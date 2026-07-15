@@ -128,7 +128,7 @@ pub fn ars_acceleration_release_gate_report(
         ),
     };
 
-    evaluate_ars_acceleration_release_gate_with_a12(
+    evaluate_ars_acceleration_release_gate_with_a12_impl(
         ReleaseGateInput {
             config,
             state: &state,
@@ -140,6 +140,7 @@ pub fn ars_acceleration_release_gate_report(
         &current_recall_gate,
         calibration_run.as_ref(),
         chrono::Utc::now().timestamp_millis(),
+        Some(store),
     )
 }
 
@@ -175,6 +176,25 @@ pub fn evaluate_ars_acceleration_release_gate_with_a12(
     current_recall_gate: &RecallEvalGateAttestation,
     calibration_run: Option<&RecallFusionCalibrationRunAttestation>,
     now_millis: i64,
+) -> ArsAccelerationReleaseGateReport {
+    evaluate_ars_acceleration_release_gate_with_a12_impl(
+        input,
+        active_a12,
+        current_recall_gate,
+        calibration_run,
+        now_millis,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_ars_acceleration_release_gate_with_a12_impl(
+    input: ReleaseGateInput<'_>,
+    active_a12: &crate::store::a12_calibration::A12CalibrationLoad,
+    current_recall_gate: &RecallEvalGateAttestation,
+    calibration_run: Option<&RecallFusionCalibrationRunAttestation>,
+    now_millis: i64,
+    live_store: Option<&SqliteStore>,
 ) -> ArsAccelerationReleaseGateReport {
     let config = input.config;
     let state = input.state;
@@ -231,15 +251,27 @@ pub fn evaluate_ars_acceleration_release_gate_with_a12(
         .filter(|(key, _)| key.starts_with("recall_fusion:"))
         .map(|(key, value)| (key.clone(), *value))
         .collect::<BTreeMap<_, _>>();
-    let recall_fusion_calibration = crate::ops::a12_activation::recall_fusion_activation_report(
-        config,
-        state,
-        policy,
-        active_a12,
-        current_recall_gate,
-        calibration_run,
-        now_millis,
-    );
+    let recall_fusion_calibration = match live_store {
+        Some(store) => crate::ops::a12_activation::recall_fusion_activation_report_live(
+            store,
+            config,
+            state,
+            policy,
+            active_a12,
+            current_recall_gate,
+            calibration_run,
+            now_millis,
+        ),
+        None => crate::ops::a12_activation::recall_fusion_activation_report(
+            config,
+            state,
+            policy,
+            active_a12,
+            current_recall_gate,
+            calibration_run,
+            now_millis,
+        ),
+    };
     let shadow_status = input
         .shadow_fusion_status
         .get("status")
@@ -282,25 +314,30 @@ pub fn evaluate_ars_acceleration_release_gate_with_a12(
         })
         .unwrap_or(false);
     let calibration = state.judge_calibration_state.as_ref();
-    let synthesis_human = crate::ops::ars_tuning::human_judge_calibration(
+    let judge_now = now_millis.div_euclid(1_000);
+    let synthesis_human = crate::ops::ars_tuning::human_judge_calibration_at(
         calibration,
         crate::store::adaptive::JudgeSurface::Synthesis,
+        judge_now,
     );
-    let concept_human = crate::ops::ars_tuning::human_judge_calibration(
+    let concept_human = crate::ops::ars_tuning::human_judge_calibration_at(
         calibration,
         crate::store::adaptive::JudgeSurface::ConceptSummary,
+        judge_now,
     );
-    let synthesis_promotion = crate::ops::ars_tuning::judge_trust_decision(
+    let synthesis_promotion = crate::ops::ars_tuning::judge_trust_decision_at(
         calibration,
         crate::store::adaptive::JudgeSurface::Synthesis,
         input.judge_structural.synthesis,
         crate::judge::contract::JudgeTrustAction::PromoteRecallFusion,
+        judge_now,
     );
-    let concept_promotion = crate::ops::ars_tuning::judge_trust_decision(
+    let concept_promotion = crate::ops::ars_tuning::judge_trust_decision_at(
         calibration,
         crate::store::adaptive::JudgeSurface::ConceptSummary,
         input.judge_structural.concept_summary,
         crate::judge::contract::JudgeTrustAction::PromoteJudgeScope,
+        judge_now,
     );
     let judge_calibration_pairs = synthesis_human
         .pair_count
@@ -416,23 +453,34 @@ pub fn evaluate_ars_acceleration_release_gate_with_a12(
         canary_blockers.push("judge_drift_alert".to_string());
     }
     if config.ars.llm_judge.enabled {
+        let judge_provider_available = config
+            .resolve_llm_for("ars.llm_judge")
+            .is_ok_and(|resolved| resolved.provider != crate::config::Provider::None);
         if config.ars.llm_judge.synthesis_enabled {
-            append_judge_promotion_blocker(
-                &mut canary_blockers,
-                "synthesis",
-                input.judge_structural.synthesis.status,
-                synthesis_human,
-                synthesis_promotion,
-            );
+            if judge_provider_available {
+                append_judge_promotion_blocker(
+                    &mut canary_blockers,
+                    "synthesis",
+                    input.judge_structural.synthesis.status,
+                    synthesis_human,
+                    synthesis_promotion,
+                );
+            } else {
+                canary_blockers.push("judge_provider_unavailable:synthesis".to_string());
+            }
         }
         if config.ars.llm_judge.concept_summary_enabled {
-            append_judge_promotion_blocker(
-                &mut canary_blockers,
-                "concept_summary",
-                input.judge_structural.concept_summary.status,
-                concept_human,
-                concept_promotion,
-            );
+            if judge_provider_available {
+                append_judge_promotion_blocker(
+                    &mut canary_blockers,
+                    "concept_summary",
+                    input.judge_structural.concept_summary.status,
+                    concept_human,
+                    concept_promotion,
+                );
+            } else {
+                canary_blockers.push("judge_provider_unavailable:concept_summary".to_string());
+            }
         }
     }
     // v1.2 (#A12 activation prerequisite — 2026-06-02 algorithm-directions
@@ -703,6 +751,37 @@ mod tests {
         );
         assert!(report.signals.policy_allows_runtime);
         assert!(report.canary.allowed);
+    }
+
+    #[test]
+    fn release_gate_blocks_active_judge_surface_without_provider() {
+        let mut config = ReinConfig::default();
+        config.adaptive.enabled = true;
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = false;
+        config.ars.llm_judge.enabled = true;
+        config.ars.llm_judge.synthesis_enabled = true;
+        config.ars.llm_judge.concept_summary_enabled = false;
+        config.adaptive.min_samples_alpha = 10;
+        let state = eligible_state();
+        let policy = loaded_canary_policy(0.25);
+        let report = evaluate_ars_acceleration_release_gate(ReleaseGateInput {
+            config: &config,
+            state: &state,
+            policy: &policy,
+            shadow_fusion_status: &serde_json::json!({
+                "status": "ready",
+                "eligible_samples": 12,
+                "min_samples": 10
+            }),
+            judge_structural: JudgeStructuralReleaseInput::default(),
+        });
+
+        assert!(!report.canary.allowed);
+        assert!(report
+            .canary
+            .blockers
+            .contains(&"judge_provider_unavailable:synthesis".to_string()));
     }
 
     #[test]

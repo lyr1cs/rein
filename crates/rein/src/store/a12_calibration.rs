@@ -14,10 +14,37 @@ use std::collections::BTreeMap;
 /// [`A12_CALIBRATION_REVISION_KEY_PREFIX`] and are immutable.
 pub const A12_CALIBRATION_METADATA_KEY: &str = "a12_calibration_active";
 pub const A12_CALIBRATION_REVISION_KEY_PREFIX: &str = "a12_calibration_revision:";
-pub const A12_CALIBRATION_SCHEMA_VERSION: u32 = 2;
+pub const A12_INPUT_EPOCH_METADATA_KEY: &str = "a12_input_epoch";
+pub const A12_CALIBRATION_SCHEMA_VERSION: u32 = 3;
 pub const A12_DEFAULT_NOISE_FLOOR: f64 = 0.02;
 const SIMPLEX_SUM_TOLERANCE: f64 = 1e-6;
 const FLOAT_COMPARISON_RELATIVE_TOLERANCE: f64 = 1e-12;
+
+/// Read the monotonic SQLite input epoch used by online A12 activation.
+/// This is deliberately one indexed metadata lookup; full snapshot hashing is
+/// reserved for offline calibration. Missing, malformed, or out-of-range state
+/// fails closed instead of silently aliasing an older generation.
+pub fn load_a12_input_epoch(conn: &rusqlite::Connection) -> crate::types::ReinResult<u64> {
+    let raw = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = ?1",
+            params![A12_INPUT_EPOCH_METADATA_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            crate::types::ReinError::Config("A12 input epoch metadata is missing".to_string())
+        })?;
+    let epoch = raw.parse::<u64>().map_err(|_| {
+        crate::types::ReinError::Config("A12 input epoch metadata is malformed".to_string())
+    })?;
+    if epoch > i64::MAX as u64 {
+        return Err(crate::types::ReinError::Config(
+            "A12 input epoch exceeds the SQLite monotonic counter range".to_string(),
+        ));
+    }
+    Ok(epoch)
+}
 
 /// Holdout verdict for one independently calibrated recall-fusion scope.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -290,10 +317,7 @@ pub struct A12ScopeEntry {
     /// Ship entry into a newer generation cannot make it active.
     pub canonical_generation: u64,
     pub generation_fingerprint: String,
-    /// Exact local SQLite recall identity produced by Task 3. Older schema-2
-    /// revisions omit this field and remain readable, but cannot satisfy the
-    /// Task-5 complete-run contract.
-    #[serde(default)]
+    /// Exact local SQLite recall identity produced by Task 3.
     pub source_snapshot_fingerprint: String,
     pub snapshot_cutoff: i64,
     pub corpus_fingerprint: String,
@@ -487,12 +511,12 @@ pub enum A12CalibrationPhase {
     Complete,
 }
 
-/// Cadence identity for Task 5. This is optional so revisions written by the
-/// original schema-2 implementation remain readable, but a legacy revision is
-/// never silently treated as a completed automatic calibration.
+/// Cadence identity for Task 5. Schema 3 adds the monotonic source epoch used
+/// by online activation; schema-2 rows fail closed and must be recalibrated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct A12CalibrationRunMetadata {
     pub phase: A12CalibrationPhase,
+    pub source_input_epoch: u64,
     pub source_snapshot_fingerprint: String,
     pub behavior_config_fingerprint: String,
 }
@@ -534,7 +558,7 @@ impl Default for A12CalibrationState {
 
 impl A12CalibrationState {
     /// A pending revision is an immutable, empty activation barrier. Merely
-    /// observing a schema-2 row without phase metadata is not enough.
+    /// observing a row without phase metadata is not enough.
     pub fn is_pending(&self) -> bool {
         self.run
             .as_ref()
@@ -549,7 +573,7 @@ impl A12CalibrationState {
     }
 
     /// Earliest fixed-time replay boundary across completed scopes, in Unix
-    /// milliseconds. Pending and legacy schema-2 rows have no reusable
+    /// milliseconds. Pending and legacy rows have no reusable
     /// cadence horizon.
     pub fn next_expiry_unix_ms(&self) -> Option<i64> {
         if !self.is_complete() {
@@ -727,6 +751,9 @@ fn validate_state(state: &A12CalibrationState) -> Result<(), String> {
         if run.source_snapshot_fingerprint.is_empty() || run.behavior_config_fingerprint.is_empty()
         {
             return Err("A12 run identities must be non-empty".to_string());
+        }
+        if run.source_input_epoch > i64::MAX as u64 {
+            return Err("A12 run input epoch exceeds the SQLite counter range".to_string());
         }
         if run.phase == A12CalibrationPhase::Pending && !state.scopes.is_empty() {
             return Err("A12 pending revisions must have empty scopes".to_string());
@@ -1521,10 +1548,62 @@ mod tests {
             updated_at: 1_010,
             run: Some(A12CalibrationRunMetadata {
                 phase: A12CalibrationPhase::Complete,
+                source_input_epoch: generation,
                 source_snapshot_fingerprint: format!("snapshot-{generation}"),
                 behavior_config_fingerprint: format!("behavior-{generation}"),
             }),
         }
+    }
+
+    #[test]
+    fn a12_input_epoch_load_is_constant_time_and_fails_closed_on_bad_metadata() {
+        let conn = conn();
+        conn.execute(
+            "INSERT INTO metadata(key, value) VALUES ('a12_input_epoch', '0')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(load_a12_input_epoch(&conn).unwrap(), 0);
+
+        conn.execute(
+            "UPDATE metadata SET value = '42' WHERE key = 'a12_input_epoch'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(load_a12_input_epoch(&conn).unwrap(), 42);
+
+        conn.execute(
+            "UPDATE metadata SET value = 'not-a-counter' WHERE key = 'a12_input_epoch'",
+            [],
+        )
+        .unwrap();
+        assert!(load_a12_input_epoch(&conn).is_err());
+
+        conn.execute("DELETE FROM metadata WHERE key = 'a12_input_epoch'", [])
+            .unwrap();
+        assert!(load_a12_input_epoch(&conn).is_err());
+    }
+
+    #[test]
+    fn a12_epoch_attestation_uses_a_new_fail_closed_payload_schema() {
+        assert_eq!(A12_CALIBRATION_SCHEMA_VERSION, 3);
+
+        let current = serde_json::to_value(state(12, 1)).unwrap();
+        assert!(current["run"]["source_input_epoch"].is_u64());
+
+        let mut old = current.clone();
+        old["schema_version"] = serde_json::json!(2);
+        assert_eq!(
+            parse_raw_state(&old.to_string()).status,
+            A12CalibrationLoadStatus::Corrupt
+        );
+
+        let mut future = current;
+        future["schema_version"] = serde_json::json!(4);
+        assert_eq!(
+            parse_raw_state(&future.to_string()).status,
+            A12CalibrationLoadStatus::UnsupportedSchema
+        );
     }
 
     #[test]
@@ -1533,6 +1612,7 @@ mod tests {
         pending.scopes.clear();
         pending.run = Some(A12CalibrationRunMetadata {
             phase: A12CalibrationPhase::Pending,
+            source_input_epoch: 12,
             source_snapshot_fingerprint: "snapshot-12".to_string(),
             behavior_config_fingerprint: "behavior-12".to_string(),
         });
@@ -1570,6 +1650,7 @@ mod tests {
         let mut pending = state(12, 1);
         pending.run = Some(A12CalibrationRunMetadata {
             phase: A12CalibrationPhase::Pending,
+            source_input_epoch: 12,
             source_snapshot_fingerprint: "snapshot-12".to_string(),
             behavior_config_fingerprint: "behavior-12".to_string(),
         });
@@ -1623,6 +1704,7 @@ mod tests {
         let mut complete = state(12, 1);
         complete.run = Some(A12CalibrationRunMetadata {
             phase: A12CalibrationPhase::Complete,
+            source_input_epoch: 12,
             source_snapshot_fingerprint: "snapshot-12".to_string(),
             behavior_config_fingerprint: "behavior-12".to_string(),
         });

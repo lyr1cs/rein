@@ -324,7 +324,7 @@ fn collect_judge_surface_calibration(
     use crate::store::adaptive::JudgeSurface;
     use crate::store::judge_structural_calibration::JudgeStructuralCalibrationLoadStatus;
 
-    let human = crate::ops::ars_tuning::human_judge_calibration(calibration, surface);
+    let human = crate::ops::ars_tuning::human_judge_calibration_at(calibration, surface, now);
     let (runtime_pairs, runtime_kappa, drift_alert_count) = match (calibration, surface) {
         (Some(calibration), JudgeSurface::Synthesis) => (
             calibration.recent_pairs_runtime_vs_offline_synthesis.len(),
@@ -345,25 +345,28 @@ fn collect_judge_surface_calibration(
     let structural =
         crate::ops::ars_tuning::resolve_judge_structural_trust(store.conn(), config, surface, now);
     let baseline_action = JudgeTrustAction::KeepConfiguredBaseline;
-    let baseline_decision = crate::ops::ars_tuning::judge_trust_decision(
+    let baseline_decision = crate::ops::ars_tuning::judge_trust_decision_at(
         calibration,
         surface,
         structural,
         baseline_action,
+        now,
     );
     let recall_fusion_action = JudgeTrustAction::PromoteRecallFusion;
-    let recall_fusion_decision = crate::ops::ars_tuning::judge_trust_decision(
+    let recall_fusion_decision = crate::ops::ars_tuning::judge_trust_decision_at(
         calibration,
         surface,
         structural,
         recall_fusion_action,
+        now,
     );
     let surface_scope_action = JudgeTrustAction::PromoteJudgeScope;
-    let surface_scope_decision = crate::ops::ars_tuning::judge_trust_decision(
+    let surface_scope_decision = crate::ops::ars_tuning::judge_trust_decision_at(
         calibration,
         surface,
         structural,
         surface_scope_action,
+        now,
     );
     let mode = match config.ars.llm_judge.structural_anchors.mode {
         JudgeStructuralAnchorMode::Off => "off",
@@ -1072,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn judge_human_kappa_projection_omits_non_finite_or_out_of_range_values() {
+    fn judge_human_kappa_projection_ignores_invalid_cached_values() {
         use crate::store::adaptive::{AdaptiveState, JudgeCalibrationState, JudgeSurface};
 
         for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1.01, -1.01] {
@@ -1097,7 +1100,11 @@ mod tests {
                 report.synthesis.human.pair_count,
                 crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS
             );
-            assert_eq!(report.synthesis.human.kappa, None, "invalid={invalid}");
+            assert_eq!(
+                report.synthesis.human.kappa,
+                Some(1.0),
+                "cached value must be ignored: {invalid}"
+            );
         }
     }
 

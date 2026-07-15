@@ -271,7 +271,7 @@ fn apply_ars_dynamic_fusion_scores(
 /// checks to the shared resolver. Recall deliberately does not read eval-gate
 /// files; policy refresh already sealed their immutable identity.
 fn resolve_dynamic_fusion_for_recall(
-    conn: &rusqlite::Connection,
+    store: &SqliteStore,
     config: &ReinConfig,
     state: &crate::store::adaptive::AdaptiveState,
     query_type: &str,
@@ -281,9 +281,15 @@ fn resolve_dynamic_fusion_for_recall(
     Option<crate::search::alpha_optimizer::ShadowFusionWeights>,
     f64,
 ) {
+    let conn = store.conn();
+    if !judge_allows_live_recall_fusion(conn, config, state, now_millis) {
+        return (None, 0.0);
+    }
+
     let policy = crate::store::ars_parameter_policy::load_parameter_policy(conn);
     let active_a12 = crate::store::a12_calibration::load_a12_calibration(conn);
-    let resolution = crate::ops::a12_activation::resolve_runtime_recall_fusion(
+    let resolution = crate::ops::a12_activation::resolve_runtime_recall_fusion_live(
+        store,
         &policy.policy,
         config,
         state,
@@ -306,6 +312,43 @@ fn resolve_dynamic_fusion_for_recall(
             },
         );
     (weights, resolution.adoption_weight)
+}
+
+/// A sealed A12/policy adoption cannot outlive the current judge trust state.
+/// Judge-backed synthesis promotion is checked on every recall so provider
+/// removal and enforced structural failures fail closed without waiting for
+/// the slower policy refresh loop.
+fn judge_allows_live_recall_fusion(
+    conn: &rusqlite::Connection,
+    config: &ReinConfig,
+    state: &crate::store::adaptive::AdaptiveState,
+    now_millis: i64,
+) -> bool {
+    if !config.ars.llm_judge.enabled || !config.ars.llm_judge.synthesis_enabled {
+        return true;
+    }
+    let Ok(resolved) = config.resolve_llm_for("ars.llm_judge") else {
+        return false;
+    };
+    if resolved.provider == crate::config::Provider::None {
+        return false;
+    }
+
+    let now = now_millis.div_euclid(1_000);
+    let structural = crate::ops::ars_tuning::resolve_judge_structural_trust(
+        conn,
+        config,
+        crate::store::adaptive::JudgeSurface::Synthesis,
+        now,
+    );
+    let decision = crate::ops::ars_tuning::judge_trust_decision_at(
+        state.judge_calibration_state.as_ref(),
+        crate::store::adaptive::JudgeSurface::Synthesis,
+        structural,
+        crate::judge::contract::JudgeTrustAction::PromoteRecallFusion,
+        now,
+    );
+    decision.action_allowed && !decision.blocks_release
 }
 
 /// A resolved canonical is "live" iff it is neither superseded nor deprecated —
@@ -1631,7 +1674,7 @@ fn recall_temporal_with_execution_mode(
                 .as_ref()
                 .map(|state| {
                     resolve_dynamic_fusion_for_recall(
-                        store.conn(),
+                        store,
                         config,
                         state,
                         &query_type_label,
@@ -4348,7 +4391,7 @@ mod tests {
         );
 
         let (weights, adoption) = resolve_dynamic_fusion_for_recall(
-            store.conn(),
+            &store,
             &config,
             &state,
             "semantic",
@@ -4384,7 +4427,7 @@ mod tests {
         );
 
         let (weights, adoption) = resolve_dynamic_fusion_for_recall(
-            store.conn(),
+            &store,
             &config,
             &state,
             "semantic",
@@ -4434,7 +4477,7 @@ mod tests {
         .unwrap());
 
         let (weights, adoption) = resolve_dynamic_fusion_for_recall(
-            store.conn(),
+            &store,
             &config,
             &state,
             "semantic",
@@ -4445,6 +4488,290 @@ mod tests {
         assert_eq!(adoption, 1.0);
         assert!((weights.sum() - 1.0).abs() < 1e-9);
         assert!(weights.bm25 > weights.support);
+    }
+
+    #[test]
+    fn ars_dynamic_fusion_resolver_disables_sealed_a12_after_live_epoch_drift() {
+        use crate::store::a12_calibration::{
+            A12CalibrationLoad, A12CalibrationLoadStatus, A12CalibrationPhase,
+            A12CalibrationRunMetadata, A12CalibrationScope, A12CalibrationState,
+            A12CalibrationVerdict, A12FusionSimplex, A12PairedTop3Stats, A12ProvenanceCounts,
+            A12ScopeEntry, A12_CALIBRATION_SCHEMA_VERSION, A12_DEFAULT_NOISE_FLOOR,
+        };
+        use crate::store::ars_parameter_policy::{
+            ArsParameterPolicy, ArsParameterPolicyMode, ArsRecallGateStatus,
+            ARS_PARAMETER_POLICY_SCHEMA_VERSION,
+        };
+
+        let store = SqliteStore::in_memory().unwrap();
+        let mut config = ReinConfig::default();
+        config.adaptive.enabled = true;
+        config.adaptive.min_samples_alpha = 10;
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = false;
+        let adaptive = crate::store::adaptive::AdaptiveState {
+            version: 5,
+            ..Default::default()
+        };
+        let now_millis = 1_700_000_075_000;
+        let source_epoch =
+            crate::store::a12_calibration::load_a12_input_epoch(store.conn()).unwrap();
+        let hard_dedup =
+            crate::ops::effective_hard_dedup_threshold_from_conn(store.conn(), &config);
+        let behavior = crate::ops::a12_autocalibration::a12_behavior_config_fingerprint(
+            &config,
+            hard_dedup,
+            20,
+            config.adaptive.min_samples_alpha,
+        )
+        .unwrap();
+        let paired = crate::eval::mcnemar::mcnemar_from_counts(20, 0, 0, 0).unwrap();
+        let paired = A12PairedTop3Stats {
+            n: u64::from(paired.n),
+            both_hit: u64::from(paired.a),
+            baseline_only: u64::from(paired.b),
+            treatment_only: u64::from(paired.c),
+            neither_hit: u64::from(paired.d),
+            chi_squared: paired.chi_squared,
+            p_value: paired.p_value,
+            diff_point: paired.diff_point,
+            ci_lower: paired.ci_lower,
+            ci_upper: paired.ci_upper,
+            used_exact: paired.used_exact,
+        };
+        let source_snapshot = "recall-live-source".to_string();
+        let generation_fingerprint = "recall-live-generation".to_string();
+        let corpus_fingerprint = "recall-live-corpus".to_string();
+        let scope = A12ScopeEntry {
+            scope: A12CalibrationScope::Global,
+            canonical_generation: 1,
+            generation_fingerprint: generation_fingerprint.clone(),
+            source_snapshot_fingerprint: source_snapshot.clone(),
+            snapshot_cutoff: 5,
+            corpus_fingerprint: corpus_fingerprint.clone(),
+            train_family_ess: 20,
+            train_case_count: 20,
+            holdout_family_ess: 20,
+            simplex: A12FusionSimplex {
+                bm25: 0.35,
+                vector: 0.35,
+                kg: 0.10,
+                episode: 0.08,
+                support: 0.07,
+                diversity: 0.05,
+            },
+            verdict: A12CalibrationVerdict::Ship,
+            noise_floor: A12_DEFAULT_NOISE_FLOOR,
+            paired_top3: paired,
+            provenance: A12ProvenanceCounts {
+                canonical_loo: 20,
+                concept_loo: 0,
+                episode_loo: 0,
+            },
+            provenance_holdout: None,
+            training_fingerprint: "training".to_string(),
+            holdout_fingerprint: "holdout".to_string(),
+            optimizer_fingerprint: "optimizer".to_string(),
+            evaluation_fingerprint: "evaluation".to_string(),
+            holdout_reason: "holdout evaluated".to_string(),
+            calibrated_at: 1_700_000_000,
+            evaluated_at: 1_700_000_050,
+            valid_until_exclusive: None,
+            cluster_generation: None,
+            invalidation: None,
+        };
+        let calibration_state = A12CalibrationState {
+            schema_version: A12_CALIBRATION_SCHEMA_VERSION,
+            revision: 1,
+            generation: 1,
+            generation_fingerprint,
+            snapshot_cutoff: 5,
+            corpus_fingerprint,
+            cluster_generation: 0,
+            scopes: std::collections::BTreeMap::from([("global".to_string(), scope)]),
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_050,
+            run: Some(A12CalibrationRunMetadata {
+                phase: A12CalibrationPhase::Complete,
+                source_input_epoch: source_epoch,
+                source_snapshot_fingerprint: source_snapshot,
+                behavior_config_fingerprint: behavior,
+            }),
+        };
+        let calibration = A12CalibrationLoad {
+            state: calibration_state.clone(),
+            status: A12CalibrationLoadStatus::Loaded,
+            error: None,
+        };
+        let gate = crate::ops::a12_activation::RecallEvalGateAttestation {
+            status: ArsRecallGateStatus::Ship,
+            reason_code: crate::ops::a12_activation::RecallEvalGateReasonCode::Compared,
+            build_fingerprint: Some(env!("REIN_BUILD_FINGERPRINT").to_string()),
+            fixture_fingerprint: Some("recall-live-fixture".to_string()),
+            evaluated_at: Some(1_700_000_050),
+            reason: "ship".to_string(),
+        };
+        let evidence = crate::ops::a12_activation::resolve_recall_fusion_evidence(
+            &adaptive,
+            &calibration,
+            config.adaptive.min_samples_alpha,
+            A12_DEFAULT_NOISE_FLOOR,
+            now_millis,
+            &gate,
+        );
+        assert!(
+            crate::store::a12_calibration::compare_and_swap_a12_calibration(
+                store.conn(),
+                &calibration_state,
+                0,
+            )
+            .unwrap()
+        );
+        let policy = ArsParameterPolicy {
+            schema_version: ARS_PARAMETER_POLICY_SCHEMA_VERSION,
+            revision: 1,
+            mode: ArsParameterPolicyMode::Canary,
+            source_adaptive_version: adaptive.version,
+            runtime_adoption_weight: 0.0,
+            adoption_weights: std::collections::HashMap::from([(
+                "recall_fusion:global".to_string(),
+                0.25,
+            )]),
+            recall_fusion_evidence: evidence.into_iter().collect(),
+            last_updated: "2026-07-15T00:00:00Z".to_string(),
+            ..Default::default()
+        };
+        assert!(crate::store::ars_parameter_policy::save_parameter_policy_cas(
+            store.conn(),
+            &policy,
+            0,
+        )
+        .unwrap());
+
+        let (current, current_adoption) = resolve_dynamic_fusion_for_recall(
+            &store, &config, &adaptive, "semantic", None, now_millis,
+        );
+        assert!(current.is_some());
+        assert_eq!(current_adoption, 0.25);
+
+        store
+            .conn()
+            .execute(
+                "INSERT INTO metadata(key, value) VALUES ('rerank_weights', '{}')",
+                [],
+            )
+            .unwrap();
+        let (stale, stale_adoption) = resolve_dynamic_fusion_for_recall(
+            &store, &config, &adaptive, "semantic", None, now_millis,
+        );
+        assert!(stale.is_none());
+        assert_eq!(stale_adoption, 0.0);
+    }
+
+    #[test]
+    fn active_judge_without_provider_blocks_live_recall_fusion() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = false;
+        config.ars.llm_judge.enabled = true;
+        config.ars.llm_judge.synthesis_enabled = true;
+        config.adaptive.min_samples_alpha = 1;
+        let mut state = crate::store::adaptive::AdaptiveState::default();
+        state.learned_shadow_fusion.insert(
+            "semantic".into(),
+            crate::store::adaptive::LearnedShadowFusionEntry {
+                weights: crate::store::adaptive::ShadowFusionWeightEntry {
+                    bm25: 0.1,
+                    vec: 0.2,
+                    kg: 0.3,
+                    episode: 0.1,
+                    support: 0.2,
+                    diversity: 0.1,
+                },
+                sample_count: 12,
+                last_updated: "2026-04-30T00:00:00Z".into(),
+            },
+        );
+        let policy = crate::store::ars_parameter_policy::ArsParameterPolicy {
+            revision: 1,
+            mode: crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary,
+            runtime_adoption_weight: 1.0,
+            last_updated: "2026-07-13T00:00:00Z".to_string(),
+            ..Default::default()
+        };
+        assert!(crate::store::ars_parameter_policy::save_parameter_policy_cas(
+            store.conn(),
+            &policy,
+            0,
+        )
+        .unwrap());
+
+        let (weights, adoption) = resolve_dynamic_fusion_for_recall(
+            &store,
+            &config,
+            &state,
+            "semantic",
+            None,
+            1_700_000_075_000,
+        );
+        assert!(weights.is_none());
+        assert_eq!(adoption, 0.0);
+    }
+
+    #[test]
+    fn enforced_unknown_structural_state_blocks_live_recall_fusion() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut config = ReinConfig::default();
+        config.ars.acceleration.enabled = true;
+        config.ars.acceleration.shadow_only = false;
+        config.ars.llm_judge.enabled = true;
+        config.ars.llm_judge.synthesis_enabled = true;
+        config.ars.llm_judge.structural_anchors.mode =
+            crate::config::JudgeStructuralAnchorMode::Enforce;
+        config.llm.provider = "omlx".to_string();
+        config.llm.omlx.model = Some("judge-model".to_string());
+        config.adaptive.min_samples_alpha = 1;
+        let mut state = crate::store::adaptive::AdaptiveState::default();
+        state.learned_shadow_fusion.insert(
+            "semantic".into(),
+            crate::store::adaptive::LearnedShadowFusionEntry {
+                weights: crate::store::adaptive::ShadowFusionWeightEntry {
+                    bm25: 0.1,
+                    vec: 0.2,
+                    kg: 0.3,
+                    episode: 0.1,
+                    support: 0.2,
+                    diversity: 0.1,
+                },
+                sample_count: 12,
+                last_updated: "2026-04-30T00:00:00Z".into(),
+            },
+        );
+        let policy = crate::store::ars_parameter_policy::ArsParameterPolicy {
+            revision: 1,
+            mode: crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary,
+            runtime_adoption_weight: 1.0,
+            last_updated: "2026-07-13T00:00:00Z".to_string(),
+            ..Default::default()
+        };
+        assert!(crate::store::ars_parameter_policy::save_parameter_policy_cas(
+            store.conn(),
+            &policy,
+            0,
+        )
+        .unwrap());
+
+        let (weights, adoption) = resolve_dynamic_fusion_for_recall(
+            &store,
+            &config,
+            &state,
+            "semantic",
+            None,
+            1_700_000_075_000,
+        );
+        assert!(weights.is_none());
+        assert_eq!(adoption, 0.0);
     }
 
     #[test]
@@ -4489,7 +4816,7 @@ mod tests {
         .unwrap());
 
         let (actual, adoption) = resolve_dynamic_fusion_for_recall(
-            store.conn(),
+            &store,
             &config,
             &state,
             "semantic",

@@ -24,7 +24,8 @@ use crate::types::{ReinError, ReinResult};
 use chrono::Utc;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap};
 
 // ── Event Types ──────────────────────────────────────────────────────────────
 
@@ -472,6 +473,15 @@ pub struct AdaptiveState {
     /// M4: Memory → cluster assignment.
     pub memory_clusters: HashMap<String, u32>,
 
+    /// Canonical digest of the exact AdaptiveState projection read by A12
+    /// replay (`learned_alpha`, `cluster_version`, `memory_clusters`). The
+    /// snapshot writer recomputes this field on every CAS branch; callers must
+    /// never treat a supplied value as authoritative. SQLite's O(1) A12 epoch
+    /// trigger compares it so version-only adaptive ticks do not invalidate a
+    /// calibration, while old/malformed writers that omit it fail closed.
+    #[serde(default)]
+    pub a12_recall_projection_fingerprint: String,
+
     /// M5: Tier boundary thresholds.
     pub hot_threshold: f64,
     pub cold_threshold: f64,
@@ -830,6 +840,45 @@ impl CanonicalLengthStats {
 }
 
 impl AdaptiveState {
+    /// Deterministic identity of the AdaptiveState fields consumed by A12's
+    /// local recall replay. HashMap iteration order is deliberately removed by
+    /// projecting through BTreeMap before serialization.
+    pub(crate) fn compute_a12_recall_projection_fingerprint(&self) -> ReinResult<String> {
+        #[derive(Serialize)]
+        struct A12RecallProjection<'a> {
+            learned_alpha: BTreeMap<&'a str, &'a LearnedAlphaEntry>,
+            cluster_version: u64,
+            memory_clusters: BTreeMap<&'a str, u32>,
+        }
+
+        let projection = A12RecallProjection {
+            learned_alpha: self
+                .learned_alpha
+                .iter()
+                .map(|(key, value)| (key.as_str(), value))
+                .collect(),
+            cluster_version: self.cluster_version,
+            memory_clusters: self
+                .memory_clusters
+                .iter()
+                .map(|(key, value)| (key.as_str(), *value))
+                .collect(),
+        };
+        let bytes = serde_json::to_vec(&projection).map_err(ReinError::Serialization)?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"a12-adaptive-recall-projection-v1\0");
+        hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(bytes);
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    fn serialize_with_a12_recall_projection(&self) -> ReinResult<String> {
+        let mut persisted = self.clone();
+        persisted.a12_recall_projection_fingerprint =
+            persisted.compute_a12_recall_projection_fingerprint()?;
+        serde_json::to_string(&persisted).map_err(ReinError::Serialization)
+    }
+
     pub fn ars_effective_scalar(&self, key: &str) -> Option<f64> {
         self.ars_effective_scalars.get(key).and_then(|entry| {
             if entry.value.is_finite() {
@@ -1051,7 +1100,7 @@ impl AdaptiveState {
     /// Checks that the stored version matches our base version to prevent lost updates
     /// when two concurrent GC runs modify the state simultaneously.
     pub fn save_snapshot(&self, conn: &Connection) -> ReinResult<()> {
-        let json = serde_json::to_string(self).map_err(ReinError::Serialization)?;
+        let json = self.serialize_with_a12_recall_projection()?;
 
         // Optimistic concurrency: only update if version hasn't changed since we loaded
         // COALESCE so malformed/missing JSON reads as -1 rather than NULL
@@ -1576,8 +1625,7 @@ impl AdaptiveState {
                         &mut current.learned_shadow_fusion,
                     );
 
-                    let merged_json =
-                        serde_json::to_string(&current).map_err(ReinError::Serialization)?;
+                    let merged_json = current.serialize_with_a12_recall_projection()?;
 
                     // CAS write: only succeed if nobody else wrote since our read.
                     // COALESCE so a malformed JSON in the row doesn't silently skip the update.

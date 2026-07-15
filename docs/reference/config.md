@@ -8,7 +8,7 @@ default TOML template is `crates/rein/config/default.toml`.
 
 | Section | Purpose |
 |---|---|
-| `config_version` (top-level) | Schema-version metadata, not a tunable (default `1` = `CURRENT_CONFIG_VERSION`). A config stamped newer than the running build is refused at load (forward-compat guard); the unversioned sentinel `0` and the current version both load. |
+| `config_version` (top-level) | Schema-version metadata, not a tunable (default `3` = `CURRENT_CONFIG_VERSION` on the post-v1.2 integration line; v1.2.0 used version 2). A config stamped newer than the running build is refused at load (forward-compat guard); the unversioned sentinel `0` and the current version both load. |
 | `[database]` | SQLite path. `path = "auto"` resolves to the user's Rein data directory. |
 | `[embedding]`, `[embedding.google]`, `[embedding.omlx]` | Embedding provider, dimensions, model, endpoint, and optional Google key. |
 | `[search]` | RRF/convex-combination fusion, dedup threshold, LLM reranker, MMR, and strong-signal settings. |
@@ -115,5 +115,6 @@ operator decision.
 | `REIN_LOG` | Configure tracing filter, such as `warn`, `info`, or `debug`. |
 | `REIN_REST_MAX_BODY_BYTES` | Override the REST JSON request body cap; default is 1 MiB. |
 | `REIN_LLM_CONCURRENCY` | Override global LLM request concurrency. `0` is treated as invalid and falls back to the default. |
+| `REIN_EVAL_GATE_ROOT` | Absolute checkout/artifact root containing `docs/eval-baselines` and `target/eval-gates`. Required for installed daemons that run outside a Rein checkout; relative paths fail closed. |
 | `REIN_ASYNC_MEMORY_PROVIDER` | Override `[async_memory].provider`. |
 | `REIN_ASYNC_P1` | Set to `0` to disable the async open-store connection pool path. |

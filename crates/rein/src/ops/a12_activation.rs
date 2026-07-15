@@ -12,7 +12,16 @@ use crate::store::ars_parameter_policy::{
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Absolute source/evidence root used by installed daemons that do not run
+/// with a repository as their working directory. The root keeps the existing
+/// `docs/eval-baselines` + `target/eval-gates` layout, so `rein-eval` can
+/// produce the artifacts simply by running from this directory.
+pub const REIN_EVAL_GATE_ROOT_ENV: &str = "REIN_EVAL_GATE_ROOT";
+// Must remain identical to the fixed replay limit used by the A12 cadence in
+// `ops::adaptive`; it is part of the behavior-config fingerprint contract.
+const A12_RUNTIME_RECALL_TRACE_LIMIT: usize = 20;
 
 /// Immutable identity of the recall eval-gate decision used by policy refresh.
 /// Runtime consumes the sealed fields from the policy and never re-reads files.
@@ -24,6 +33,8 @@ pub enum RecallEvalGateReasonCode {
     MissingRun,
     CorruptBaseline,
     CorruptRun,
+    ArtifactRootUnconfigured,
+    ArtifactRootRelative,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -36,21 +47,87 @@ pub struct RecallEvalGateAttestation {
     pub reason: String,
 }
 
-/// Load the current recall scorecards from the same conventional locations
-/// used by Trust. Scorecards are resolved from the server process working
-/// directory on purpose: the policy sealer attests the same cwd-based paths,
-/// so sealer and verifier always describe the same artifacts. A daemon
-/// started outside the repository therefore reports `NoData` rather than
-/// attesting someone else's scorecards. The returned attestation contains
-/// semantic identity only; neither the repository root nor either scorecard
-/// path is retained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecallEvalGateArtifactPaths {
+    baseline: PathBuf,
+    run: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecallEvalGatePathError {
+    RelativeOperatorRoot,
+    Unconfigured,
+}
+
+fn find_recall_eval_gate_root(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|candidate| candidate.join("docs/eval-baselines").is_dir())
+        .map(Path::to_path_buf)
+}
+
+/// Resolve scorecards without treating an arbitrary process cwd as trusted
+/// evidence. An explicit absolute operator root wins. Development runs may
+/// discover a checkout ancestor from cwd. Installed daemons outside a checkout
+/// fail closed with a configuration hint instead of retaining a private build
+/// path in the binary or reading unrelated files.
+fn resolve_recall_eval_gate_artifact_paths(
+    operator_root: Option<&Path>,
+    current_dir: &Path,
+) -> Result<RecallEvalGateArtifactPaths, RecallEvalGatePathError> {
+    let root = if let Some(root) = operator_root {
+        if !root.is_absolute() {
+            return Err(RecallEvalGatePathError::RelativeOperatorRoot);
+        }
+        root.to_path_buf()
+    } else if let Some(root) = find_recall_eval_gate_root(current_dir) {
+        root
+    } else {
+        return Err(RecallEvalGatePathError::Unconfigured);
+    };
+    Ok(RecallEvalGateArtifactPaths {
+        baseline: gates::baseline_path(&root, "recall"),
+        run: gates::run_path(&root.join("target"), "recall"),
+    })
+}
+
+/// Load current recall scorecards through the shared stable artifact resolver.
+/// The returned attestation contains semantic identity only; neither the root
+/// nor either scorecard path is retained.
 pub fn current_recall_eval_gate_attestation(noise_floor: f64) -> RecallEvalGateAttestation {
-    let repo_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    recall_eval_gate_attestation(
-        &gates::baseline_path(&repo_root, "recall"),
-        &gates::run_path(&repo_root.join("target"), "recall"),
-        noise_floor,
-    )
+    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let operator_root = std::env::var_os(REIN_EVAL_GATE_ROOT_ENV).map(PathBuf::from);
+    let paths = match resolve_recall_eval_gate_artifact_paths(
+        operator_root.as_deref(),
+        &current_dir,
+    ) {
+        Ok(paths) => paths,
+        Err(RecallEvalGatePathError::RelativeOperatorRoot) => {
+            return RecallEvalGateAttestation {
+                status: ArsRecallGateStatus::NoData,
+                reason_code: RecallEvalGateReasonCode::ArtifactRootRelative,
+                build_fingerprint: None,
+                fixture_fingerprint: None,
+                evaluated_at: None,
+                reason: format!(
+                    "{REIN_EVAL_GATE_ROOT_ENV} must be an absolute path to an eval-gate root"
+                ),
+            };
+        }
+        Err(RecallEvalGatePathError::Unconfigured) => {
+            return RecallEvalGateAttestation {
+                status: ArsRecallGateStatus::NoData,
+                reason_code: RecallEvalGateReasonCode::ArtifactRootUnconfigured,
+                build_fingerprint: None,
+                fixture_fingerprint: None,
+                evaluated_at: None,
+                reason: format!(
+                    "recall eval-gate root is unconfigured; set {REIN_EVAL_GATE_ROOT_ENV} to an absolute source/evidence root"
+                ),
+            };
+        }
+    };
+    recall_eval_gate_attestation(&paths.baseline, &paths.run, noise_floor)
 }
 
 /// Load and compare caller-supplied recall scorecard paths. Supplying paths is
@@ -659,6 +736,167 @@ pub fn resolve_runtime_recall_fusion(
             selected,
         ),
     }
+}
+
+/// Online A12 resolver. The pure resolver above validates the sealed policy
+/// graph; this store-aware boundary additionally binds it to the SQLite state
+/// and behavior-changing config that exist at the instant of live recall.
+/// Ordinary corpus/config drift therefore disables stale automatic Ship
+/// evidence immediately, before the next cadence refresh.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_runtime_recall_fusion_live(
+    store: &crate::store::SqliteStore,
+    policy: &ArsParameterPolicy,
+    config: &crate::config::ReinConfig,
+    adaptive: &AdaptiveState,
+    active_a12: &A12CalibrationLoad,
+    query_type: &str,
+    cluster_id: Option<u32>,
+    min_samples_alpha: usize,
+    expected_noise_floor: f64,
+    now_millis: i64,
+) -> RuntimeRecallFusionResolution {
+    let resolved = resolve_runtime_recall_fusion(
+        policy,
+        config,
+        adaptive,
+        active_a12,
+        query_type,
+        cluster_id,
+        min_samples_alpha,
+        expected_noise_floor,
+        now_millis,
+    );
+    if resolved.adoption_weight <= f64::EPSILON
+        || resolved.simplex.is_none()
+        || !matches!(
+            resolved.basis,
+            ArsRecallFusionEvidenceBasis::SelfSupervised | ArsRecallFusionEvidenceBasis::Blended
+        )
+    {
+        return resolved;
+    }
+
+    let Some(run) = active_a12
+        .state
+        .run
+        .as_ref()
+        .filter(|run| run.phase == A12CalibrationPhase::Complete)
+    else {
+        return live_runtime_input_blocked(
+            policy,
+            config,
+            adaptive,
+            active_a12,
+            min_samples_alpha,
+            resolved,
+            RecallFusionScopeHealthCode::RunIncomplete,
+            "active A12 run has no complete live-input attestation",
+        );
+    };
+
+    let current_source_epoch =
+        match crate::store::a12_calibration::load_a12_input_epoch(store.conn()) {
+            Ok(epoch) => epoch,
+            Err(_) => {
+                return live_runtime_input_blocked(
+                    policy,
+                    config,
+                    adaptive,
+                    active_a12,
+                    min_samples_alpha,
+                    resolved,
+                    RecallFusionScopeHealthCode::Stale,
+                    "current A12 input epoch is unavailable",
+                );
+            }
+        };
+    if current_source_epoch != run.source_input_epoch {
+        return live_runtime_input_blocked(
+            policy,
+            config,
+            adaptive,
+            active_a12,
+            min_samples_alpha,
+            resolved,
+            RecallFusionScopeHealthCode::Stale,
+            "current A12 input epoch drifted from the sealed Ship run",
+        );
+    }
+
+    let hard_dedup_bound =
+        crate::ops::effective_hard_dedup_threshold_from_conn(store.conn(), config);
+    let current_behavior = match crate::ops::a12_autocalibration::a12_behavior_config_fingerprint(
+        config,
+        hard_dedup_bound,
+        A12_RUNTIME_RECALL_TRACE_LIMIT,
+        min_samples_alpha,
+    ) {
+        Ok(fingerprint) => fingerprint,
+        Err(_) => {
+            return live_runtime_input_blocked(
+                policy,
+                config,
+                adaptive,
+                active_a12,
+                min_samples_alpha,
+                resolved,
+                RecallFusionScopeHealthCode::Stale,
+                "current A12 behavior config fingerprint is unavailable",
+            );
+        }
+    };
+    if current_behavior != run.behavior_config_fingerprint {
+        return live_runtime_input_blocked(
+            policy,
+            config,
+            adaptive,
+            active_a12,
+            min_samples_alpha,
+            resolved,
+            RecallFusionScopeHealthCode::Stale,
+            "current A12 behavior config drifted from the sealed Ship run",
+        );
+    }
+
+    resolved
+}
+
+#[allow(clippy::too_many_arguments)]
+fn live_runtime_input_blocked(
+    policy: &ArsParameterPolicy,
+    config: &crate::config::ReinConfig,
+    adaptive: &AdaptiveState,
+    active_a12: &A12CalibrationLoad,
+    min_samples_alpha: usize,
+    resolved: RuntimeRecallFusionResolution,
+    code: RecallFusionScopeHealthCode,
+    reason: &str,
+) -> RuntimeRecallFusionResolution {
+    let Some(policy_key) = resolved.scope_key.as_deref() else {
+        return runtime_disabled(None, resolved.basis, code, reason);
+    };
+    if policy
+        .recall_fusion_evidence
+        .get(policy_key)
+        .is_some_and(|evidence| evidence.basis == ArsRecallFusionEvidenceBasis::Blended)
+    {
+        let mut fallback = resolve_runtime_sealed_human_boundary(
+            policy,
+            config,
+            adaptive,
+            active_a12,
+            policy_key,
+            &policy.recall_fusion_evidence[policy_key],
+            min_samples_alpha,
+        );
+        if fallback.adoption_weight > f64::EPSILON && fallback.simplex.is_some() {
+            fallback.code = RecallFusionScopeHealthCode::HumanFallback;
+            fallback.reason = format!("{reason}; serving sealed human fallback");
+            return fallback;
+        }
+    }
+    runtime_disabled(resolved.scope_key, resolved.basis, code, reason)
 }
 
 fn has_automatic_candidate(evidence: &ArsRecallFusionEvidence) -> bool {
@@ -1424,7 +1662,8 @@ pub fn collect_recall_fusion_activation_report(
         crate::store::a12_calibration::A12_DEFAULT_NOISE_FLOOR,
     );
     let run = recall_fusion_calibration_run_attestation(&active_a12);
-    recall_fusion_activation_report(
+    recall_fusion_activation_report_live(
+        store,
         config,
         &adaptive,
         &policy,
@@ -1437,6 +1676,55 @@ pub fn collect_recall_fusion_activation_report(
 
 #[allow(clippy::too_many_arguments)]
 pub fn recall_fusion_activation_report(
+    config: &crate::config::ReinConfig,
+    adaptive: &AdaptiveState,
+    policy: &crate::store::ars_parameter_policy::ArsParameterPolicyLoad,
+    active_a12: &A12CalibrationLoad,
+    current_recall_gate: &RecallEvalGateAttestation,
+    calibration_run: Option<&RecallFusionCalibrationRunAttestation>,
+    now_millis: i64,
+) -> RecallFusionActivationReport {
+    recall_fusion_activation_report_impl(
+        None,
+        config,
+        adaptive,
+        policy,
+        active_a12,
+        current_recall_gate,
+        calibration_run,
+        now_millis,
+    )
+}
+
+/// Store-aware report boundary used by production doctor/Trust/release paths.
+/// Its scope decisions are identical to online recall: full snapshot hashing
+/// stays offline, while the live epoch and behavior fingerprint fail closed.
+#[allow(clippy::too_many_arguments)]
+pub fn recall_fusion_activation_report_live(
+    store: &crate::store::SqliteStore,
+    config: &crate::config::ReinConfig,
+    adaptive: &AdaptiveState,
+    policy: &crate::store::ars_parameter_policy::ArsParameterPolicyLoad,
+    active_a12: &A12CalibrationLoad,
+    current_recall_gate: &RecallEvalGateAttestation,
+    calibration_run: Option<&RecallFusionCalibrationRunAttestation>,
+    now_millis: i64,
+) -> RecallFusionActivationReport {
+    recall_fusion_activation_report_impl(
+        Some(store),
+        config,
+        adaptive,
+        policy,
+        active_a12,
+        current_recall_gate,
+        calibration_run,
+        now_millis,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recall_fusion_activation_report_impl(
+    live_store: Option<&crate::store::SqliteStore>,
     config: &crate::config::ReinConfig,
     adaptive: &AdaptiveState,
     policy: &crate::store::ars_parameter_policy::ArsParameterPolicyLoad,
@@ -1470,6 +1758,7 @@ pub fn recall_fusion_activation_report(
         .into_iter()
         .map(|scope| {
             recall_fusion_activation_scope_report(
+                live_store,
                 config,
                 adaptive,
                 policy,
@@ -1531,6 +1820,7 @@ pub fn recall_fusion_activation_report(
 
 #[allow(clippy::too_many_arguments)]
 fn recall_fusion_activation_scope_report(
+    live_store: Option<&crate::store::SqliteStore>,
     config: &crate::config::ReinConfig,
     adaptive: &AdaptiveState,
     policy: &crate::store::ars_parameter_policy::ArsParameterPolicyLoad,
@@ -1549,17 +1839,31 @@ fn recall_fusion_activation_scope_report(
         == crate::store::ars_parameter_policy::ArsParameterPolicyLoadStatus::Loaded
     {
         match runtime_scope_parts(scope) {
-            Some((query_type, cluster_id)) => resolve_runtime_recall_fusion(
-                &policy.policy,
-                config,
-                adaptive,
-                active_a12,
-                query_type,
-                cluster_id,
-                config.adaptive.min_samples_alpha,
-                crate::store::a12_calibration::A12_DEFAULT_NOISE_FLOOR,
-                now_millis,
-            ),
+            Some((query_type, cluster_id)) => match live_store {
+                Some(store) => resolve_runtime_recall_fusion_live(
+                    store,
+                    &policy.policy,
+                    config,
+                    adaptive,
+                    active_a12,
+                    query_type,
+                    cluster_id,
+                    config.adaptive.min_samples_alpha,
+                    crate::store::a12_calibration::A12_DEFAULT_NOISE_FLOOR,
+                    now_millis,
+                ),
+                None => resolve_runtime_recall_fusion(
+                    &policy.policy,
+                    config,
+                    adaptive,
+                    active_a12,
+                    query_type,
+                    cluster_id,
+                    config.adaptive.min_samples_alpha,
+                    crate::store::a12_calibration::A12_DEFAULT_NOISE_FLOOR,
+                    now_millis,
+                ),
+            },
             None => runtime_disabled(
                 Some(policy_key.clone()),
                 evidence.map_or(ArsRecallFusionEvidenceBasis::Static, |value| value.basis),
@@ -2090,7 +2394,7 @@ mod tests {
         };
         A12CalibrationLoad {
             state: A12CalibrationState {
-                schema_version: 1,
+                schema_version: crate::store::a12_calibration::A12_CALIBRATION_SCHEMA_VERSION,
                 revision: 4,
                 generation: 11,
                 generation_fingerprint: "generation-fingerprint".to_string(),
@@ -2102,12 +2406,40 @@ mod tests {
                 updated_at: 1_700_000_050,
                 run: Some(crate::store::a12_calibration::A12CalibrationRunMetadata {
                     phase: crate::store::a12_calibration::A12CalibrationPhase::Complete,
+                    source_input_epoch: 0,
                     source_snapshot_fingerprint: "source-snapshot-fingerprint".to_string(),
                     behavior_config_fingerprint: "behavior-config-fingerprint".to_string(),
                 }),
             },
             status: A12CalibrationLoadStatus::Loaded,
             error: None,
+        }
+    }
+
+    fn seal_current_live_inputs(
+        store: &crate::store::SqliteStore,
+        config: &ReinConfig,
+        calibration: &mut A12CalibrationLoad,
+    ) {
+        let source =
+            crate::ops::a12_autocalibration::a12_source_snapshot_fingerprint(store).unwrap();
+        let source_input_epoch =
+            crate::store::a12_calibration::load_a12_input_epoch(store.conn()).unwrap();
+        let hard_dedup_bound =
+            crate::ops::effective_hard_dedup_threshold_from_conn(store.conn(), config);
+        let behavior = crate::ops::a12_autocalibration::a12_behavior_config_fingerprint(
+            config,
+            hard_dedup_bound,
+            A12_RUNTIME_RECALL_TRACE_LIMIT,
+            config.adaptive.min_samples_alpha,
+        )
+        .unwrap();
+        let run = calibration.state.run.as_mut().unwrap();
+        run.source_input_epoch = source_input_epoch;
+        run.source_snapshot_fingerprint = source.clone();
+        run.behavior_config_fingerprint = behavior;
+        for entry in calibration.state.scopes.values_mut() {
+            entry.source_snapshot_fingerprint = source.clone();
         }
     }
 
@@ -2451,6 +2783,69 @@ mod tests {
         assert_eq!(attestation.fixture_fingerprint, None);
         assert_eq!(attestation.evaluated_at, None);
         assert!(attestation.reason.contains("baseline"));
+    }
+
+    #[test]
+    fn recall_gate_path_resolver_prefers_absolute_operator_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let operator_root = temp.path().join("operator-root");
+        let cwd_root = temp.path().join("checkout");
+        std::fs::create_dir_all(cwd_root.join("docs/eval-baselines")).unwrap();
+
+        let paths = resolve_recall_eval_gate_artifact_paths(
+            Some(operator_root.as_path()),
+            cwd_root.as_path(),
+        )
+        .expect("absolute operator root must be authoritative");
+
+        assert_eq!(
+            paths.baseline,
+            operator_root.join("docs/eval-baselines/recall.json")
+        );
+        assert_eq!(
+            paths.run,
+            operator_root.join("target/eval-gates/recall-run.json")
+        );
+    }
+
+    #[test]
+    fn recall_gate_path_resolver_discovers_checkout_ancestor() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_root = temp.path().join("checkout");
+        let nested = repo_root.join("crates/rein");
+        std::fs::create_dir_all(repo_root.join("docs/eval-baselines")).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let paths = resolve_recall_eval_gate_artifact_paths(None, &nested)
+            .expect("development checkout must be discovered from a nested cwd");
+
+        assert_eq!(
+            paths.baseline,
+            repo_root.join("docs/eval-baselines/recall.json")
+        );
+        assert_eq!(
+            paths.run,
+            repo_root.join("target/eval-gates/recall-run.json")
+        );
+    }
+
+    #[test]
+    fn recall_gate_path_resolver_rejects_relative_operator_root() {
+        let error = resolve_recall_eval_gate_artifact_paths(
+            Some(Path::new("relative-checkout")),
+            Path::new("/daemon-cwd"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, RecallEvalGatePathError::RelativeOperatorRoot);
+    }
+
+    #[test]
+    fn recall_gate_path_resolver_requires_explicit_root_outside_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = resolve_recall_eval_gate_artifact_paths(None, temp.path()).unwrap_err();
+
+        assert_eq!(error, RecallEvalGatePathError::Unconfigured);
     }
 
     #[test]
@@ -2966,6 +3361,167 @@ mod tests {
             resolved.simplex,
             Some(expected_runtime_simplex(simplex(values), 20, 0.25, &config))
         );
+    }
+
+    #[test]
+    fn live_runtime_resolution_blocks_ship_after_source_snapshot_drift() {
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+        let config = runtime_config();
+        let values = [0.35, 0.35, 0.10, 0.08, 0.07, 0.05];
+        let mut calibration = a12_loaded(
+            A12CalibrationScope::Global,
+            values,
+            20,
+            20,
+            A12CalibrationVerdict::Ship,
+        );
+        seal_current_live_inputs(&store, &config, &mut calibration);
+        let state = AdaptiveState {
+            version: 5,
+            ..Default::default()
+        };
+        let evidence = resolve_recall_fusion_evidence(
+            &state,
+            &calibration,
+            10,
+            0.02,
+            1_700_000_075_000,
+            &gate(ArsRecallGateStatus::Ship),
+        );
+        let policy = canary_policy(
+            state.version,
+            0.0,
+            HashMap::from([("recall_fusion:global".to_string(), 0.25)]),
+            evidence,
+        );
+
+        crate::ops::a12_autocalibration::reset_a12_full_snapshot_fingerprint_call_count();
+
+        let current = resolve_runtime_recall_fusion_live(
+            &store,
+            &policy,
+            &config,
+            &state,
+            &calibration,
+            "semantic",
+            None,
+            10,
+            0.02,
+            1_700_000_075_000,
+        );
+        assert_eq!(current.adoption_weight, 0.25, "{}", current.reason);
+        assert_eq!(
+            crate::ops::a12_autocalibration::a12_full_snapshot_fingerprint_call_count(),
+            0,
+            "online A12 resolution must never hash the full recall snapshot"
+        );
+
+        store
+            .conn()
+            .execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('rerank_weights', ?1)",
+                rusqlite::params!["{\"semantic\":0.5}"],
+            )
+            .unwrap();
+
+        let drifted = resolve_runtime_recall_fusion_live(
+            &store,
+            &policy,
+            &config,
+            &state,
+            &calibration,
+            "semantic",
+            None,
+            10,
+            0.02,
+            1_700_000_075_000,
+        );
+        assert_eq!(drifted.adoption_weight, 0.0);
+        assert_eq!(drifted.simplex, None);
+        assert_eq!(drifted.code, RecallFusionScopeHealthCode::Stale);
+        assert!(drifted.reason.contains("input epoch"));
+
+        let policy_load = crate::store::ars_parameter_policy::ArsParameterPolicyLoad {
+            policy,
+            status: crate::store::ars_parameter_policy::ArsParameterPolicyLoadStatus::Loaded,
+            error: None,
+        };
+        let run = recall_fusion_calibration_run_attestation(&calibration);
+        let report = recall_fusion_activation_report_live(
+            &store,
+            &config,
+            &state,
+            &policy_load,
+            &calibration,
+            &gate(ArsRecallGateStatus::Ship),
+            run.as_ref(),
+            1_700_000_075_000,
+        );
+        let global = report
+            .scopes
+            .iter()
+            .find(|scope| scope.scope == "global")
+            .unwrap();
+        assert!(!global.active);
+        assert_eq!(global.health_code, RecallFusionScopeHealthCode::Stale);
+        assert!(global.reason.contains("input epoch"));
+        assert_eq!(
+            crate::ops::a12_autocalibration::a12_full_snapshot_fingerprint_call_count(),
+            0,
+            "store-aware activation reports must use the O(1) live resolver"
+        );
+    }
+
+    #[test]
+    fn live_runtime_resolution_blocks_ship_after_behavior_config_drift() {
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+        let config = runtime_config();
+        let mut calibration = a12_loaded(
+            A12CalibrationScope::Global,
+            [0.35, 0.35, 0.10, 0.08, 0.07, 0.05],
+            20,
+            20,
+            A12CalibrationVerdict::Ship,
+        );
+        seal_current_live_inputs(&store, &config, &mut calibration);
+        let state = AdaptiveState {
+            version: 5,
+            ..Default::default()
+        };
+        let evidence = resolve_recall_fusion_evidence(
+            &state,
+            &calibration,
+            10,
+            0.02,
+            1_700_000_075_000,
+            &gate(ArsRecallGateStatus::Ship),
+        );
+        let policy = canary_policy(
+            state.version,
+            0.0,
+            HashMap::from([("recall_fusion:global".to_string(), 0.25)]),
+            evidence,
+        );
+        let mut drifted_config = config.clone();
+        drifted_config.search.strong_signal_ratio += 0.01;
+
+        let drifted = resolve_runtime_recall_fusion_live(
+            &store,
+            &policy,
+            &drifted_config,
+            &state,
+            &calibration,
+            "semantic",
+            None,
+            10,
+            0.02,
+            1_700_000_075_000,
+        );
+
+        assert_eq!(drifted.adoption_weight, 0.0);
+        assert_eq!(drifted.simplex, None);
+        assert_eq!(drifted.code, RecallFusionScopeHealthCode::Stale);
+        assert!(drifted.reason.contains("behavior config"));
     }
 
     #[test]

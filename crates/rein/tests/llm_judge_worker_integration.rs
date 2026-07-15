@@ -770,7 +770,7 @@ fn structural_anchor_events_only_advance_the_independent_structural_state() {
     let after = AdaptiveState::restore_snapshot(store.conn()).expect("adaptive state remains");
     assert_eq!(
         serde_json::to_value(&after).unwrap(),
-        serde_json::to_value(&before).unwrap(),
+        serde_json::to_value(&consumer_input).unwrap(),
         "anchor events must not mutate AdaptiveState"
     );
     for (consumer, expected) in [

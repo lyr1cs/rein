@@ -16,6 +16,7 @@ const A12_RECALL_TRACE_LIMIT: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct A12RefreshInputs {
+    source_input_epoch: u64,
     source_snapshot_fingerprint: String,
     behavior_config_fingerprint: String,
     hard_dedup_bound_bits: u32,
@@ -49,15 +50,17 @@ enum A12CalibrationRefreshOutcome {
 fn a12_generation_fingerprint(
     phase: &str,
     generation: u64,
+    source_input_epoch: u64,
     source_snapshot_fingerprint: &str,
     behavior_config_fingerprint: &str,
     corpus_fingerprint: &str,
     calibrated_at_unix_ms: i64,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"a12-calibration-generation-v1\0");
+    hasher.update(b"a12-calibration-generation-v2\0");
     for field in [
         phase.as_bytes(),
+        &source_input_epoch.to_le_bytes(),
         source_snapshot_fingerprint.as_bytes(),
         behavior_config_fingerprint.as_bytes(),
         corpus_fingerprint.as_bytes(),
@@ -281,8 +284,16 @@ where
     })?;
     let hard_dedup_bound =
         crate::ops::effective_hard_dedup_threshold_from_conn(store.conn(), config);
+    let source_input_epoch = crate::store::a12_calibration::load_a12_input_epoch(store.conn())?;
     let source_snapshot_fingerprint =
         crate::ops::a12_autocalibration::a12_source_snapshot_fingerprint(store)?;
+    let source_input_epoch_after =
+        crate::store::a12_calibration::load_a12_input_epoch(store.conn())?;
+    if source_input_epoch_after != source_input_epoch {
+        return Err(ReinError::Config(format!(
+            "A12 input epoch advanced during source snapshot capture: before={source_input_epoch} after={source_input_epoch_after}"
+        )));
+    }
     let behavior_config_fingerprint =
         crate::ops::a12_autocalibration::a12_behavior_config_fingerprint(
             config,
@@ -291,6 +302,7 @@ where
             config.adaptive.min_samples_alpha,
         )?;
     let inputs = A12RefreshInputs {
+        source_input_epoch,
         source_snapshot_fingerprint,
         behavior_config_fingerprint,
         hard_dedup_bound_bits: hard_dedup_bound.to_bits(),
@@ -310,7 +322,8 @@ where
     if loaded.status == A12CalibrationLoadStatus::Loaded
         && loaded.state.is_complete()
         && loaded.state.run.as_ref().is_some_and(|run| {
-            run.source_snapshot_fingerprint == inputs.source_snapshot_fingerprint
+            run.source_input_epoch == inputs.source_input_epoch
+                && run.source_snapshot_fingerprint == inputs.source_snapshot_fingerprint
                 && run.behavior_config_fingerprint == inputs.behavior_config_fingerprint
         })
         && loaded
@@ -339,6 +352,7 @@ where
     let pending_corpus_fingerprint = a12_generation_fingerprint(
         "pending-corpus",
         pending_generation,
+        inputs.source_input_epoch,
         &inputs.source_snapshot_fingerprint,
         &inputs.behavior_config_fingerprint,
         "pending",
@@ -347,6 +361,7 @@ where
     let pending_generation_fingerprint = a12_generation_fingerprint(
         "pending",
         pending_generation,
+        inputs.source_input_epoch,
         &inputs.source_snapshot_fingerprint,
         &inputs.behavior_config_fingerprint,
         &pending_corpus_fingerprint,
@@ -365,6 +380,7 @@ where
         updated_at: calibrated_at_unix_s,
         run: Some(A12CalibrationRunMetadata {
             phase: A12CalibrationPhase::Pending,
+            source_input_epoch: inputs.source_input_epoch,
             source_snapshot_fingerprint: inputs.source_snapshot_fingerprint.clone(),
             behavior_config_fingerprint: inputs.behavior_config_fingerprint.clone(),
         }),
@@ -385,6 +401,13 @@ where
         return Err(ReinError::Config(
             "A12 calibration batch does not match its pending snapshot/corpus identity".into(),
         ));
+    }
+    let live_epoch = crate::store::a12_calibration::load_a12_input_epoch(store.conn())?;
+    if live_epoch != inputs.source_input_epoch {
+        return Err(ReinError::Config(format!(
+            "A12 input epoch advanced before final CAS: pending={} live={live_epoch}",
+            inputs.source_input_epoch
+        )));
     }
     let live_snapshot = crate::ops::a12_autocalibration::a12_source_snapshot_fingerprint(store)?;
     if live_snapshot != inputs.source_snapshot_fingerprint {
@@ -434,6 +457,7 @@ where
     let final_generation_fingerprint = a12_generation_fingerprint(
         "complete",
         final_generation,
+        inputs.source_input_epoch,
         &inputs.source_snapshot_fingerprint,
         &inputs.behavior_config_fingerprint,
         &batch.corpus_fingerprint,
@@ -469,6 +493,7 @@ where
         updated_at,
         run: Some(A12CalibrationRunMetadata {
             phase: A12CalibrationPhase::Complete,
+            source_input_epoch: inputs.source_input_epoch,
             source_snapshot_fingerprint: inputs.source_snapshot_fingerprint,
             behavior_config_fingerprint: inputs.behavior_config_fingerprint,
         }),
@@ -479,6 +504,16 @@ where
     before_final_cas(store, &pending)?;
     store.conn().execute_batch("BEGIN IMMEDIATE")?;
     let publication = (|| -> ReinResult<A12CalibrationRefreshOutcome> {
+        let locked_epoch = crate::store::a12_calibration::load_a12_input_epoch(store.conn())?;
+        if locked_epoch
+            != final_state
+                .run
+                .as_ref()
+                .expect("Task-5 final state always carries run metadata")
+                .source_input_epoch
+        {
+            return Ok(A12CalibrationRefreshOutcome::FinalSnapshotMismatch);
+        }
         let locked_snapshot =
             crate::ops::a12_autocalibration::a12_source_snapshot_fingerprint_in_transaction(store)?;
         if locked_snapshot
@@ -1430,22 +1465,14 @@ fn refresh_ars_parameter_policy(
     state: &crate::store::adaptive::AdaptiveState,
 ) {
     let active_a12 = crate::store::a12_calibration::load_a12_calibration(conn);
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let baseline_path = cwd.join("docs/eval-baselines/recall.json");
-    let run_path = cwd.join("target/eval-gates/recall-run.json");
-    let recall_gate = crate::ops::a12_activation::recall_eval_gate_attestation(
-        &baseline_path,
-        &run_path,
+    let recall_gate = crate::ops::a12_activation::current_recall_eval_gate_attestation(
         crate::store::a12_calibration::A12_DEFAULT_NOISE_FLOOR,
     );
-    // Scorecards resolve against the process working directory, so a daemon
-    // started outside the repository attests NoData on every refresh and
-    // automatic activation never arms. Log the resolved paths and attestation
-    // outcome so operators can see why; the paths themselves are never
-    // persisted into the sealed policy.
+    // The shared resolver honors an explicit absolute REIN_EVAL_GATE_ROOT and
+    // otherwise discovers only a checkout ancestor. Log semantic identity,
+    // never host-local artifact paths; installed daemons without a configured
+    // root fail closed with the same NoData result exposed by Trust/doctor.
     tracing::info!(
-        baseline_path = %baseline_path.display(),
-        run_path = %run_path.display(),
         status = ?recall_gate.status,
         reason_code = ?recall_gate.reason_code,
         reason = %recall_gate.reason,
@@ -5608,6 +5635,7 @@ mod tests {
                 updated_at: 1_700_000_050,
                 run: Some(A12CalibrationRunMetadata {
                     phase: A12CalibrationPhase::Complete,
+                    source_input_epoch: 0,
                     source_snapshot_fingerprint: "source-snapshot-fingerprint".to_string(),
                     behavior_config_fingerprint: "behavior-config-fingerprint".to_string(),
                 }),

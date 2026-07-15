@@ -9,6 +9,8 @@
 // Keep this module warning-clean before those integrations land.
 #![allow(dead_code)]
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use chrono::{DateTime, Utc};
@@ -21,6 +23,23 @@ use crate::types::{ReinError, ReinResult};
 
 const A12_FAMILY_PREFIX: &str = "a12-family:";
 const A12_SPLIT_MODULUS: u8 = 5;
+#[cfg(test)]
+thread_local! {
+    // Test-only instrumentation is thread-local because Rust runs unit tests
+    // concurrently. A process-global Atomic made an unrelated calibration
+    // test look like the live resolver performed a full snapshot hash.
+    static A12_FULL_SNAPSHOT_FINGERPRINT_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_a12_full_snapshot_fingerprint_call_count() {
+    A12_FULL_SNAPSHOT_FINGERPRINT_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn a12_full_snapshot_fingerprint_call_count() -> usize {
+    A12_FULL_SNAPSHOT_FINGERPRINT_CALLS.with(Cell::get)
+}
 
 /// Source of an independently supported LOO positive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -289,6 +308,8 @@ pub(crate) fn a12_behavior_config_fingerprint(
 /// Capture the complete local SQLite-backed recall identity without exposing
 /// the transaction implementation to the cadence/orchestration layer.
 pub(crate) fn a12_source_snapshot_fingerprint(store: &SqliteStore) -> ReinResult<String> {
+    #[cfg(test)]
+    A12_FULL_SNAPSHOT_FINGERPRINT_CALLS.with(|calls| calls.set(calls.get() + 1));
     capture_a12_local_recall_snapshot_identity(store)
 }
 
@@ -299,6 +320,8 @@ pub(crate) fn a12_source_snapshot_fingerprint(store: &SqliteStore) -> ReinResult
 pub(crate) fn a12_source_snapshot_fingerprint_in_transaction(
     store: &SqliteStore,
 ) -> ReinResult<String> {
+    #[cfg(test)]
+    A12_FULL_SNAPSHOT_FINGERPRINT_CALLS.with(|calls| calls.set(calls.get() + 1));
     a12_local_recall_snapshot_identity(store)
 }
 
@@ -835,12 +858,14 @@ fn hash_a12_recall_metadata(
                     ) {
                         Ok(state) => {
                             hash_field(hasher, b"adaptive-restore-ok");
-                            let projection = serde_json::json!({
-                                "learned_alpha": state.learned_alpha,
-                                "cluster_version": state.cluster_version,
-                                "memory_clusters": state.memory_clusters,
-                            });
-                            hash_canonical_json(hasher, &projection);
+                            // Keep the offline snapshot identity exactly aligned
+                            // with the projection digest persisted by every
+                            // AdaptiveState writer. The v4 epoch trigger can then
+                            // ignore unrelated adaptive bookkeeping without
+                            // allowing a replay-relevant change through.
+                            let projection_fingerprint =
+                                state.compute_a12_recall_projection_fingerprint()?;
+                            hash_field(hasher, projection_fingerprint.as_bytes());
                         }
                         Err(_) => {
                             // Any type error anywhere makes production's
@@ -1148,7 +1173,21 @@ struct EvidenceView {
 struct FamilySnapshot {
     families: Vec<A12CanonicalFamily>,
     member_to_family: HashMap<String, String>,
-    live_tip_content: HashMap<String, String>,
+    raw_memories: Vec<RawFamilyMemory>,
+}
+
+#[derive(Debug)]
+struct RawFamilyMemory {
+    id: String,
+    content: String,
+    stable_family_id: String,
+    live_tip_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct EvidenceSnapshot {
+    by_family: BTreeMap<String, Vec<EvidenceView>>,
+    all_views: Vec<EvidenceView>,
 }
 
 /// Compute the full 256-bit digest modulo five (rather than truncating the
@@ -1598,18 +1637,11 @@ fn build_a12_loo_corpus_inner(
         .iter()
         .map(|family| (family.stable_family_id.as_str(), family))
         .collect();
-    let mut evidence_by_family = load_evidence_views(store, &snapshot.member_to_family)?;
+    let EvidenceSnapshot {
+        by_family: mut evidence_by_family,
+        all_views: all_evidence_views,
+    } = load_evidence_views(store, &snapshot.member_to_family)?;
     let auxiliary = load_auxiliary_family_links(store, &snapshot.member_to_family)?;
-
-    let live_candidates: Vec<(&A12CanonicalFamily, &str, &str)> = snapshot
-        .families
-        .iter()
-        .filter_map(|family| {
-            let live_tip_id = family.live_tip_id.as_deref()?;
-            let content = snapshot.live_tip_content.get(live_tip_id)?;
-            Some((family, live_tip_id, content.as_str()))
-        })
-        .collect();
 
     let mut observations = Vec::new();
     let mut abstentions = Vec::new();
@@ -1629,9 +1661,29 @@ fn build_a12_loo_corpus_inner(
             continue;
         }
 
+        // A12 is family-level leave-one-evidence-out, not row-level
+        // leave-one-out. Holding back only the query's original row lets
+        // another superseded predecessor match FTS and collapse into the live
+        // tip; retaining sibling evidence likewise leaks the label through
+        // evidence-derived features. Seal all family evidence once and copy it
+        // into every view. `loo_exclusion` also compares the query with every
+        // raw memory and evidence row. A cross-family duplicate excludes both
+        // the raw row and its collapsed live tip; own-family predecessors stay
+        // held out without invalidating an independently supported live tip.
+        let mut family_evidence_ids = views.iter().map(|view| view.id.clone()).collect::<Vec<_>>();
+        family_evidence_ids.sort();
+        family_evidence_ids.dedup();
+
         let mut cases = Vec::new();
         for view in views {
-            let exclusion = loo_exclusion(&view, &live_candidates, hard_dedup_bound);
+            let exclusion = loo_exclusion(
+                &view,
+                family,
+                &family_evidence_ids,
+                &snapshot.raw_memories,
+                &all_evidence_views,
+                hard_dedup_bound,
+            );
             let Some(canonical_live_tip_id) = family.live_tip_id.as_deref() else {
                 abstentions.push(A12LooAbstention {
                     stable_family_id: family.stable_family_id.clone(),
@@ -1767,9 +1819,12 @@ impl A12LooExclusion {
 fn load_family_snapshot(store: &SqliteStore) -> ReinResult<FamilySnapshot> {
     let memories = load_memory_snapshots(store)?;
     let mut by_live_tip: BTreeMap<String, Vec<MemorySnapshot>> = BTreeMap::new();
-    for memory in memories {
+    for memory in &memories {
         let live_tip_id = store.canonical_id_for(&memory.id)?;
-        by_live_tip.entry(live_tip_id).or_default().push(memory);
+        by_live_tip
+            .entry(live_tip_id)
+            .or_default()
+            .push(memory.clone());
     }
 
     let mut assembled = Vec::with_capacity(by_live_tip.len());
@@ -1799,31 +1854,49 @@ fn load_family_snapshot(store: &SqliteStore) -> ReinResult<FamilySnapshot> {
             live_tip_id: live_tip.map(|tip| tip.id.clone()),
             member_ids: members.iter().map(|member| member.id.clone()).collect(),
         };
-        assembled.push((family, live_tip.map(|tip| tip.content.clone())));
+        assembled.push(family);
     }
-    assembled.sort_by(|(left, _), (right, _)| {
+    assembled.sort_by(|left, right| {
         left.stable_created_at
             .cmp(&right.stable_created_at)
             .then_with(|| left.stable_family_id.cmp(&right.stable_family_id))
     });
 
     let mut member_to_family = HashMap::new();
-    let mut live_tip_content = HashMap::new();
+    let mut family_live_tips = HashMap::new();
     let mut families = Vec::with_capacity(assembled.len());
-    for (family, content) in assembled {
+    for family in assembled {
         for member_id in &family.member_ids {
             member_to_family.insert(member_id.clone(), family.stable_family_id.clone());
         }
-        if let (Some(live_tip_id), Some(content)) = (&family.live_tip_id, content) {
-            live_tip_content.insert(live_tip_id.clone(), content);
-        }
+        family_live_tips.insert(family.stable_family_id.clone(), family.live_tip_id.clone());
         families.push(family);
     }
+
+    let raw_memories = memories
+        .into_iter()
+        .map(|memory| {
+            let stable_family_id = member_to_family
+                .get(&memory.id)
+                .expect("every loaded memory must belong to an assembled family")
+                .clone();
+            let live_tip_id = family_live_tips
+                .get(&stable_family_id)
+                .expect("every assembled family must have a live-tip entry")
+                .clone();
+            RawFamilyMemory {
+                id: memory.id,
+                content: memory.content,
+                stable_family_id,
+                live_tip_id,
+            }
+        })
+        .collect();
 
     Ok(FamilySnapshot {
         families,
         member_to_family,
-        live_tip_content,
+        raw_memories,
     })
 }
 
@@ -1859,7 +1932,7 @@ fn load_memory_snapshots(store: &SqliteStore) -> ReinResult<Vec<MemorySnapshot>>
 fn load_evidence_views(
     store: &SqliteStore,
     member_to_family: &HashMap<String, String>,
-) -> ReinResult<BTreeMap<String, Vec<EvidenceView>>> {
+) -> ReinResult<EvidenceSnapshot> {
     let mut statement = store.conn().prepare(
         "SELECT id, memory_id, canonical_id, content, created_at, imported_at \
          FROM memory_evidence ORDER BY created_at, imported_at, id",
@@ -1876,26 +1949,29 @@ fn load_evidence_views(
     })?;
 
     let mut by_family: BTreeMap<String, Vec<EvidenceView>> = BTreeMap::new();
+    let mut all_views = Vec::new();
     for row in rows {
         let (id, original_memory_id, canonical_id, content, created_at, imported_at) = row?;
-        let stable_family_id = original_memory_id
+        let view = EvidenceView {
+            id,
+            original_memory_id,
+            canonical_id,
+            content,
+            created_at: parse_timestamp(&created_at, "memory_evidence.created_at")?,
+            imported_at: parse_timestamp(&imported_at, "memory_evidence.imported_at")?,
+        };
+        let stable_family_id = view
+            .original_memory_id
             .as_ref()
             .and_then(|memory_id| member_to_family.get(memory_id))
-            .or_else(|| member_to_family.get(&canonical_id));
-        let Some(stable_family_id) = stable_family_id else {
-            continue;
-        };
-        by_family
-            .entry(stable_family_id.clone())
-            .or_default()
-            .push(EvidenceView {
-                id,
-                original_memory_id,
-                canonical_id,
-                content,
-                created_at: parse_timestamp(&created_at, "memory_evidence.created_at")?,
-                imported_at: parse_timestamp(&imported_at, "memory_evidence.imported_at")?,
-            });
+            .or_else(|| member_to_family.get(&view.canonical_id));
+        if let Some(stable_family_id) = stable_family_id {
+            by_family
+                .entry(stable_family_id.clone())
+                .or_default()
+                .push(view.clone());
+        }
+        all_views.push(view);
     }
     for views in by_family.values_mut() {
         views.sort_by(|left, right| {
@@ -1906,7 +1982,10 @@ fn load_evidence_views(
                 .then_with(|| left.id.cmp(&right.id))
         });
     }
-    Ok(by_family)
+    Ok(EvidenceSnapshot {
+        by_family,
+        all_views,
+    })
 }
 
 type AuxiliaryFamilyLinks = BTreeMap<String, BTreeMap<String, BTreeSet<A12OutcomeProvenance>>>;
@@ -1975,24 +2054,56 @@ fn add_auxiliary_group(
 
 fn loo_exclusion(
     view: &EvidenceView,
-    live_candidates: &[(&A12CanonicalFamily, &str, &str)],
+    family: &A12CanonicalFamily,
+    family_evidence_ids: &[String],
+    raw_memories: &[RawFamilyMemory],
+    all_evidence_views: &[EvidenceView],
     hard_dedup_bound: f32,
 ) -> A12LooExclusion {
-    let mut held_out_memory_ids = view.original_memory_id.iter().cloned().collect::<Vec<_>>();
+    let mut held_out_memory_ids = family
+        .member_ids
+        .iter()
+        .filter(|memory_id| {
+            Some(memory_id.as_str()) != family.live_tip_id.as_deref()
+                || view.original_memory_id.as_deref() == Some(memory_id.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     held_out_memory_ids.sort();
-    let held_out_evidence_ids = vec![view.id.clone()];
+    held_out_memory_ids.dedup();
+    let mut held_out_evidence_ids = family_evidence_ids.to_vec();
     let content_hash = sha256_hex(&view.content);
     let mut equal_content_memory_ids = Vec::new();
     let mut near_duplicate_memory_ids = Vec::new();
 
-    for (_, live_tip_id, content) in live_candidates {
-        if sha256_hex(content) == content_hash {
-            equal_content_memory_ids.push((*live_tip_id).to_string());
+    for raw_memory in raw_memories {
+        let already_held_out = held_out_memory_ids
+            .binary_search_by(|candidate| candidate.as_str().cmp(&raw_memory.id))
+            .is_ok();
+        let equal_content = sha256_hex(&raw_memory.content) == content_hash;
+        let near_duplicate = similarity(&view.content, &raw_memory.content) >= hard_dedup_bound;
+        if equal_content && !already_held_out {
+            equal_content_memory_ids.push(raw_memory.id.clone());
+            if raw_memory.stable_family_id != family.stable_family_id {
+                equal_content_memory_ids.extend(raw_memory.live_tip_id.iter().cloned());
+            }
         }
-        if similarity(&view.content, content) >= hard_dedup_bound {
-            near_duplicate_memory_ids.push((*live_tip_id).to_string());
+        if near_duplicate && !already_held_out {
+            near_duplicate_memory_ids.push(raw_memory.id.clone());
+            if raw_memory.stable_family_id != family.stable_family_id {
+                near_duplicate_memory_ids.extend(raw_memory.live_tip_id.iter().cloned());
+            }
         }
     }
+    for evidence in all_evidence_views {
+        if sha256_hex(&evidence.content) == content_hash
+            || similarity(&view.content, &evidence.content) >= hard_dedup_bound
+        {
+            held_out_evidence_ids.push(evidence.id.clone());
+        }
+    }
+    held_out_evidence_ids.sort();
+    held_out_evidence_ids.dedup();
     equal_content_memory_ids.sort();
     equal_content_memory_ids.dedup();
     near_duplicate_memory_ids.sort();
@@ -2204,6 +2315,147 @@ mod tests {
         assert_eq!(family_after.split_bucket, original_bucket);
         assert_eq!(family_after.fold, original_fold);
         assert_eq!(family_after.member_ids, vec![root_id, middle_id, final_id]);
+    }
+
+    #[test]
+    fn loo_excludes_every_family_predecessor_and_evidence_view() {
+        let store = SqliteStore::in_memory().unwrap();
+        let root_id = "loo-family-root";
+        let middle_id = "loo-family-middle";
+        let live_tip_id = "loo-family-tip";
+        store
+            .store(memory(root_id, "unique predecessor phrase for fts leakage"))
+            .unwrap();
+        store
+            .store(memory(middle_id, "unique predecessor phrase plus revision"))
+            .unwrap();
+        store
+            .store(memory(live_tip_id, "independent current canonical content"))
+            .unwrap();
+        store.mark_superseded(root_id, middle_id).unwrap();
+        store.mark_superseded(middle_id, live_tip_id).unwrap();
+
+        let family_evidence_ids = {
+            let mut statement = store
+                .conn()
+                .prepare(
+                    "SELECT id FROM memory_evidence \
+                     WHERE memory_id IN (?1, ?2, ?3) ORDER BY id",
+                )
+                .unwrap();
+            statement
+                .query_map(rusqlite::params![root_id, middle_id, live_tip_id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(family_evidence_ids.len(), 3);
+
+        let corpus = build_a12_loo_corpus(&store, 0.95).unwrap();
+        let observation = corpus
+            .observations
+            .iter()
+            .find(|observation| observation.stable_family_id == root_id)
+            .expect("canonical family should retain leakage-free query views");
+        let mut family_memory_ids = vec![root_id.to_string(), middle_id.to_string()];
+        family_memory_ids.sort();
+        for case in &observation.cases {
+            assert_eq!(case.exclusion.held_out_memory_ids, family_memory_ids);
+            assert!(!case
+                .exclusion
+                .held_out_memory_ids
+                .contains(&live_tip_id.to_string()));
+            assert_eq!(case.exclusion.held_out_evidence_ids, family_evidence_ids);
+        }
+    }
+
+    #[test]
+    fn loo_excludes_cross_family_superseded_duplicate_before_canonical_collapse() {
+        let store = SqliteStore::in_memory().unwrap();
+        let held_root = id_for_fold("cross-family-held-root", A12Fold::Training);
+        let held_tip = "cross-family-held-tip";
+        let other_root = id_for_fold("cross-family-other-root", A12Fold::Training);
+        let other_middle = "cross-family-other-middle";
+        let other_tip = "cross-family-other-tip";
+        let query = "Rust borrow checker prevents dangling references";
+        let leaked_middle = "Rust borrow checker prevents a dangling reference";
+        let independent_tip = "Postgres transactions preserve durable commits";
+        let hard_bound = similarity(query, leaked_middle);
+        assert!(hard_bound > similarity(query, independent_tip));
+
+        store.store(memory(&held_root, query)).unwrap();
+        store
+            .store(memory(held_tip, "independent held-family canonical text"))
+            .unwrap();
+        set_created_at(&store, &held_root, "2026-01-01T00:00:00Z");
+        set_created_at(&store, held_tip, "2026-02-01T00:00:00Z");
+        store.mark_superseded(&held_root, held_tip).unwrap();
+
+        store
+            .store(memory(&other_root, "other family historical root"))
+            .unwrap();
+        store.store(memory(other_middle, leaked_middle)).unwrap();
+        store.store(memory(other_tip, independent_tip)).unwrap();
+        set_created_at(&store, &other_root, "2026-01-01T00:00:00Z");
+        set_created_at(&store, other_middle, "2026-02-01T00:00:00Z");
+        set_created_at(&store, other_tip, "2026-03-01T00:00:00Z");
+        store.mark_superseded(&other_root, other_middle).unwrap();
+        store.mark_superseded(other_middle, other_tip).unwrap();
+        insert_auxiliary_group(&store, &[held_root.as_str(), other_root.as_str()]);
+
+        let leaked_evidence_id = store
+            .conn()
+            .query_row(
+                "SELECT id FROM memory_evidence WHERE memory_id = ?1 AND content = ?2 \
+                 ORDER BY id LIMIT 1",
+                rusqlite::params![other_middle, leaked_middle],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let corpus = build_a12_loo_corpus(&store, hard_bound).unwrap();
+        let case = corpus
+            .observations
+            .iter()
+            .find(|observation| observation.stable_family_id == held_root)
+            .and_then(|observation| {
+                observation
+                    .cases
+                    .iter()
+                    .find(|case| case.original_memory_id.as_deref() == Some(held_root.as_str()))
+            })
+            .expect("held-out root must retain its independent canonical positive");
+
+        assert!(case
+            .exclusion
+            .near_duplicate_memory_ids
+            .contains(&other_middle.to_string()));
+        assert!(case
+            .exclusion
+            .near_duplicate_memory_ids
+            .contains(&other_tip.to_string()));
+        assert!(case
+            .exclusion
+            .held_out_evidence_ids
+            .contains(&leaked_evidence_id));
+
+        let trace = crate::search::recall::recall_loo_trace(
+            &store,
+            &crate::config::ReinConfig::default(),
+            case,
+            10,
+        )
+        .unwrap();
+        assert!(!trace
+            .event
+            .candidates
+            .iter()
+            .any(|candidate| candidate.memory_id == other_middle));
+        assert!(!trace
+            .legacy_order
+            .iter()
+            .any(|memory_id| memory_id == other_tip));
     }
 
     #[test]

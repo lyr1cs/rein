@@ -9,7 +9,7 @@
 // migration after the first run.  See `reviews/fix-20260511-F4-oauth.md`.
 // ============================================================================
 use crate::types::{ReinError, ReinResult};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::sync::Once;
 
 /// v0.31 candidate (Agent F4 / A-H2): current OAuth migration schema version.
@@ -142,6 +142,15 @@ const MIGRATIONS: &[Migration] = &[
         // argument as v2.
         idempotent: true,
     },
+    Migration {
+        version: 4,
+        name: "create_a12_input_epoch",
+        up: create_a12_input_epoch,
+        // Metadata initialization plus CREATE TRIGGER IF NOT EXISTS only.
+        // Replaying the migration cannot duplicate trigger programs or reset
+        // an already-advanced epoch.
+        idempotent: true,
+    },
 ];
 
 /// v2 forward migration: durable `(subject, predicate, object)` fact table for
@@ -202,6 +211,123 @@ fn create_memory_triple_meta(conn: &Connection) -> ReinResult<()> {
             extracted_at TEXT NOT NULL
         );",
     )?;
+    Ok(())
+}
+
+/// v4 forward migration: monotonic O(1) invalidation token for online A12.
+///
+/// Offline calibration still hashes the complete SQLite recall snapshot. Live
+/// recall only needs to know whether any input to that snapshot changed since
+/// the generation was sealed, so every base-table write increments one durable
+/// counter. FTS shadow tables are derived synchronously from `memories` and
+/// `concepts`; vec0 writes flow through `embedding_write_seq`, which the
+/// metadata trigger below observes. This avoids triggers on virtual/shadow
+/// tables and keeps the epoch independent of SQLite extension internals.
+fn create_a12_input_epoch(conn: &Connection) -> ReinResult<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO metadata(key, value) VALUES ('a12_input_epoch', '0')",
+        [],
+    )?;
+
+    // Existing adaptive snapshots predate the projection digest. Backfill only
+    // when this binary can parse the row, and preserve unknown top-level fields
+    // so a mixed-version deployment never loses forward-compatible data. A
+    // malformed/future row deliberately stays without a digest; the trigger
+    // below will then conservatively advance the epoch on every rewrite.
+    let adaptive_raw = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'adaptive_state'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(raw) = adaptive_raw {
+        if let Ok(state) = serde_json::from_str::<crate::store::adaptive::AdaptiveState>(&raw) {
+            if let Ok(fingerprint) = state.compute_a12_recall_projection_fingerprint() {
+                conn.execute(
+                    "UPDATE metadata
+                     SET value = json_set(value, '$.a12_recall_projection_fingerprint', ?1)
+                     WHERE key = 'adaptive_state'",
+                    rusqlite::params![fingerprint],
+                )?;
+            }
+        }
+    }
+
+    // One row can legitimately bump more than once (for example a memory
+    // INSERT also creates canonical state). Exact deltas are irrelevant; only
+    // monotonic change matters. The nested metadata UPDATE cannot recurse:
+    // all metadata triggers below exclude `a12_input_epoch` in their WHEN
+    // predicates, including when PRAGMA recursive_triggers is enabled.
+    const BUMP: &str = "
+        UPDATE metadata SET value = CASE
+            WHEN typeof(value) = 'text'
+             AND value <> ''
+             AND value NOT GLOB '*[^0-9]*'
+             AND length(value) <= 19
+             AND (length(value) < 19 OR value < '9223372036854775807')
+            THEN CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+            ELSE RAISE(ABORT, 'a12_input_epoch is malformed, negative, or exhausted')
+        END WHERE key = 'a12_input_epoch';
+        SELECT CASE WHEN changes() = 1 THEN 1
+            ELSE RAISE(ABORT, 'a12_input_epoch is missing') END;";
+    for table in [
+        "memories",
+        "memory_canonical_state",
+        "memory_evidence",
+        "concepts",
+        "concept_links",
+        "episodes",
+    ] {
+        for (suffix, operation) in [("ai", "INSERT"), ("au", "UPDATE"), ("ad", "DELETE")] {
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER IF NOT EXISTS a12_input_epoch_{table}_{suffix} \
+                 AFTER {operation} ON {table} BEGIN {BUMP} END;"
+            ))?;
+        }
+    }
+
+    let relevant_new = "NEW.key IN ('adaptive_state', 'rerank_weights', 'embedding_write_seq') \
+                        OR NEW.key GLOB 'survival_curve:*'";
+    let relevant_old = "OLD.key IN ('adaptive_state', 'rerank_weights', 'embedding_write_seq') \
+                        OR OLD.key GLOB 'survival_curve:*'";
+    // AdaptiveState is large and its version advances on every cadence. Only
+    // three fields affect A12 replay, so current writers persist their shared
+    // projection digest. Equality is trusted only for two valid 64-hex text
+    // digests. Missing, malformed, or legacy digests always bump (fail closed).
+    let same_valid_adaptive_projection = "
+        OLD.key = 'adaptive_state'
+        AND NEW.key = 'adaptive_state'
+        AND CASE
+            WHEN json_valid(OLD.value) = 0 OR json_valid(NEW.value) = 0 THEN 0
+            WHEN json_type(OLD.value, '$.a12_recall_projection_fingerprint') != 'text'
+              OR json_type(NEW.value, '$.a12_recall_projection_fingerprint') != 'text'
+            THEN 0
+            WHEN length(json_extract(OLD.value, '$.a12_recall_projection_fingerprint')) != 64
+              OR length(json_extract(NEW.value, '$.a12_recall_projection_fingerprint')) != 64
+            THEN 0
+            WHEN json_extract(OLD.value, '$.a12_recall_projection_fingerprint')
+                   GLOB '*[^0-9A-Fa-f]*'
+              OR json_extract(NEW.value, '$.a12_recall_projection_fingerprint')
+                   GLOB '*[^0-9A-Fa-f]*'
+            THEN 0
+            WHEN json_extract(OLD.value, '$.a12_recall_projection_fingerprint') =
+                 json_extract(NEW.value, '$.a12_recall_projection_fingerprint')
+            THEN 1
+            ELSE 0
+        END = 1";
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER IF NOT EXISTS a12_input_epoch_metadata_ai
+             AFTER INSERT ON metadata WHEN {relevant_new} BEGIN {BUMP} END;
+         CREATE TRIGGER IF NOT EXISTS a12_input_epoch_metadata_au
+             AFTER UPDATE ON metadata
+             WHEN ({relevant_old} OR {relevant_new})
+              AND (OLD.key IS NOT NEW.key OR OLD.value IS NOT NEW.value)
+              AND NOT ({same_valid_adaptive_projection})
+             BEGIN {BUMP} END;
+         CREATE TRIGGER IF NOT EXISTS a12_input_epoch_metadata_ad
+             AFTER DELETE ON metadata WHEN {relevant_old} BEGIN {BUMP} END;"
+    ))?;
     Ok(())
 }
 
@@ -2148,6 +2274,342 @@ pub fn replace_vector_index_from_staging(conn: &Connection, dims: usize) -> Rein
 mod migration_tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    fn a12_input_epoch(conn: &Connection) -> Option<u64> {
+        conn.query_row(
+            "SELECT value FROM metadata WHERE key = 'a12_input_epoch'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| value.parse().ok())
+    }
+
+    #[test]
+    fn a12_input_epoch_migration_is_initialized_and_idempotent() {
+        init_sqlite_vec();
+        let conn = Connection::open_in_memory().expect("open memory db");
+
+        init_schema(&conn, 4).expect("first schema init");
+        assert_eq!(schema_user_version(&conn).unwrap(), 4);
+        assert_eq!(a12_input_epoch(&conn), Some(0));
+
+        init_schema(&conn, 4).expect("second schema init");
+        assert_eq!(a12_input_epoch(&conn), Some(0));
+        let trigger_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'trigger' AND name GLOB 'a12_input_epoch_*'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(trigger_count, 21, "v4 installs one trigger per write path");
+    }
+
+    #[test]
+    fn a12_epoch_ignores_only_valid_equal_adaptive_projection_digests() {
+        init_sqlite_vec();
+        let conn = Connection::open_in_memory().expect("open memory db");
+        init_schema(&conn, 4).expect("schema init");
+
+        let state = crate::store::adaptive::AdaptiveState::default();
+        state.save_snapshot(&conn).expect("first adaptive snapshot");
+        let after_insert = a12_input_epoch(&conn).unwrap();
+
+        let mut version_only =
+            crate::store::adaptive::AdaptiveState::restore_snapshot(&conn).unwrap();
+        version_only.version += 1;
+        version_only
+            .save_snapshot(&conn)
+            .expect("version-only adaptive update");
+        assert_eq!(
+            a12_input_epoch(&conn),
+            Some(after_insert),
+            "bookkeeping-only adaptive writes must not invalidate A12"
+        );
+
+        let mut replay_relevant =
+            crate::store::adaptive::AdaptiveState::restore_snapshot(&conn).unwrap();
+        replay_relevant.version += 1;
+        replay_relevant.cluster_version += 1;
+        replay_relevant
+            .save_snapshot(&conn)
+            .expect("projection-changing adaptive update");
+        assert!(
+            a12_input_epoch(&conn).unwrap() > after_insert,
+            "a replay-relevant adaptive change must invalidate A12"
+        );
+    }
+
+    #[test]
+    fn a12_epoch_mixed_version_adaptive_writer_fails_closed_repeatedly() {
+        init_sqlite_vec();
+        let conn = Connection::open_in_memory().expect("open memory db");
+        init_schema(&conn, 4).expect("schema init");
+        crate::store::adaptive::AdaptiveState::default()
+            .save_snapshot(&conn)
+            .expect("current writer snapshot");
+
+        let before_legacy = a12_input_epoch(&conn).unwrap();
+        conn.execute(
+            "UPDATE metadata
+             SET value = json_remove(value, '$.a12_recall_projection_fingerprint')
+             WHERE key = 'adaptive_state'",
+            [],
+        )
+        .unwrap();
+        let after_digest_removal = a12_input_epoch(&conn).unwrap();
+        assert!(after_digest_removal > before_legacy);
+
+        conn.execute(
+            "UPDATE metadata
+             SET value = json_set(value, '$.version', 99)
+             WHERE key = 'adaptive_state'",
+            [],
+        )
+        .unwrap();
+        assert!(
+            a12_input_epoch(&conn).unwrap() > after_digest_removal,
+            "a row without a valid digest must invalidate on every old-writer update"
+        );
+    }
+
+    #[test]
+    fn a12_epoch_migration_backfills_digest_without_losing_unknown_fields() {
+        init_sqlite_vec();
+        let conn = Connection::open_in_memory().expect("open memory db");
+        init_schema_with_migrations(&conn, 4, &MIGRATIONS[..2]).expect("initialize through v3");
+
+        let mut value = serde_json::to_value(crate::store::adaptive::AdaptiveState::default())
+            .expect("serialize legacy adaptive state");
+        value["future_writer_field"] = serde_json::json!({"preserve": true});
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("a12_recall_projection_fingerprint");
+        conn.execute(
+            "INSERT INTO metadata(key, value) VALUES ('adaptive_state', ?1)",
+            [serde_json::to_string(&value).unwrap()],
+        )
+        .unwrap();
+
+        init_schema(&conn, 4).expect("apply v4");
+        let raw: String = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'adaptive_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let migrated: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(migrated["future_writer_field"]["preserve"], true);
+        let digest = migrated["a12_recall_projection_fingerprint"]
+            .as_str()
+            .expect("v4 must add projection digest");
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn a12_epoch_tracks_projection_change_through_adaptive_cas_merge() {
+        init_sqlite_vec();
+        let conn = Connection::open_in_memory().expect("open memory db");
+        init_schema(&conn, 4).expect("schema init");
+        crate::store::adaptive::AdaptiveState::default()
+            .save_snapshot(&conn)
+            .expect("initial snapshot");
+
+        let base = crate::store::adaptive::AdaptiveState::restore_snapshot(&conn).unwrap();
+        let mut peer = base.clone();
+        peer.version += 1;
+        peer.memory_clusters.insert("peer".to_string(), 1);
+        peer.save_snapshot(&conn).expect("peer snapshot");
+        let after_peer = a12_input_epoch(&conn).unwrap();
+
+        let mut stale = base;
+        stale.version += 1;
+        stale.memory_clusters.insert("stale".to_string(), 2);
+        stale.save_snapshot(&conn).expect("CAS-merged snapshot");
+        assert!(a12_input_epoch(&conn).unwrap() > after_peer);
+        let merged = crate::store::adaptive::AdaptiveState::restore_snapshot(&conn).unwrap();
+        assert_eq!(merged.memory_clusters.get("peer"), Some(&1));
+        assert_eq!(merged.memory_clusters.get("stale"), Some(&2));
+        assert_eq!(
+            merged.a12_recall_projection_fingerprint,
+            merged.compute_a12_recall_projection_fingerprint().unwrap()
+        );
+    }
+
+    #[test]
+    fn a12_input_epoch_tracks_every_sqlite_recall_input_without_recursing() {
+        init_sqlite_vec();
+        let conn = Connection::open_in_memory().expect("open memory db");
+        init_schema(&conn, 4).expect("schema init");
+        conn.pragma_update(None, "recursive_triggers", true)
+            .unwrap();
+
+        let mut prior = a12_input_epoch(&conn).unwrap();
+        let mut assert_advanced = |label: &str| {
+            let next = a12_input_epoch(&conn).unwrap();
+            assert!(next > prior, "{label} must advance A12 input epoch");
+            prior = next;
+        };
+
+        conn.execute_batch(
+            "INSERT INTO memories (id, layer, topic, summary, content, importance, source,
+                 strength, decay_lambda, created_at, updated_at, last_accessed)
+             VALUES ('epoch-memory', 'LTM', 't', 's', 'c', 'medium', 'manual',
+                 1.0, 0.0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                 '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        assert_advanced("memory insert");
+
+        conn.execute(
+            "INSERT INTO memory_evidence (
+                 id, memory_id, canonical_id, source, source_topic, summary, content,
+                 keywords, created_at, imported_at
+             ) VALUES ('epoch-evidence', 'epoch-memory', 'epoch-memory', 'manual',
+                 't', 's', 'evidence', '[]', '2026-01-01T00:00:00Z',
+                 '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        assert_advanced("evidence insert");
+
+        conn.execute_batch(
+            "INSERT INTO memoirs(id, name, description, created_at, updated_at)
+             VALUES ('epoch-memoir', 'epoch memoir', '', '2026-01-01T00:00:00Z',
+                     '2026-01-01T00:00:00Z');
+             INSERT INTO concepts(id, memoir_id, name, definition, created_at, updated_at)
+             VALUES ('epoch-concept-a', 'epoch-memoir', 'a', 'definition a',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        assert_advanced("concept insert");
+
+        conn.execute(
+            "INSERT INTO concepts(id, memoir_id, name, definition, created_at, updated_at)
+             VALUES ('epoch-concept-b', 'epoch-memoir', 'b', 'definition b',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        assert_advanced("second concept insert");
+
+        conn.execute(
+            "INSERT INTO concept_links(id, source_id, target_id, relation, created_at)
+             VALUES ('epoch-link', 'epoch-concept-a', 'epoch-concept-b', 'related',
+                     '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        assert_advanced("concept-link insert");
+
+        conn.execute(
+            "INSERT INTO episodes(id, title, created_at)
+             VALUES ('epoch-episode', 'episode', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        assert_advanced("episode insert");
+
+        crate::store::vec::insert_embedding(&conn, "epoch-memory", &[0.0; 4]).unwrap();
+        assert_advanced("embedding write sequence");
+
+        conn.execute(
+            "INSERT INTO metadata(key, value) VALUES ('adaptive_state', '{}')",
+            [],
+        )
+        .unwrap();
+        assert_advanced("adaptive metadata");
+
+        conn.execute(
+            "INSERT INTO metadata(key, value) VALUES ('rerank_weights', '{}')",
+            [],
+        )
+        .unwrap();
+        assert_advanced("rerank metadata");
+
+        conn.execute(
+            "INSERT INTO metadata(key, value) VALUES ('survival_curve:global', '{}')",
+            [],
+        )
+        .unwrap();
+        assert_advanced("survival metadata");
+
+        conn.execute(
+            "INSERT INTO metadata(key, value) VALUES ('unrelated_epoch_probe', '1')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            a12_input_epoch(&conn),
+            Some(prior),
+            "unrelated metadata must not invalidate A12"
+        );
+    }
+
+    #[test]
+    fn corrupt_a12_input_epoch_aborts_source_writes_without_resetting_counter() {
+        init_sqlite_vec();
+        for corrupt in [
+            Some("corrupt"),
+            Some("-1"),
+            Some("9223372036854775808"),
+            None,
+        ] {
+            let conn = Connection::open_in_memory().expect("open memory db");
+            init_schema(&conn, 4).expect("schema init");
+            match corrupt {
+                Some(raw) => {
+                    conn.execute(
+                        "UPDATE metadata SET value = ?1 WHERE key = 'a12_input_epoch'",
+                        [raw],
+                    )
+                    .unwrap();
+                }
+                None => {
+                    conn.execute("DELETE FROM metadata WHERE key = 'a12_input_epoch'", [])
+                        .unwrap();
+                }
+            }
+
+            let result = conn.execute_batch(
+                "INSERT INTO memories (id, layer, topic, summary, content, importance, source,
+                     strength, decay_lambda, created_at, updated_at, last_accessed)
+                 VALUES ('must-rollback', 'LTM', 't', 's', 'c', 'medium', 'manual',
+                     1.0, 0.0, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                     '2026-01-01T00:00:00Z');",
+            );
+
+            assert!(
+                result.is_err(),
+                "bad epoch {corrupt:?} must fail the source write"
+            );
+            let after = conn
+                .query_row(
+                    "SELECT value FROM metadata WHERE key = 'a12_input_epoch'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok();
+            assert_eq!(
+                after.as_deref(),
+                corrupt,
+                "the trigger must preserve corruption"
+            );
+            let leaked: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memories WHERE id = 'must-rollback'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(leaked, 0, "the source mutation must roll back atomically");
+        }
+    }
 
     /// #17 codex R10 — a wholesale vector-index swap must credit the
     /// embedding churn counter inside the SAME commit, so an interrupted

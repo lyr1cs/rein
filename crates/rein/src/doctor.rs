@@ -2970,11 +2970,11 @@ fn project_dedup_threshold_doctor_check(
     }
 }
 
-/// Format the shared A12 activation projection. The projection reads the
-/// cwd-resolved recall scorecards (read-only) to attest the current eval
-/// gate; it never persists those paths and never changes the active pointer
-/// or policy. Recovery is always an operator/producer action; doctor never
-/// repairs calibration evidence.
+/// Format the shared A12 activation projection. The projection reads recall
+/// scorecards through the shared artifact-root resolver (read-only) to attest
+/// the current eval gate; it never persists those paths and never changes the
+/// active pointer or policy. Recovery is always an operator/producer action;
+/// doctor never repairs calibration evidence.
 fn check_recall_fusion_calibration(
     store: &crate::store::SqliteStore,
     config: &ReinConfig,
@@ -3067,7 +3067,7 @@ fn check_recall_fusion_calibration(
 
     let advice = match report.health_status.as_str() {
         "missing" | "static" | "no_data" | "policy_missing" | "a12_missing" => {
-            "Collect both training and permanent-holdout family evidence, produce a current Ship recall eval-gate attestation, and let the adaptive pipeline seal a new policy revision. Recall eval-gate scorecards are resolved from the server process working directory, so a daemon started outside the repository reports NoData here. This check is read-only."
+            "Collect both training and permanent-holdout family evidence, produce a current Ship recall eval-gate attestation, and let the adaptive pipeline seal a new policy revision. Installed daemons outside a checkout must set REIN_EVAL_GATE_ROOT to an absolute artifact root; development runs may discover a checkout ancestor from the working directory. This check is read-only."
         }
         "bail" => {
             "Inspect the paired holdout regression, then calibrate a new immutable A12 generation after correcting the producer or retrieval behavior. Bail evidence is preserved and never overridden by doctor."
@@ -5090,6 +5090,7 @@ provider = "inherit"
             updated_at: 1_700_000_050,
             run: Some(A12CalibrationRunMetadata {
                 phase: A12CalibrationPhase::Complete,
+                source_input_epoch: 0,
                 source_snapshot_fingerprint: "source-snapshot-fingerprint".to_string(),
                 behavior_config_fingerprint: "behavior-config-fingerprint".to_string(),
             }),

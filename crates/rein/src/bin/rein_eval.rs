@@ -2024,14 +2024,6 @@ fn build_concept_category_map(fixtures_list: &[ConceptFixture]) -> HashMap<Strin
 /// the "what the operator sees pre-synthesis" floor — Cap B treatment must
 /// at least match it (the additive non-inferiority bar).
 fn cmd_synthesis_baseline(fixtures: &Path, output: &Path) -> Result<()> {
-    let fixtures_list = load_synthesis_fixtures(fixtures)?;
-    if fixtures_list.is_empty() {
-        bail!(
-            "no recall-synthesis fixtures found in {}",
-            fixtures.display()
-        );
-    }
-
     // Symmetric scoring with `run_synthesis_treatment_with_extractor` —
     // both must use the same checker for McNemar to be honest. Loading
     // config here is cheap and lets baseline opt into the embedding-based
@@ -2040,6 +2032,23 @@ fn cmd_synthesis_baseline(fixtures: &Path, output: &Path) -> Result<()> {
         .context("loading rein config for synthesis baseline (hybrid checker)")?;
     let judge = build_judge(&config, JudgeMode::SynthesisSourceCoverage);
     let checker = build_hybrid_checker(&config);
+    cmd_synthesis_baseline_with_checker(fixtures, output, judge.as_ref(), &checker)
+}
+
+fn cmd_synthesis_baseline_with_checker(
+    fixtures: &Path,
+    output: &Path,
+    judge: Option<&LlmJudgeHitChecker>,
+    checker: &KeywordOverlapHitChecker,
+) -> Result<()> {
+    let fixtures_list = load_synthesis_fixtures(fixtures)?;
+    if fixtures_list.is_empty() {
+        bail!(
+            "no recall-synthesis fixtures found in {}",
+            fixtures.display()
+        );
+    }
+
     let mut outcomes = Vec::with_capacity(fixtures_list.len());
     let mut skipped = 0usize;
 
@@ -2065,7 +2074,7 @@ fn cmd_synthesis_baseline(fixtures: &Path, output: &Path) -> Result<()> {
         // Reuse `score_concept_case` with `living_summary = None` — the
         // helper's "definition + (optional) summary" abstraction maps
         // cleanly onto baseline (raw text) vs treatment (LLM prose) here.
-        let hit = if let Some(j) = judge.as_ref() {
+        let hit = if let Some(j) = judge {
             let summaries_owned = fx.judge_source_summaries();
             let summaries: Vec<&str> = summaries_owned.iter().map(|s| s.as_str()).collect();
             match j.judge_synthesis(&fx.query, &summaries, &baseline_text) {
@@ -2087,7 +2096,7 @@ fn cmd_synthesis_baseline(fixtures: &Path, output: &Path) -> Result<()> {
                 }
             }
         } else {
-            score_concept_case(&baseline_text, None, &fx.evidence_keywords, &checker)
+            score_concept_case(&baseline_text, None, &fx.evidence_keywords, checker)
         };
         outcomes.push(PairedOutcome {
             case_id: fx.case_id.clone(),
@@ -3190,14 +3199,15 @@ mod tests {
     fn synthesis_baseline_is_deterministic() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/recall_synthesis");
         let out_path = tmp_path("synth_baseline_det");
+        let checker = KeywordOverlapHitChecker::stem_only();
 
-        cmd_synthesis_baseline(&dir, &out_path)
+        cmd_synthesis_baseline_with_checker(&dir, &out_path, None, &checker)
             .expect("baseline command should succeed against the shipped fixtures");
         let sc1: Scorecard = serde_json::from_slice(&fs::read(&out_path).unwrap()).unwrap();
 
         // Run a second time and compare hit columns + lengths — output must
         // be deterministic (same fixtures + same hit checker version).
-        cmd_synthesis_baseline(&dir, &out_path)
+        cmd_synthesis_baseline_with_checker(&dir, &out_path, None, &checker)
             .expect("baseline command should succeed on the second run");
         let sc2: Scorecard = serde_json::from_slice(&fs::read(&out_path).unwrap()).unwrap();
 

@@ -121,6 +121,18 @@ fn structural_input(status: JudgeStructuralStatus, enforce: bool) -> JudgeStruct
     }
 }
 
+fn configure_active_synthesis_judge(config: &mut ReinConfig) {
+    config.ars.llm_judge.enabled = true;
+    config.ars.llm_judge.synthesis_enabled = true;
+    config.ars.llm_judge.concept_summary_enabled = false;
+    config.llm.provider = "omlx".to_string();
+    config.llm.omlx.model = Some("release-gate-judge".to_string());
+}
+
+fn live_pair_ts(offset: usize) -> i64 {
+    chrono::Utc::now().timestamp().saturating_sub(offset as i64)
+}
+
 fn a12_paired(n: u32) -> A12PairedTop3Stats {
     let result = rein::eval::mcnemar::mcnemar_from_counts(n, 0, 0, 0).unwrap();
     A12PairedTop3Stats {
@@ -191,6 +203,7 @@ fn a12_global(train_ess: u64, holdout_ess: u64, valid_until: Option<i64>) -> A12
             updated_at: 1_700_000_050,
             run: Some(A12CalibrationRunMetadata {
                 phase: A12CalibrationPhase::Complete,
+                source_input_epoch: 0,
                 source_snapshot_fingerprint: "source-snapshot-fingerprint".to_string(),
                 behavior_config_fingerprint: "behavior-config-fingerprint".to_string(),
             }),
@@ -548,9 +561,7 @@ fn failed_stale_and_mismatched_structural_health_block_without_faking_human_kapp
         JudgeStructuralStatus::Unknown,
     ] {
         let mut config = ReinConfig::default();
-        config.ars.llm_judge.enabled = true;
-        config.ars.llm_judge.synthesis_enabled = true;
-        config.ars.llm_judge.concept_summary_enabled = false;
+        configure_active_synthesis_judge(&mut config);
         let state = eligible_state(12);
         let policy = loaded_canary_policy(state.version);
         let shadow_fusion_status = ready_shadow_status();
@@ -586,9 +597,7 @@ fn failed_stale_and_mismatched_structural_health_block_without_faking_human_kapp
 #[test]
 fn ready_structural_anchors_do_not_authorize_release_promotion() {
     let mut config = ReinConfig::default();
-    config.ars.llm_judge.enabled = true;
-    config.ars.llm_judge.synthesis_enabled = true;
-    config.ars.llm_judge.concept_summary_enabled = false;
+    configure_active_synthesis_judge(&mut config);
     let state = eligible_state(12);
     let policy = loaded_canary_policy(state.version);
     let shadow_fusion_status = ready_shadow_status();
@@ -618,18 +627,18 @@ fn ready_structural_anchors_do_not_authorize_release_promotion() {
 #[test]
 fn monitor_failure_does_not_override_healthy_human_calibration() {
     let mut config = ReinConfig::default();
-    config.ars.llm_judge.enabled = true;
-    config.ars.llm_judge.synthesis_enabled = true;
-    config.ars.llm_judge.concept_summary_enabled = false;
+    configure_active_synthesis_judge(&mut config);
     let mut state = eligible_state(12);
     let mut calibration = JudgeCalibrationState {
         kappa: 0.9,
         ..JudgeCalibrationState::default()
     };
     for idx in 0..rein::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
-        calibration
-            .recent_pairs_synthesis
-            .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
+        calibration.recent_pairs_synthesis.push_back((
+            idx % 2 == 0,
+            idx % 2 == 0,
+            live_pair_ts(idx),
+        ));
     }
     state.judge_calibration_state = Some(calibration);
     let policy = loaded_canary_policy(state.version);
@@ -656,18 +665,18 @@ fn monitor_failure_does_not_override_healthy_human_calibration() {
 #[test]
 fn human_negative_evidence_precedes_structural_failure_in_release_gate() {
     let mut config = ReinConfig::default();
-    config.ars.llm_judge.enabled = true;
-    config.ars.llm_judge.synthesis_enabled = true;
-    config.ars.llm_judge.concept_summary_enabled = false;
+    configure_active_synthesis_judge(&mut config);
     let mut state = eligible_state(12);
     let mut calibration = JudgeCalibrationState {
         kappa: 0.1,
         ..JudgeCalibrationState::default()
     };
     for idx in 0..rein::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
-        calibration
-            .recent_pairs_synthesis
-            .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
+        calibration.recent_pairs_synthesis.push_back((
+            idx % 2 == 0,
+            idx % 2 != 0,
+            live_pair_ts(idx),
+        ));
     }
     state.judge_calibration_state = Some(calibration);
     let policy = loaded_canary_policy(state.version);
@@ -691,7 +700,7 @@ fn human_negative_evidence_precedes_structural_failure_in_release_gate() {
         .iter()
         .any(|blocker| blocker.starts_with("judge_structural_unhealthy:synthesis")));
     assert_eq!(report.signals.judge_human_pairs_synthesis, 30);
-    assert_eq!(report.signals.judge_human_kappa_synthesis, Some(0.1));
+    assert_eq!(report.signals.judge_human_kappa_synthesis, Some(-1.0));
 }
 
 #[test]

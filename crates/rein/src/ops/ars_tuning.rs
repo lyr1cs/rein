@@ -163,19 +163,37 @@ pub fn human_judge_calibration(
     calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
     surface: JudgeSurface,
 ) -> HumanJudgeCalibration {
+    human_judge_calibration_at(calibration, surface, chrono::Utc::now().timestamp())
+}
+
+/// Deterministic read-time projection of the rolling human-pair window.
+/// Persisted deques are pruned on writes, but a quiet surface may receive no
+/// new pair for weeks; trust reads therefore must independently enforce the
+/// seven-day window and reject future-dated evidence. Both surfaces recompute
+/// kappa from the filtered pairs rather than trusting a cached aggregate.
+pub fn human_judge_calibration_at(
+    calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
+    surface: JudgeSurface,
+    now: i64,
+) -> HumanJudgeCalibration {
     let Some(calibration) = calibration else {
         return HumanJudgeCalibration {
             pair_count: 0,
             kappa: None,
         };
     };
-    let (pair_count, raw_kappa) = match surface {
-        JudgeSurface::Synthesis => (calibration.recent_pairs_synthesis.len(), calibration.kappa),
-        JudgeSurface::ConceptSummary => (
-            calibration.recent_pairs_concept.len(),
-            crate::store::adaptive::compute_cohens_kappa(&calibration.recent_pairs_concept),
-        ),
+    let source = match surface {
+        JudgeSurface::Synthesis => &calibration.recent_pairs_synthesis,
+        JudgeSurface::ConceptSummary => &calibration.recent_pairs_concept,
     };
+    let cutoff = now.saturating_sub(crate::store::adaptive::LLM_JUDGE_HALF_PAIR_TTL_SECS);
+    let live_pairs = source
+        .iter()
+        .copied()
+        .filter(|&(_, _, ts)| (cutoff..=now).contains(&ts))
+        .collect::<std::collections::VecDeque<_>>();
+    let pair_count = live_pairs.len();
+    let raw_kappa = crate::store::adaptive::compute_cohens_kappa(&live_pairs);
     HumanJudgeCalibration {
         pair_count,
         kappa: (pair_count >= crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS).then_some(raw_kappa),
@@ -187,7 +205,21 @@ pub fn judge_calibration_evidence(
     surface: JudgeSurface,
     structural: JudgeStructuralTrustContext,
 ) -> crate::judge::contract::JudgeCalibrationEvidence {
-    let human = human_judge_calibration(calibration, surface);
+    judge_calibration_evidence_at(
+        calibration,
+        surface,
+        structural,
+        chrono::Utc::now().timestamp(),
+    )
+}
+
+pub fn judge_calibration_evidence_at(
+    calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
+    surface: JudgeSurface,
+    structural: JudgeStructuralTrustContext,
+    now: i64,
+) -> crate::judge::contract::JudgeCalibrationEvidence {
+    let human = human_judge_calibration_at(calibration, surface, now);
     crate::judge::contract::JudgeCalibrationEvidence {
         human_pair_count: human.pair_count,
         human_kappa: human.kappa,
@@ -202,6 +234,22 @@ pub fn judge_trust_decision(
     structural: JudgeStructuralTrustContext,
     action: crate::judge::contract::JudgeTrustAction,
 ) -> crate::judge::contract::JudgeTrustDecision {
+    judge_trust_decision_at(
+        calibration,
+        surface,
+        structural,
+        action,
+        chrono::Utc::now().timestamp(),
+    )
+}
+
+pub fn judge_trust_decision_at(
+    calibration: Option<&crate::store::adaptive::JudgeCalibrationState>,
+    surface: JudgeSurface,
+    structural: JudgeStructuralTrustContext,
+    action: crate::judge::contract::JudgeTrustAction,
+    now: i64,
+) -> crate::judge::contract::JudgeTrustDecision {
     if !structural.gate_required {
         return crate::judge::contract::JudgeTrustDecision {
             basis: crate::judge::contract::JudgeCalibrationBasis::ConfiguredBaseline,
@@ -212,7 +260,7 @@ pub fn judge_trust_decision(
         };
     }
     crate::judge::contract::judge_trust_gate(
-        &judge_calibration_evidence(calibration, surface, structural),
+        &judge_calibration_evidence_at(calibration, surface, structural, now),
         action,
     )
 }
@@ -807,6 +855,10 @@ fn finite_or(value: f64, fallback: f64) -> f64 {
 mod tests {
     use super::*;
 
+    fn live_pair_ts(offset: usize) -> i64 {
+        chrono::Utc::now().timestamp().saturating_sub(offset as i64)
+    }
+
     #[test]
     fn runtime_vs_nightly_kappa_is_drift_only_not_reliability() {
         let mut calibration = crate::store::adaptive::JudgeCalibrationState {
@@ -847,10 +899,10 @@ mod tests {
             let hit = idx % 2 == 0;
             calibration
                 .recent_pairs_synthesis
-                .push_back((hit, hit, idx as i64));
+                .push_back((hit, hit, live_pair_ts(idx)));
             calibration
                 .recent_pairs_concept
-                .push_back((hit, !hit, idx as i64));
+                .push_back((hit, !hit, live_pair_ts(idx)));
         }
 
         assert_eq!(
@@ -870,9 +922,11 @@ mod tests {
             ..Default::default()
         };
         for idx in 0..(crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS - 1) {
-            calibration
-                .recent_pairs_synthesis
-                .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
+            calibration.recent_pairs_synthesis.push_back((
+                idx % 2 == 0,
+                idx % 2 == 0,
+                live_pair_ts(idx),
+            ));
         }
         assert_eq!(
             human_judge_calibration(Some(&calibration), JudgeSurface::Synthesis).kappa,
@@ -880,12 +934,91 @@ mod tests {
         );
 
         let idx = crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS - 1;
-        calibration
-            .recent_pairs_synthesis
-            .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
+        calibration.recent_pairs_synthesis.push_back((
+            idx % 2 == 0,
+            idx % 2 == 0,
+            live_pair_ts(idx),
+        ));
         assert_eq!(
             human_judge_calibration(Some(&calibration), JudgeSurface::Synthesis).kappa,
             Some(1.0)
+        );
+    }
+
+    #[test]
+    fn human_calibration_at_excludes_expired_and_future_pairs() {
+        let now = 1_700_000_000;
+        let cutoff = now - crate::store::adaptive::LLM_JUDGE_HALF_PAIR_TTL_SECS;
+        let mut calibration = crate::store::adaptive::JudgeCalibrationState {
+            kappa: 1.0,
+            ..Default::default()
+        };
+        for idx in 0..crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
+            let hit = idx % 2 == 0;
+            calibration
+                .recent_pairs_synthesis
+                .push_back((hit, hit, cutoff - 1));
+            calibration
+                .recent_pairs_synthesis
+                .push_back((hit, hit, now + 1));
+        }
+
+        let human = human_judge_calibration_at(Some(&calibration), JudgeSurface::Synthesis, now);
+        assert_eq!(human.pair_count, 0);
+        assert_eq!(human.kappa, None);
+    }
+
+    #[test]
+    fn synthesis_human_calibration_recomputes_kappa_from_live_pairs() {
+        let now = 1_700_000_000;
+        let mut calibration = crate::store::adaptive::JudgeCalibrationState {
+            // Simulate a stale/corrupt cached value. The live pairs disagree.
+            kappa: 1.0,
+            ..Default::default()
+        };
+        for idx in 0..crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
+            let hit = idx % 2 == 0;
+            calibration
+                .recent_pairs_synthesis
+                .push_back((hit, !hit, now - idx as i64));
+        }
+
+        let human = human_judge_calibration_at(Some(&calibration), JudgeSurface::Synthesis, now);
+        assert_eq!(
+            human.pair_count,
+            crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS
+        );
+        assert_eq!(human.kappa, Some(-1.0));
+    }
+
+    #[test]
+    fn expired_human_pairs_cannot_authorize_recall_fusion_promotion() {
+        let now = 1_700_000_000;
+        let expired = now - crate::store::adaptive::LLM_JUDGE_HALF_PAIR_TTL_SECS - 1;
+        let mut calibration = crate::store::adaptive::JudgeCalibrationState::default();
+        for idx in 0..crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
+            let hit = idx % 2 == 0;
+            calibration
+                .recent_pairs_synthesis
+                .push_back((hit, hit, expired));
+        }
+        let structural = JudgeStructuralTrustContext {
+            status: crate::judge::contract::JudgeStructuralStatus::Ready,
+            enforce: true,
+            gate_required: true,
+        };
+
+        let decision = judge_trust_decision_at(
+            Some(&calibration),
+            JudgeSurface::Synthesis,
+            structural,
+            crate::judge::contract::JudgeTrustAction::PromoteRecallFusion,
+            now,
+        );
+        assert!(!decision.action_allowed);
+        assert_eq!(
+            decision.basis,
+            crate::judge::contract::JudgeCalibrationBasis::StructuralAnchors
         );
     }
 
@@ -960,9 +1093,11 @@ mod tests {
             ..Default::default()
         };
         for idx in 0..crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
-            calibration
-                .recent_pairs_synthesis
-                .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
+            calibration.recent_pairs_synthesis.push_back((
+                idx % 2 == 0,
+                idx % 2 == 0,
+                live_pair_ts(idx),
+            ));
         }
         let failed = JudgeStructuralTrustContext {
             status: crate::judge::contract::JudgeStructuralStatus::Failed,
@@ -1347,9 +1482,11 @@ mod tests {
             ..Default::default()
         };
         for idx in 0..crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
-            calibration
-                .recent_pairs_synthesis
-                .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
+            calibration.recent_pairs_synthesis.push_back((
+                idx % 2 == 0,
+                idx % 2 == 0,
+                live_pair_ts(idx),
+            ));
         }
         let effective = effective_judge_weight_decay_rate(
             0.3,
@@ -1380,7 +1517,7 @@ mod tests {
         for idx in 0..12 {
             calibration
                 .recent_pairs_synthesis
-                .push_back((true, true, idx));
+                .push_back((true, true, live_pair_ts(idx)));
         }
 
         assert_eq!(
@@ -1431,9 +1568,11 @@ mod tests {
             ..Default::default()
         };
         for idx in 0..crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
-            calibration
-                .recent_pairs_synthesis
-                .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
+            calibration.recent_pairs_synthesis.push_back((
+                idx % 2 == 0,
+                idx % 2 == 0,
+                live_pair_ts(idx),
+            ));
         }
 
         let effective = effective_judge_sample_rate(
@@ -1461,7 +1600,7 @@ mod tests {
         for idx in 0..12 {
             calibration
                 .recent_pairs_synthesis
-                .push_back((true, true, idx));
+                .push_back((true, true, live_pair_ts(idx)));
         }
 
         assert_eq!(
@@ -1505,7 +1644,7 @@ mod tests {
         for idx in 0..12 {
             calibration
                 .recent_pairs_synthesis
-                .push_back((true, true, idx));
+                .push_back((true, true, live_pair_ts(idx)));
         }
 
         // cold_start_n is NOT an LLM-spend knob — it gates whether to
@@ -1528,9 +1667,11 @@ mod tests {
             ..Default::default()
         };
         for idx in 0..crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
-            calibration
-                .recent_pairs_synthesis
-                .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
+            calibration.recent_pairs_synthesis.push_back((
+                idx % 2 == 0,
+                idx % 2 == 0,
+                live_pair_ts(idx),
+            ));
         }
 
         let effective =
@@ -1547,9 +1688,11 @@ mod tests {
             ..Default::default()
         };
         for idx in 0..crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
-            calibration
-                .recent_pairs_synthesis
-                .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
+            calibration.recent_pairs_synthesis.push_back((
+                idx % 2 == 0,
+                idx % 2 == 0,
+                live_pair_ts(idx),
+            ));
         }
 
         let effective = effective_useful_rate_threshold(
@@ -1755,9 +1898,11 @@ mod tests {
             ..Default::default()
         };
         for idx in 0..crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
-            calibration
-                .recent_pairs_concept
-                .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
+            calibration.recent_pairs_concept.push_back((
+                idx % 2 == 0,
+                idx % 2 == 0,
+                live_pair_ts(idx),
+            ));
         }
 
         // Concept reliability survives; synthesis is zeroed.
@@ -1781,9 +1926,11 @@ mod tests {
             ..Default::default()
         };
         for idx in 0..crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
-            calibration
-                .recent_pairs_synthesis
-                .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
+            calibration.recent_pairs_synthesis.push_back((
+                idx % 2 == 0,
+                idx % 2 == 0,
+                live_pair_ts(idx),
+            ));
         }
 
         assert_eq!(
@@ -1809,9 +1956,11 @@ mod tests {
             ..Default::default()
         };
         for idx in 0..crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS {
-            calibration
-                .recent_pairs_synthesis
-                .push_back((idx % 2 == 0, idx % 2 == 0, idx as i64));
+            calibration.recent_pairs_synthesis.push_back((
+                idx % 2 == 0,
+                idx % 2 == 0,
+                live_pair_ts(idx),
+            ));
         }
 
         assert!(llm_feedback_reliability(Some(&calibration), JudgeSurface::Synthesis) > 0.0);
