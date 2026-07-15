@@ -374,6 +374,7 @@ token is read from `REIN_PROXY_TOKEN` at invocation time.
 | `REIN_PROXY_BIND` | Override proxy bind address. |
 | `REIN_PROXY_PORT` | Override proxy port. |
 | `REIN_ASYNC_MEMORY_PROVIDER` | Override async memory worker provider. |
+| `REIN_EVAL_GATE_ROOT` | Absolute eval-gate artifact root for A12 recall-fusion calibration on installed daemons outside a source checkout. Relative paths fail closed. |
 | `REIN_INSTALL_GUI` | Set to `0` to skip GUI build in `scripts/install.sh`. |
 | `REIN_LOG` | Set Rust tracing level, such as `info` or `debug`. |
 

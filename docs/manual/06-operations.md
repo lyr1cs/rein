@@ -289,6 +289,17 @@ rein doctor --fix
   is in Canary mode, doctor refreshes `ars_parameter_policy` so the next
   `refresh_ars_parameter_policy` tick demotes the policy back to Shadow
   with `runtime_adoption_weight = 0`.
+- **A12 input-epoch re-baseline (v1.3.0)** — a *missing* `a12_input_epoch`
+  row self-heals at every store open without `--fix` (re-creation cannot
+  reset a live counter). A *malformed* row is repaired only here: `--fix`
+  atomically re-baselines the counter AND invalidates any active A12
+  recall-fusion calibration bound to it, because a calibration sealed
+  against an epoch that can no longer be verified must not stay live.
+- **Corrupt A12 calibration pointer repair (v1.3.0)** — when the active
+  `a12_calibration` pointer fails to load as the current schema, `--fix`
+  deletes only the corrupt active pointer. Future-schema payloads are left
+  byte-preserved and the immutable revision history is never touched, so a
+  downgrade cannot destroy state written by a newer binary.
 
 `rein doctor` (read-only) also surfaces:
 
@@ -304,6 +315,20 @@ rein doctor --fix
   `ADOPTION_WEIGHTS_CAP = 4128`; this is warn-only with no eviction (every
   `adoption_weights` key maps to a runtime trust gate scope identifier;
   silently dropping one would mute a canary scope).
+- **`a12_input_epoch` (v1.3.0)** — verifies the durable A12 input-epoch row
+  exists and is well-formed. A missing row is reported as self-healing (it
+  is re-created at the next open); a malformed row is a WARN with a repair
+  hint pointing at `rein doctor --fix` (see above — the fix invalidates any
+  active A12 calibration).
+- **`recall_fusion_calibration` (v1.3.0)** — reports A12 recall-fusion
+  calibration health as typed scope-health codes
+  (`RecallFusionScopeHealthCode`), not prose matching. Benign absence —
+  fresh install, shadow-only operation — is Ok, not a warning; genuinely
+  blocked scopes carry a repair hint. Installed daemons running outside a
+  source checkout must set `REIN_EVAL_GATE_ROOT` to an **absolute**
+  eval-gate artifact root (relative values fail closed); development runs
+  may discover a checkout ancestor from the working directory. This check
+  is read-only.
 
 Get machine-readable output:
 
@@ -338,3 +363,17 @@ Common repair flow:
    `rein doctor --fix`.
 4. Recheck `rein dashboard`.
 5. Drain relevant workers if queues remain pending.
+
+## Config And Schema Versions
+
+v1.3.0 stamps `config_version = 3` (v1.2.0 wrote `2`; the bump covers the
+`[ars.llm_judge.structural_anchors]` migration) and migrates the SQLite
+database to schema version 4 (the A12 input-epoch triggers). Both migrations
+run automatically and forward-only on first load/open.
+
+The operational note is the downgrade guard: a binary older than the one that
+stamped the config refuses to load a newer-stamped `config.toml` rather than
+misreading it, and the database downgrade guard behaves the same way for
+schema version 4. If you roll the binary back to v1.2.x, roll back the config
+file with it and keep a pre-upgrade database copy — the newer-stamped
+artifacts are intentionally not readable by older binaries.

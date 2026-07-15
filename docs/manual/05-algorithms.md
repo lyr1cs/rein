@@ -944,6 +944,175 @@ persistence-side both split judge calibration state by `JudgeSurface`
 contaminates the other surface's scalar. In
 accelerates tuning gradually instead of replacing static ARS parameters at once.
 
+## Self-Supervised Calibration (v1.3)
+
+v1.3 adds a calibration layer that mines labels from structure Rein already
+stores, instead of from human feedback or subjective constants. Three surfaces
+use it: recall-fusion weights (#A12), LLM judge trust (structural anchors),
+and destructive dedup thresholds (#C2). Every surface is fail-closed: missing,
+stale, tampered, or unverifiable calibration state resolves to static
+behavior, never to a learned value.
+
+### A12 Leave-One-Evidence-Out Corpus
+
+`ops/a12_autocalibration.rs` derives labeled recall queries from three
+structural family kinds the store itself asserts:
+
+- canonical families: a canonical row and its merged evidence rows,
+- concept families: a concept and its source memories,
+- episode families: an episode and its member memories.
+
+Holding one member of a family out and replaying recall with its text yields a
+query whose expected answer — the family's independently supported members —
+is known without a human label. Each LOO positive records its provenance
+(`canonical_loo`, `concept_loo`, `episode_loo`), which feeds the
+per-provenance diagnostics below. Exclusion is family-level: the held-out
+member's whole family, including supersede-chain relatives, leaves the
+eligible answer set, so a superseded revision of the held-out row cannot leak
+the answer back in.
+
+### Family-Disjoint Split
+
+Families are assigned to five folds by hashing a stable family key:
+
+$$
+\mathrm{fold}(F) =
+\mathrm{SHA256}(\text{"a12-family:"} \,\|\, \mathrm{key}(F)) \bmod 5
+$$
+
+One fold is the permanent activation holdout: it is never passed to the
+optimizer, in any run. Because fold membership is a pure hash of the family
+key, the split is deterministic across runs and machines, and a family can
+never migrate from holdout into training as the store grows.
+
+### Side-Effect-Free Replay
+
+`search/recall.rs` exposes `recall_loo_trace`, a replay entry point that runs
+the production candidate pipeline but writes nothing: no recall-access events,
+no recall-hit counters, no tiering updates. Dynamic (learned) weights are
+disabled inside the trace, so calibration measures the static pipeline and can
+never train on its own output.
+
+### Optimizer And Holdout Gate
+
+The optimizer searches the same bounded six-dimensional simplex the ARS shadow
+replay uses (BM25, vector, graph, episode, support, diversity). The objective
+weights each family equally regardless of its evidence count, so one large
+canonical family cannot dominate the loss.
+
+A candidate weight vector is judged on the permanent holdout fold with a
+paired top-3 test: for each holdout query, success means an expected member
+appears in the top 3 after canonical collapse. Candidate and incumbent are
+compared on discordant queries only, with the same paired McNemar
+non-inferiority machinery the eval gates use (`eval/mcnemar.rs`).
+
+### Input Epoch Coherence
+
+A calibration is only valid for the store state it measured. The schema v4
+migration installs 21 SQLite triggers that maintain `a12_input_epoch`, a
+durable counter bumped by every replay-relevant write. Calibration runs bind
+to the epoch they read, and the final seal re-checks the epoch under
+`BEGIN IMMEDIATE` inside the same CAS transaction — a write racing the run
+invalidates the run instead of sealing a stale measurement. At recall time the
+runtime resolver re-verifies epoch, behavior fingerprint, and judge trust
+before honoring a sealed policy; any mismatch resolves to static weights.
+
+The epoch row self-heals asymmetrically: a missing row is re-created at every
+open (re-creation cannot reset a live counter), while a malformed row is
+repaired only by `rein doctor --fix`, which atomically re-baselines the
+counter and invalidates any active A12 calibration bound to it.
+
+### Sealed Policy And Fail-Closed Activation
+
+`store/a12_calibration.rs` stores versioned calibration state
+(`A12_CALIBRATION_SCHEMA_VERSION = 3`) under a metadata CAS with an immutable
+revision history. One shared evidence resolver feeds the policy refresh, the
+release gate, and the runtime, so those three surfaces cannot disagree about
+what calibration evidence exists.
+
+Activation rides the existing `ars_parameter_policy` rollout layer, whose
+payload schema moves 2 → 3. Schema-2 rows load fail-closed and are upgraded by
+CAS; future-schema rows stay byte-preserved (the v0.28.8 discipline).
+Automatic — non-human — evidence is restricted to `recall_fusion:*` adoption
+keys, steps those weights by at most `0.05` per refresh, and counts only while
+the judge structural trust gate holds; judge pair evidence additionally
+enforces a 7-day TTL at read. Tampered calibration state zeroes adoption — it
+never falls back to human-attributed evidence — and stale-specific state
+degrades to sealed pure-human evidence only.
+
+### Judge Structural Anchors
+
+The runtime judge's trust weight previously calibrated only against
+human-labeled pairs. `store/judge_structural_calibration.rs` adds
+deterministic structural probes: four probe kinds with known correct verdicts
+— `SupportedExactSingle`, `SupportedExactMulti`, `UnsupportedNonce`, and
+`QueryMismatch`. A probe payload cannot self-report its label: the in-crate
+probe runner mints opaque per-kind tokens and the state stores only their
+SHA-256 hashes, so an event exposed by one probe kind cannot attest any other
+kind.
+
+Probe state is versioned per surface — synthesis and concept-summary keep
+independent rows inside one CAS envelope because their rubrics differ. A
+surface is Ready only when all four kinds pass within a single run, and a
+model-fingerprint or rubric-fingerprint change invalidates the run. The
+`[ars.llm_judge.structural_anchors]` mode is `off` by default, with `monitor`
+and `enforce` as explicit opt-ins (a config schema migration covers older
+configs).
+
+The shared judge trust gate keeps three invariants: zero human pairs never
+fabricates a human κ (structural passes cannot impersonate human agreement);
+structural anchors only hold the configured baseline and never raise judge
+weight or sample rate above it; and the runtime-vs-nightly κ comparison is a
+drift signal only, never a trust source.
+
+### Dedup Calibration And The False-Merge Bound (C2)
+
+Destructive lexical merges are floored at the static threshold: the legacy
+learned global threshold (`0.40` on live stores) is demoted to a shadow
+suggestion, and vector cleanup runs on its own cosine threshold again —
+lexical `L(a,b)` and embedding cosine are different score spaces and no longer
+share one learned cutoff.
+
+`store/dedup_calibration.rs` holds a sealed, versioned dedup calibration
+policy. Train and holdout sides split by pair hash and canonical family, and
+promotion produces `Ship`, `Bail`, or `NoData` — but even `Ship` only exposes
+a candidate threshold; nothing auto-lowers the static destructive floor.
+
+The promotion evidence bar is an exact one-sided Clopper-Pearson upper bound
+on the false-merge rate. With `k` false merges among `n` sealed negative
+pairs, the upper `1-alpha` bound is the Beta quantile
+`B(1-alpha; k+1, n-k)`; in the zero-failure case it reduces to:
+
+$$
+\bar{p} = 1 - \alpha^{1/n}
+$$
+
+Holding the bound under the `0.02` false-merge budget at 95% confidence with
+zero observed failures requires:
+
+$$
+n \ge \frac{\ln 0.05}{\ln 0.98} \approx 148.3
+\implies n \ge 149
+$$
+
+sealed negatives. The current sealed cohort has `n = 10`, so the policy
+reports `NoData` — the designed outcome, not a failure: the bound turns "not
+enough evidence to touch a destructive threshold" into a computed fact rather
+than a judgment call. Doctor, the trust measurement report, and the GUI expose
+the static, shadow, and hard-effective thresholds separately.
+
+### Per-Provenance Diagnostics
+
+Because every LOO positive carries its provenance, holdout agreement is also
+reported per family kind (canonical vs concept vs episode). When provenances
+disagree on the direction a weight should move, the activation report raises a
+`provenance_direction_conflict` flag; the flag does not block activation but
+accumulates as the data trigger for a future second-LLM arbiter over
+conflicting structural evidence. Scope health is reported as a typed
+`RecallFusionScopeHealthCode` (11 variants) consumed by `rein doctor` directly
+— attention states are driven by the code, not by prose matching — and benign
+absence (fresh install, shadow-only operation) is explicitly healthy.
+
 ## Background Research
 
 Rein also tracks recent memory-system research as design background. TA-Mem,

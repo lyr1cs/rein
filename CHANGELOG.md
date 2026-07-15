@@ -9,6 +9,81 @@ The full release notes (with audit-round breakdowns and operator-visible
 schema changes) live on the [GitHub Releases page](https://github.com/lyr1cs/rein/releases).
 This file is a condensed index intended for quick scanning.
 
+## [1.3.0] — 2026-07-15
+
+Self-supervised activation minor: the #A12 recall-fusion activation
+infrastructure lands end-to-end (default fail-closed, shadow until promoted),
+the LLM judge gains deterministic structural calibration, and destructive
+dedup thresholds get a statistical safety floor. Config schema version bumps
+to 3; database schema version bumps to 4 (both forward-migrated
+automatically). 1819 lib tests / 0 fail; 27 workspace suites green; 7
+adversarial review rounds.
+
+### Added
+
+- **#A12 self-supervised recall-fusion calibration** — a
+  leave-one-evidence-out corpus derived from structural families (canonical
+  evidence / concept / episode); SHA-256 family-disjoint 5-fold split with a
+  permanent activation holdout fold that is never passed to the optimizer;
+  side-effect-free `recall_loo_trace` replay (no recall-access / recall-hit /
+  tiering writes, dynamic weights disabled); family-equal optimizer + paired
+  top-3 McNemar holdout gate; sealed versioned A12 calibration state
+  (metadata CAS, immutable revision history); one shared evidence resolver
+  feeds policy refresh, release gate, and runtime. LOO exclusion is
+  family-level, so supersede-chain relatives cannot leak held-out answers.
+- **`a12_input_epoch` coherence** — a schema v4 migration installs 21
+  triggers maintaining a durable input-epoch counter over every
+  replay-relevant write. Calibration runs bind to the epoch and the final
+  seal re-checks it inside `BEGIN IMMEDIATE`; the runtime resolver
+  re-verifies epoch, behavior fingerprint, and judge trust on every recall. A
+  missing epoch row self-heals at open; a malformed row is repaired only by
+  `rein doctor --fix`, which atomically re-baselines the counter and
+  invalidates any active A12 calibration.
+- **Judge structural calibration** — four deterministic probe kinds
+  (`SupportedExactSingle` / `SupportedExactMulti` / `UnsupportedNonce` /
+  `QueryMismatch`) with per-surface versioned state; probe payloads cannot
+  self-report labels; Ready requires all four kinds in one run; a model or
+  rubric change invalidates the run. New `[ars.llm_judge.structural_anchors]`
+  config (`off` | `monitor` | `enforce`, default `off`). Zero human pairs
+  never fabricates a human κ; anchors hold the configured baseline only and
+  never raise judge weight or sample rate; runtime-vs-nightly κ is a
+  drift-only signal.
+- **#C2 dedup calibration safety** — destructive lexical merges floored at
+  the static threshold (the legacy learned `0.40` demoted to a shadow
+  suggestion); vector cleanup back on its own cosine threshold; sealed
+  versioned dedup calibration policy (train/holdout split by pair-hash +
+  canonical family; `Ship` / `Bail` / `NoData`; never auto-lowers the static
+  floor). Promotion requires an exact one-sided Clopper-Pearson false-merge
+  bound — zero-failure 2% @ 95% needs ≥ 149 sealed negatives; the current
+  n = 10 cohort reports `NoData`. Doctor, trust measurement, and the GUI
+  expose static vs shadow vs hard-effective thresholds.
+- **Observability** — typed `RecallFusionScopeHealthCode` (11 variants)
+  drives doctor attention states (no prose matching); benign absence (fresh
+  install / shadow-only) is doctor-Ok; per-provenance holdout agreement
+  diagnostics with a `provenance_direction_conflict` flag. New doctor checks
+  `a12_input_epoch` and `recall_fusion_calibration`.
+- **`REIN_EVAL_GATE_ROOT`** environment variable — absolute eval-gate
+  artifact root for installed daemons outside a source checkout; relative
+  paths fail closed.
+
+### Changed
+
+- **`ars_parameter_policy` payload schema 2 → 3** — schema-2 rows load
+  fail-closed and are CAS-upgraded; future-schema rows stay byte-preserved.
+  Automatic (non-human) evidence is restricted to `recall_fusion:*` adoption
+  keys, steps at most `0.05` per refresh, and counts only while the judge
+  structural trust gate holds; judge pair evidence enforces a 7-day TTL at
+  read. Tampered calibration state zeroes adoption (never falls back to
+  human evidence); stale-specific state degrades to sealed pure-human
+  evidence only.
+- **Config schema version 2 → 3** — v2 configs migrate automatically at
+  load; older binaries refuse newer-stamped configs (existing downgrade
+  guard).
+- **Compiled default Gemini model id** migrated from the retired
+  `gemini-3.1-flash-lite-preview` (retired 2026-05-25) to the stable
+  `gemini-3.1-flash-lite`; `rein doctor` warns when an operator config still
+  pins the retired id.
+
 ## [1.2.0] — 2026-06-12
 
 Algorithm + hardening minor: the #A5 fact-layer reader lands, the hooks
