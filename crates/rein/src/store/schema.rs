@@ -124,6 +124,10 @@ struct Migration {
 /// gated by `[dedup].persist_triples` (default off → empty table → no behavior
 /// change). The synthetic-migration tests in `migration_tests` still cover the
 /// drop / rollback / re-apply slices via their own `&[Migration]` lists.
+/// Schema version that installs the `a12_input_epoch` row + triggers. The
+/// every-open self-heal below keys on this same constant.
+const A12_INPUT_EPOCH_SCHEMA_VERSION: i64 = 4;
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 2,
@@ -143,7 +147,7 @@ const MIGRATIONS: &[Migration] = &[
         idempotent: true,
     },
     Migration {
-        version: 4,
+        version: A12_INPUT_EPOCH_SCHEMA_VERSION,
         name: "create_a12_input_epoch",
         up: create_a12_input_epoch,
         // Metadata initialization plus CREATE TRIGGER IF NOT EXISTS only.
@@ -558,6 +562,29 @@ fn init_schema_with_migrations(
     }
 
     apply_migrations(conn, migrations)?;
+    heal_a12_input_epoch_row(conn)?;
+    Ok(())
+}
+
+/// Every-open self-heal for the v4 `a12_input_epoch` row. The v4 triggers
+/// RAISE on every base-table write when the row is missing, and
+/// `apply_migrations` never re-runs a stamped migration — a deleted row would
+/// otherwise wedge all writes permanently. `INSERT OR IGNORE` cannot reset a
+/// live counter; a re-created row restarts at zero, which any sealed A12
+/// run's `source_input_epoch` then mismatches, forcing fail-closed
+/// recalibration (the safe direction; writes were trigger-rejected while the
+/// row was missing, so no data change can hide behind the reset). A
+/// present-but-malformed value is deliberately NOT rewritten here: silently
+/// re-baselining could serve stale A12 evidence, so doctor surfaces it with
+/// an explicit repair path that also invalidates the active calibration.
+fn heal_a12_input_epoch_row(conn: &Connection) -> ReinResult<()> {
+    if schema_user_version(conn)? < A12_INPUT_EPOCH_SCHEMA_VERSION {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO metadata(key, value) VALUES ('a12_input_epoch', '0')",
+        [],
+    )?;
     Ok(())
 }
 
@@ -2305,6 +2332,48 @@ mod migration_tests {
             )
             .unwrap();
         assert_eq!(trigger_count, 21, "v4 installs one trigger per write path");
+    }
+
+    #[test]
+    fn a12_input_epoch_row_self_heals_on_reopen_without_resetting_live_counter() {
+        init_sqlite_vec();
+        let conn = Connection::open_in_memory().expect("open memory db");
+        init_schema(&conn, 4).expect("first schema init");
+
+        // An advanced counter survives bring-up untouched.
+        conn.execute(
+            "UPDATE metadata SET value = '57' WHERE key = 'a12_input_epoch'",
+            [],
+        )
+        .unwrap();
+        init_schema(&conn, 4).expect("re-open with advanced counter");
+        assert_eq!(a12_input_epoch(&conn), Some(57));
+
+        // Deleting the row wedges every epoch-guarded write path...
+        conn.execute("DELETE FROM metadata WHERE key = 'a12_input_epoch'", [])
+            .unwrap();
+        let wedged = conn.execute(
+            "INSERT INTO metadata(key, value) VALUES ('adaptive_state', '{}')",
+            [],
+        );
+        assert!(
+            wedged
+                .unwrap_err()
+                .to_string()
+                .contains("a12_input_epoch is missing"),
+            "missing epoch row must abort epoch-guarded writes"
+        );
+
+        // ...and the next open self-heals it at zero instead of leaving the
+        // database permanently write-wedged.
+        init_schema(&conn, 4).expect("re-open after epoch row deletion");
+        assert_eq!(a12_input_epoch(&conn), Some(0));
+        conn.execute(
+            "INSERT INTO metadata(key, value) VALUES ('adaptive_state', '{}')",
+            [],
+        )
+        .expect("writes must work again after the self-heal");
+        assert_eq!(a12_input_epoch(&conn), Some(1));
     }
 
     #[test]

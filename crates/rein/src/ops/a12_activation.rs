@@ -19,9 +19,6 @@ use std::path::{Path, PathBuf};
 /// `docs/eval-baselines` + `target/eval-gates` layout, so `rein-eval` can
 /// produce the artifacts simply by running from this directory.
 pub const REIN_EVAL_GATE_ROOT_ENV: &str = "REIN_EVAL_GATE_ROOT";
-// Must remain identical to the fixed replay limit used by the A12 cadence in
-// `ops::adaptive`; it is part of the behavior-config fingerprint contract.
-const A12_RUNTIME_RECALL_TRACE_LIMIT: usize = 20;
 
 /// Immutable identity of the recall eval-gate decision used by policy refresh.
 /// Runtime consumes the sealed fields from the policy and never re-reads files.
@@ -829,7 +826,7 @@ pub fn resolve_runtime_recall_fusion_live(
     let current_behavior = match crate::ops::a12_autocalibration::a12_behavior_config_fingerprint(
         config,
         hard_dedup_bound,
-        A12_RUNTIME_RECALL_TRACE_LIMIT,
+        crate::ops::adaptive::A12_RECALL_TRACE_LIMIT,
         min_samples_alpha,
     ) {
         Ok(fingerprint) => fingerprint,
@@ -2430,7 +2427,7 @@ mod tests {
         let behavior = crate::ops::a12_autocalibration::a12_behavior_config_fingerprint(
             config,
             hard_dedup_bound,
-            A12_RUNTIME_RECALL_TRACE_LIMIT,
+            crate::ops::adaptive::A12_RECALL_TRACE_LIMIT,
             config.adaptive.min_samples_alpha,
         )
         .unwrap();

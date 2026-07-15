@@ -12,7 +12,10 @@ use std::collections::{BTreeMap, HashMap};
 use super::dedup::run_vec_dedup;
 
 const ARS_POLICY_ADOPTION_MAX_STEP: f64 = 0.05;
-const A12_RECALL_TRACE_LIMIT: usize = 20;
+/// Fixed replay limit shared by the offline A12 cadence and the online
+/// activation resolver — a single definition because it is part of the
+/// behavior-config fingerprint contract on both sides.
+pub(crate) const A12_RECALL_TRACE_LIMIT: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct A12RefreshInputs {
@@ -5506,6 +5509,48 @@ mod tests {
                 .unwrap();
             assert_eq!(preserved, raw);
         }
+    }
+
+    /// P2-2 end-to-end: a corrupt active pointer wedges refresh (Unhealthy,
+    /// bytes preserved) until the doctor-fix repair deletes it; the next
+    /// refresh tick then reseals a fresh complete calibration.
+    #[test]
+    fn doctor_repair_unwedges_corrupt_a12_active_pointer_for_next_refresh() {
+        let store = SqliteStore::in_memory().unwrap();
+        AdaptiveState::default()
+            .save_snapshot(store.conn())
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO metadata (key, value) VALUES (?1, '{not-json')",
+                rusqlite::params![crate::store::a12_calibration::A12_CALIBRATION_METADATA_KEY],
+            )
+            .unwrap();
+
+        let outcome = refresh_a12_calibration_with(
+            &store,
+            &a12_enabled_config(),
+            &AdaptiveState::default(),
+            chrono::DateTime::<Utc>::from_timestamp(2_000, 0).unwrap(),
+            |_inputs, _at| unreachable!("corrupt pointer must not invoke calibration"),
+            |_store, _pending| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(outcome, A12CalibrationRefreshOutcome::Unhealthy);
+
+        // Operator repair — the same helper `rein doctor --fix` invokes.
+        let repaired =
+            crate::store::a12_calibration::repair_corrupt_a12_calibration(store.conn()).unwrap();
+        assert_eq!(repaired.deleted, 1);
+
+        run_post_snapshot_refreshes(&store, &a12_enabled_config());
+        let a12 = crate::store::a12_calibration::load_a12_calibration(store.conn());
+        assert_eq!(
+            a12.status,
+            crate::store::a12_calibration::A12CalibrationLoadStatus::Loaded
+        );
+        assert!(a12.state.is_complete());
     }
 
     #[test]

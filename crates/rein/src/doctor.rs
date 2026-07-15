@@ -156,6 +156,7 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
                             checks.push(check_ars_parameter_policy(&store, config));
                             checks.push(check_dedup_threshold_observability(&store, config));
                             checks.push(check_recall_fusion_calibration(&store, config));
+                            checks.push(check_a12_input_epoch(&store));
                             // v0.27.x judge checks
                             checks.push(check_judge_calibration(&store, config));
                             checks.push(check_judge_call_ledger(&store, config));
@@ -2657,6 +2658,57 @@ fn apply_local_fixes(config: &ReinConfig, store: &SqliteStore) -> Vec<String> {
         )),
     }
 
+    // P2-1 epoch recovery. A missing `a12_input_epoch` row is re-created at
+    // zero (same idempotent heal the schema bring-up applies on every open);
+    // a malformed row is re-baselined ONLY together with invalidating the
+    // active A12 calibration, so no sealed run keeps serving against an
+    // untrusted counter. Both are no-ops on a healthy row.
+    match store.conn().execute(
+        "INSERT OR IGNORE INTO metadata(key, value) VALUES ('a12_input_epoch', '0')",
+        [],
+    ) {
+        Ok(inserted) if inserted > 0 => fixes.push(
+            "re-created missing a12_input_epoch row at zero; sealed A12 runs recalibrate fail-closed"
+                .to_string(),
+        ),
+        Ok(_) => {}
+        Err(e) => fixes.push(format!("failed to re-create a12_input_epoch row: {e}")),
+    }
+    match crate::store::a12_calibration::repair_malformed_a12_input_epoch(store.conn()) {
+        Ok(outcome) if outcome.reset => fixes.push(format!(
+            "re-baselined malformed a12_input_epoch (was {:?}) and invalidated the active A12 calibration ({})",
+            outcome.observed_value.unwrap_or_default(),
+            if outcome.calibration_invalidated {
+                "active pointer cleared"
+            } else {
+                "no active pointer present"
+            }
+        )),
+        Ok(_) => {}
+        Err(e) => fixes.push(format!("failed to re-baseline a12_input_epoch: {e}")),
+    }
+
+    // P2-2: schema-2 (or otherwise corrupt) A12 active-pointer recovery.
+    // Mirrors the parameter-policy repair above: the helper re-checks status
+    // under `BEGIN IMMEDIATE` and deletes only a confirmed-Corrupt active
+    // row — future-schema rows and immutable revision rows are preserved —
+    // so the next `refresh_a12_calibration` tick reseals fresh instead of
+    // early-returning Unhealthy forever.
+    match crate::store::a12_calibration::repair_corrupt_a12_calibration(store.conn()) {
+        Ok(outcome) if outcome.deleted > 0 => fixes.push(format!(
+            "deleted corrupt a12_calibration active pointer ({} row{}): {}",
+            outcome.deleted,
+            if outcome.deleted == 1 { "" } else { "s" },
+            outcome
+                .error_at_delete
+                .unwrap_or_else(|| "unknown error".to_string())
+        )),
+        Ok(_) => {}
+        Err(e) => fixes.push(format!(
+            "failed to delete corrupt a12_calibration active pointer: {e}"
+        )),
+    }
+
     // v0.28.7 H2 — drift-triggered rollback. If the parameter policy is in
     // Canary mode while `judge_calibration_state.judge_drift_alert*` is
     // positive, force a refresh which (per the demote-on-drift logic in
@@ -3075,8 +3127,11 @@ fn check_recall_fusion_calibration(
         "policy_unsupported_schema" | "a12_unsupported_schema" => {
             "Upgrade rein to a binary that understands this policy/A12 schema. Preserve the active pointer and immutable revision bytes unchanged; this check never rewrites them."
         }
-        "policy_corrupt" | "a12_corrupt" | "policy_storage_error" | "a12_storage_error" => {
-            "Preserve the policy/A12 evidence for diagnosis, restore the producer or storage invariant, then seal a new immutable revision. This check never deletes or repairs calibration rows."
+        "policy_corrupt" | "a12_corrupt" => {
+            "Preserve the policy/A12 evidence for diagnosis, then run `rein doctor --fix`: it deletes only a confirmed-corrupt active row (immutable A12 revisions and future-schema bytes are preserved) so the next calibration/refresh tick reseals fresh. This read-only check itself never repairs."
+        }
+        "policy_storage_error" | "a12_storage_error" => {
+            "Storage errors are usually transient (busy/locked reads); retry doctor once the lock clears. No destructive recovery runs for storage errors — the underlying row may still be healthy."
         }
         _ => {
             "Refresh the stale, expired, fingerprint-mismatched, or tampered A12 generation and seal a matching policy revision. A scope serving only its sealed human fallback recovers the same way: recalibrate so the automatic candidate is current again. This check reports evidence only and performs no repair."
@@ -3089,6 +3144,74 @@ fn check_recall_fusion_calibration(
     );
     check.repair_hint = Some(advice.to_string());
     check
+}
+
+/// The v4 `a12_input_epoch` row is the O(1) invalidation token for online
+/// A12. When it is missing, every epoch-guarded write aborts until the next
+/// database open self-heals the row at zero; when it is malformed, writes
+/// stay aborted until an explicit repair. Read-only here — `rein doctor
+/// --fix` re-baselines a malformed row only together with invalidating the
+/// active A12 calibration so no sealed run can serve against an untrusted
+/// counter.
+fn check_a12_input_epoch(store: &crate::store::SqliteStore) -> DoctorCheck {
+    use rusqlite::OptionalExtension;
+
+    let raw = store
+        .conn()
+        .query_row(
+            "SELECT value FROM metadata WHERE key = ?1",
+            rusqlite::params![crate::store::a12_calibration::A12_INPUT_EPOCH_METADATA_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional();
+    match raw {
+        Err(error) => {
+            let mut check = warn_in(
+                DoctorCategory::Storage,
+                "a12_input_epoch",
+                format!("storage error reading a12_input_epoch: {error}"),
+            );
+            check.repair_hint = Some(
+                "Transient storage errors clear on retry; re-run doctor once the database lock is released.".to_string(),
+            );
+            check
+        }
+        Ok(None) => {
+            let mut check = warn_in(
+                DoctorCategory::Storage,
+                "a12_input_epoch",
+                "a12_input_epoch row is missing; every memory/graph write is rejected until it is re-created".to_string(),
+            );
+            check.repair_hint = Some(
+                "Restart or reopen the database (schema bring-up re-creates the row at zero) or run `rein doctor --fix`. Sealed A12 runs then mismatch the reset counter and recalibrate fail-closed.".to_string(),
+            );
+            check
+        }
+        Ok(Some(raw)) => {
+            let healthy = raw
+                .parse::<u64>()
+                .is_ok_and(|epoch| epoch <= i64::MAX as u64);
+            if healthy {
+                ok_in(
+                    DoctorCategory::Storage,
+                    "a12_input_epoch",
+                    format!("a12_input_epoch={raw}"),
+                )
+            } else {
+                let mut check = warn_in(
+                    DoctorCategory::Storage,
+                    "a12_input_epoch",
+                    format!(
+                        "a12_input_epoch is malformed ({raw:?}); every memory/graph write is rejected until it is repaired"
+                    ),
+                );
+                check.repair_hint = Some(
+                    "Run `rein doctor --fix`: it re-baselines the counter to zero AND invalidates the active A12 calibration in the same transaction, so the next calibration run reseals fresh instead of serving against an untrusted counter.".to_string(),
+                );
+                check
+            }
+        }
+    }
 }
 
 /// Surface human agreement, runtime-vs-nightly drift, and deterministic
@@ -4978,6 +5101,60 @@ provider = "inherit"
         assert!(check.message.contains("unsupported_schema"));
         assert_eq!(stored, raw);
         assert!(!check
+            .repair_hint
+            .as_deref()
+            .unwrap_or_default()
+            .contains("--fix"));
+    }
+
+    #[test]
+    fn a12_input_epoch_doctor_reports_healthy_counter() {
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+
+        let check = check_a12_input_epoch(&store);
+
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert!(check.message.contains("a12_input_epoch="));
+    }
+
+    #[test]
+    fn a12_input_epoch_doctor_warns_when_row_is_missing() {
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM metadata WHERE key = ?1",
+                rusqlite::params![crate::store::a12_calibration::A12_INPUT_EPOCH_METADATA_KEY],
+            )
+            .unwrap();
+
+        let check = check_a12_input_epoch(&store);
+
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.message.contains("missing"));
+        assert!(check
+            .repair_hint
+            .as_deref()
+            .unwrap_or_default()
+            .contains("--fix"));
+    }
+
+    #[test]
+    fn a12_input_epoch_doctor_warns_on_malformed_counter() {
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE metadata SET value = 'garbage' WHERE key = ?1",
+                rusqlite::params![crate::store::a12_calibration::A12_INPUT_EPOCH_METADATA_KEY],
+            )
+            .unwrap();
+
+        let check = check_a12_input_epoch(&store);
+
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.message.contains("malformed"));
+        assert!(check
             .repair_hint
             .as_deref()
             .unwrap_or_default()

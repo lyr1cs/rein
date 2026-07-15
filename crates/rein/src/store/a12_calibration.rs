@@ -1369,6 +1369,82 @@ pub fn compare_and_swap_a12_calibration(
     finish_a12_savepoint(conn, operation)
 }
 
+/// Outcome of an explicit `a12_input_epoch` re-baseline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepairA12InputEpochOutcome {
+    pub reset: bool,
+    pub calibration_invalidated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_value: Option<String>,
+}
+
+/// Atomically re-baseline a present-but-malformed `a12_input_epoch` row.
+///
+/// Fail-closed chain: resetting the counter also deletes the active A12
+/// pointer, so no sealed run can keep serving against a re-baselined epoch —
+/// its `source_input_epoch` binding is no longer trustworthy — and the next
+/// calibration run reseals fresh. Immutable revision rows are preserved for
+/// diagnostics. A healthy row is never touched, and a missing row is left to
+/// the open-time schema bring-up self-heal (which recreates it at zero).
+#[must_use = "callers must report whether the A12 input epoch was re-baselined"]
+pub fn repair_malformed_a12_input_epoch(
+    conn: &rusqlite::Connection,
+) -> rusqlite::Result<RepairA12InputEpochOutcome> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let recovery: rusqlite::Result<RepairA12InputEpochOutcome> = (|| {
+        let raw = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?1",
+                params![A12_INPUT_EPOCH_METADATA_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(raw) = raw else {
+            return Ok(RepairA12InputEpochOutcome {
+                reset: false,
+                calibration_invalidated: false,
+                observed_value: None,
+            });
+        };
+        let healthy = raw
+            .parse::<u64>()
+            .is_ok_and(|epoch| epoch <= i64::MAX as u64);
+        if healthy {
+            return Ok(RepairA12InputEpochOutcome {
+                reset: false,
+                calibration_invalidated: false,
+                observed_value: Some(raw),
+            });
+        }
+        // Reset the counter FIRST: while the value is malformed every
+        // epoch-guarded trigger RAISEs, so any bump fired later in this
+        // transaction must already observe the healthy baseline.
+        conn.execute(
+            "UPDATE metadata SET value = '0' WHERE key = ?1",
+            params![A12_INPUT_EPOCH_METADATA_KEY],
+        )?;
+        let deleted = conn.execute(
+            "DELETE FROM metadata WHERE key = ?1",
+            params![A12_CALIBRATION_METADATA_KEY],
+        )?;
+        Ok(RepairA12InputEpochOutcome {
+            reset: true,
+            calibration_invalidated: deleted > 0,
+            observed_value: Some(raw),
+        })
+    })();
+    match recovery {
+        Ok(outcome) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(outcome)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 /// Outcome of an explicit operator repair. Automatic recalibration never
 /// calls this path: an unhealthy row remains preserved until doctor (or an
 /// equivalent explicit recovery flow) requests repair.
@@ -2307,5 +2383,78 @@ mod tests {
             .is_some());
         let legacy: A12ScopeEntry = serde_json::from_value(legacy_json).unwrap();
         assert_eq!(legacy.provenance_holdout, None);
+    }
+
+    #[test]
+    fn repair_malformed_a12_input_epoch_rebaselines_and_invalidates_calibration() {
+        let conn = conn();
+        conn.execute(
+            "INSERT INTO metadata(key, value) VALUES (?1, 'garbage')",
+            params![A12_INPUT_EPOCH_METADATA_KEY],
+        )
+        .unwrap();
+        assert!(compare_and_swap_a12_calibration(&conn, &state(3, 1), 0).unwrap());
+        assert_eq!(
+            load_a12_calibration(&conn).status,
+            A12CalibrationLoadStatus::Loaded
+        );
+
+        let outcome = repair_malformed_a12_input_epoch(&conn).unwrap();
+
+        assert!(outcome.reset);
+        assert!(outcome.calibration_invalidated);
+        assert_eq!(outcome.observed_value.as_deref(), Some("garbage"));
+        assert_eq!(load_a12_input_epoch(&conn).unwrap(), 0);
+        // The active pointer is gone (next calibration run reseals fresh)...
+        assert_eq!(
+            load_a12_calibration(&conn).status,
+            A12CalibrationLoadStatus::Missing
+        );
+        // ...while immutable revision rows stay readable for diagnostics.
+        let revisions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM metadata WHERE key LIKE 'a12_calibration_revision:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(revisions >= 1);
+    }
+
+    #[test]
+    fn repair_malformed_a12_input_epoch_never_touches_healthy_or_missing_rows() {
+        // Missing row: the open-time bring-up self-heal owns recreation.
+        let conn = conn();
+        let missing = repair_malformed_a12_input_epoch(&conn).unwrap();
+        assert!(!missing.reset);
+        assert!(!missing.calibration_invalidated);
+        assert_eq!(missing.observed_value, None);
+
+        // Healthy advanced counter with an active calibration: untouched.
+        conn.execute(
+            "INSERT INTO metadata(key, value) VALUES (?1, '57')",
+            params![A12_INPUT_EPOCH_METADATA_KEY],
+        )
+        .unwrap();
+        assert!(compare_and_swap_a12_calibration(&conn, &state(3, 1), 0).unwrap());
+        let healthy = repair_malformed_a12_input_epoch(&conn).unwrap();
+        assert!(!healthy.reset);
+        assert!(!healthy.calibration_invalidated);
+        assert_eq!(load_a12_input_epoch(&conn).unwrap(), 57);
+        assert_eq!(
+            load_a12_calibration(&conn).status,
+            A12CalibrationLoadStatus::Loaded
+        );
+
+        // A value beyond the SQLite monotonic range counts as malformed.
+        conn.execute(
+            "UPDATE metadata SET value = '9223372036854775808' WHERE key = ?1",
+            params![A12_INPUT_EPOCH_METADATA_KEY],
+        )
+        .unwrap();
+        let out_of_range = repair_malformed_a12_input_epoch(&conn).unwrap();
+        assert!(out_of_range.reset);
+        assert!(out_of_range.calibration_invalidated);
+        assert_eq!(load_a12_input_epoch(&conn).unwrap(), 0);
     }
 }
