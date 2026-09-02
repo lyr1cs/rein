@@ -261,7 +261,7 @@ impl IntoMarkdown for GcOutput {
                 s.push_str(&format!(", {} low-quality concepts", self.concepts));
             }
             if let Some(summary) = self.pipeline_summary() {
-                s.push_str("\n");
+                s.push('\n');
                 s.push_str(&summary);
             }
             s
@@ -291,7 +291,7 @@ impl IntoCliText for GcOutput {
                 s.push_str(&format!(", {} low-quality concepts", self.concepts));
             }
             if let Some(summary) = self.pipeline_summary() {
-                s.push_str("\n");
+                s.push('\n');
                 s.push_str(&summary);
             }
             s

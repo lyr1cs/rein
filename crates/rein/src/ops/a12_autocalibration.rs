@@ -526,12 +526,10 @@ where
             return Err(error);
         }
     };
-    let live_after_commit = read_a12_local_recall_snapshot_identity(store)?;
-    if live_after_commit != snapshot {
-        return Err(ReinError::Config(format!(
-            "A12 local recall snapshot advanced before generation finalization: replay={snapshot} live={live_after_commit}"
-        )));
-    }
+    // Same reasoning as `build_a12_loo_corpus`: the replay is bound to
+    // `snapshot` by the in-transaction check; post-COMMIT drift is handled
+    // at publication and activation time, not by discarding the replay.
+    let _ = snapshot;
     Ok(families)
 }
 
@@ -1635,12 +1633,12 @@ pub(crate) fn build_a12_loo_corpus(
             return Err(error);
         }
     };
-    let live_after_commit = read_a12_local_recall_snapshot_identity(store)?;
-    if live_after_commit != snapshot {
-        return Err(ReinError::Config(format!(
-            "A12 local recall snapshot advanced before corpus finalization: build={snapshot} live={live_after_commit}"
-        )));
-    }
+    // The in-transaction before/after identity check above already proves
+    // the corpus is self-consistent to `snapshot`. Writes that land after
+    // COMMIT do not invalidate that proof; they make the resulting
+    // generation stale, which the activation resolver detects through the
+    // A12 input epoch. Discarding hours of replay here would only hide the
+    // verdict from the operator (2026-09-02 live run).
     corpus.source_snapshot_fingerprint = snapshot;
     Ok(corpus)
 }

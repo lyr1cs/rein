@@ -47,7 +47,11 @@ enum A12CalibrationRefreshOutcome {
     Unchanged,
     PendingCasMiss,
     CompleteSaved,
-    FinalSnapshotMismatch,
+    /// Published as `Complete`, but the live input epoch or local recall
+    /// snapshot moved while the calibration ran. The generation stays
+    /// readable for diagnostics; activation rejects it through the epoch
+    /// check and the next pipeline pass recalibrates.
+    CompleteSavedStale,
     FinalCasMiss,
 }
 
@@ -406,21 +410,6 @@ where
             "A12 calibration batch does not match its pending snapshot/corpus identity".into(),
         ));
     }
-    let live_epoch = crate::store::a12_calibration::load_a12_input_epoch(store.conn())?;
-    if live_epoch != inputs.source_input_epoch {
-        return Err(ReinError::Config(format!(
-            "A12 input epoch advanced before final CAS: pending={} live={live_epoch}",
-            inputs.source_input_epoch
-        )));
-    }
-    let live_snapshot = crate::ops::a12_autocalibration::a12_source_snapshot_fingerprint(store)?;
-    if live_snapshot != inputs.source_snapshot_fingerprint {
-        return Err(ReinError::Config(format!(
-            "A12 local snapshot advanced before final CAS: pending={} live={live_snapshot}",
-            inputs.source_snapshot_fingerprint
-        )));
-    }
-
     // Once per calibration run: surface the structural-signal agreement so an
     // operator can see when the label sources start disagreeing about
     // direction — the deterministic cue that a second-opinion arbiter would
@@ -508,40 +497,50 @@ where
     before_final_cas(store, &pending)?;
     store.conn().execute_batch("BEGIN IMMEDIATE")?;
     let publication = (|| -> ReinResult<A12CalibrationRefreshOutcome> {
+        // Publish even when the source moved during the run. The generation
+        // keeps the identity captured at the pending barrier, so every
+        // activation path (live per-recall epoch check, epoch-aware offline
+        // policy refresh, `Unchanged` cadence check) treats it as stale and
+        // the operator still sees the verdict. Before 2026-09-02 a drift here
+        // discarded the whole multi-hour replay and left an empty pending
+        // barrier active.
+        let run = final_state
+            .run
+            .as_ref()
+            .expect("Task-5 final state always carries run metadata");
         let locked_epoch = crate::store::a12_calibration::load_a12_input_epoch(store.conn())?;
-        if locked_epoch
-            != final_state
-                .run
-                .as_ref()
-                .expect("Task-5 final state always carries run metadata")
-                .source_input_epoch
-        {
-            return Ok(A12CalibrationRefreshOutcome::FinalSnapshotMismatch);
-        }
         let locked_snapshot =
             crate::ops::a12_autocalibration::a12_source_snapshot_fingerprint_in_transaction(store)?;
-        if locked_snapshot
-            != final_state
-                .run
-                .as_ref()
-                .expect("Task-5 final state always carries run metadata")
-                .source_snapshot_fingerprint
-        {
-            return Ok(A12CalibrationRefreshOutcome::FinalSnapshotMismatch);
+        let stale = locked_epoch != run.source_input_epoch
+            || locked_snapshot != run.source_snapshot_fingerprint;
+        if stale {
+            tracing::warn!(
+                run_epoch = run.source_input_epoch,
+                live_epoch = locked_epoch,
+                snapshot_moved = locked_snapshot != run.source_snapshot_fingerprint,
+                "A12 source moved during calibration; publishing the generation as stale"
+            );
         }
         if compare_and_swap_a12_calibration(store.conn(), &final_state, pending.revision)? {
-            Ok(A12CalibrationRefreshOutcome::CompleteSaved)
+            Ok(if stale {
+                A12CalibrationRefreshOutcome::CompleteSavedStale
+            } else {
+                A12CalibrationRefreshOutcome::CompleteSaved
+            })
         } else {
             Ok(A12CalibrationRefreshOutcome::FinalCasMiss)
         }
     })();
     match publication {
-        Ok(A12CalibrationRefreshOutcome::CompleteSaved) => {
+        Ok(
+            outcome @ (A12CalibrationRefreshOutcome::CompleteSaved
+            | A12CalibrationRefreshOutcome::CompleteSavedStale),
+        ) => {
             if let Err(error) = store.conn().execute_batch("COMMIT") {
                 let _ = store.conn().execute_batch("ROLLBACK");
                 return Err(error.into());
             }
-            Ok(A12CalibrationRefreshOutcome::CompleteSaved)
+            Ok(outcome)
         }
         Ok(outcome) => {
             store.conn().execute_batch("ROLLBACK")?;
@@ -673,8 +672,8 @@ fn run_post_snapshot_refreshes(
         Ok(A12CalibrationRefreshOutcome::FinalCasMiss) => tracing::warn!(
             "A12 final calibration CAS missed; active pending/peer revision remains fail-closed"
         ),
-        Ok(A12CalibrationRefreshOutcome::FinalSnapshotMismatch) => tracing::warn!(
-            "A12 source snapshot changed before final publication; active pending revision remains fail-closed"
+        Ok(A12CalibrationRefreshOutcome::CompleteSavedStale) => tracing::warn!(
+            "A12 calibration published, but the source moved during the run; the generation is readable for diagnostics and stays inactive until the next pipeline pass recalibrates"
         ),
         Ok(A12CalibrationRefreshOutcome::PendingCasMiss) => {
             tracing::warn!("A12 pending calibration CAS missed; peer revision remains active")
@@ -1645,14 +1644,17 @@ fn refresh_ars_parameter_policy_with_inputs(
         return;
     }
 
-    let mut recall_fusion_evidence = crate::ops::a12_activation::resolve_recall_fusion_evidence(
-        state,
-        active_a12,
-        config.adaptive.min_samples_alpha,
-        crate::store::a12_calibration::A12_DEFAULT_NOISE_FLOOR,
-        now_millis,
-        recall_gate,
-    );
+    let current_input_epoch = crate::store::a12_calibration::load_a12_input_epoch(conn).ok();
+    let mut recall_fusion_evidence =
+        crate::ops::a12_activation::resolve_recall_fusion_evidence_at_epoch(
+            state,
+            active_a12,
+            config.adaptive.min_samples_alpha,
+            crate::store::a12_calibration::A12_DEFAULT_NOISE_FLOOR,
+            now_millis,
+            recall_gate,
+            current_input_epoch,
+        );
     let eligible_human = recall_fusion_evidence.values().any(|evidence| {
         matches!(
             evidence.basis,
@@ -5509,8 +5511,14 @@ mod tests {
     }
 
     #[test]
-    fn a12_final_lock_rechecks_every_local_snapshot_surface_after_hook() {
-        for surface in ["memories", "fts", "vec", "metadata"] {
+    fn a12_final_lock_publishes_stale_complete_after_hook() {
+        // Every product write path bumps the A12 input epoch through the
+        // schema-v4 triggers (memories rows, vector rows via
+        // embedding_write_seq, guarded metadata keys). A write that lands
+        // between calibration and publication must not discard the result:
+        // the generation is published `Complete`, reported stale, and never
+        // activates.
+        for surface in ["memories", "vec", "metadata"] {
             let store = SqliteStore::in_memory().unwrap();
             store
                 .store(test_memory("a12-race", "source memory", 0))
@@ -5521,6 +5529,8 @@ mod tests {
                 ..AdaptiveState::default()
             };
             let at = chrono::DateTime::<Utc>::from_timestamp(2_000, 0).unwrap();
+            let epoch_before =
+                crate::store::a12_calibration::load_a12_input_epoch(store.conn()).unwrap();
 
             let outcome = refresh_a12_calibration_with(
                 &store,
@@ -5533,13 +5543,6 @@ mod tests {
                         "memories" => {
                             store.conn().execute(
                                 "UPDATE memories SET access_count = access_count + 1",
-                                [],
-                            )?;
-                        }
-                        "fts" => {
-                            store.conn().execute(
-                                "INSERT INTO memories_fts(id, topic, summary, content, keywords) \
-                                 VALUES ('a12-fts-race', 'race', 'race', 'race', 'race')",
                                 [],
                             )?;
                         }
@@ -5564,21 +5567,59 @@ mod tests {
             )
             .unwrap();
 
-            assert_ne!(
+            assert_eq!(
                 outcome,
-                A12CalibrationRefreshOutcome::CompleteSaved,
+                A12CalibrationRefreshOutcome::CompleteSavedStale,
                 "surface={surface}"
             );
             let active = crate::store::a12_calibration::load_a12_calibration(store.conn());
-            assert!(active.state.is_pending(), "surface={surface}");
-            assert!(active.state.scopes.is_empty(), "surface={surface}");
+            assert!(active.state.is_complete(), "surface={surface}");
+            assert!(!active.state.scopes.is_empty(), "surface={surface}");
+            let run = active.state.run.as_ref().unwrap();
+            assert_eq!(
+                run.source_input_epoch, epoch_before,
+                "surface={surface}: published identity is the pending-barrier identity"
+            );
+            let epoch_after =
+                crate::store::a12_calibration::load_a12_input_epoch(store.conn()).unwrap();
+            assert!(
+                epoch_after > epoch_before,
+                "surface={surface}: the hook write must bump the epoch"
+            );
             assert_eq!(
                 crate::store::a12_calibration::list_a12_calibration_history(store.conn())
                     .unwrap()
                     .len(),
-                1,
-                "surface={surface}: final revision must not remain as an orphan"
+                2,
+                "surface={surface}: pending + complete revisions"
             );
+
+            // Offline resolver with the live epoch: automatic evidence is
+            // blocked, so the policy refresh never publishes adoption for it.
+            let gate = ship_recall_gate();
+            let evidence = crate::ops::a12_activation::resolve_recall_fusion_evidence_at_epoch(
+                &durable,
+                &active,
+                config.adaptive.min_samples_alpha,
+                crate::store::a12_calibration::A12_DEFAULT_NOISE_FLOOR,
+                at.timestamp_millis(),
+                &gate,
+                Some(epoch_after),
+            );
+            for (key, value) in &evidence {
+                assert_eq!(
+                    value.basis,
+                    crate::store::ars_parameter_policy::ArsRecallFusionEvidenceBasis::Static,
+                    "surface={surface} scope={key}: stale generation must resolve static"
+                );
+            }
+            // Live per-recall resolver: the same epoch mismatch blocks it.
+            let report = crate::ops::a12_activation::collect_recall_fusion_activation_report(
+                &store,
+                &config,
+                at.timestamp_millis(),
+            );
+            assert!(!report.active, "surface={surface}");
         }
     }
 

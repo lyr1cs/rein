@@ -206,6 +206,32 @@ pub fn resolve_recall_fusion_evidence(
     now_millis: i64,
     recall_gate: &RecallEvalGateAttestation,
 ) -> BTreeMap<String, ArsRecallFusionEvidence> {
+    resolve_recall_fusion_evidence_at_epoch(
+        adaptive,
+        a12,
+        min_samples_alpha,
+        expected_noise_floor,
+        now_millis,
+        recall_gate,
+        None,
+    )
+}
+
+/// [`resolve_recall_fusion_evidence`] with the live A12 input epoch. When
+/// `current_input_epoch` is `Some`, an automatic scope whose sealed run was
+/// calibrated at a different epoch is ineligible, so the offline policy
+/// refresh agrees with the per-recall live resolver instead of publishing an
+/// adoption weight the runtime immediately rejects.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_recall_fusion_evidence_at_epoch(
+    adaptive: &AdaptiveState,
+    a12: &A12CalibrationLoad,
+    min_samples_alpha: usize,
+    expected_noise_floor: f64,
+    now_millis: i64,
+    recall_gate: &RecallEvalGateAttestation,
+    current_input_epoch: Option<u64>,
+) -> BTreeMap<String, ArsRecallFusionEvidence> {
     let floor = u64::try_from(min_samples_alpha.max(10)).unwrap_or(u64::MAX);
     let mut scopes = BTreeSet::new();
     for (scope, entry) in &adaptive.learned_shadow_fusion {
@@ -238,6 +264,7 @@ pub fn resolve_recall_fusion_evidence(
                     floor,
                     expected_noise_floor,
                     now_millis,
+                    current_input_epoch,
                     recall_gate,
                 )
             });
@@ -355,6 +382,7 @@ fn has_judge_drift(adaptive: &AdaptiveState) -> bool {
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn automatic_ineligibility_reason(
     adaptive: &AdaptiveState,
     a12: &A12CalibrationLoad,
@@ -362,10 +390,23 @@ fn automatic_ineligibility_reason(
     floor: u64,
     expected_noise_floor: f64,
     now_millis: i64,
+    current_input_epoch: Option<u64>,
     recall_gate: &RecallEvalGateAttestation,
 ) -> Option<String> {
     if has_judge_drift(adaptive) {
         return Some("judge drift blocks automatic recall fusion".to_string());
+    }
+    if let Some(current_epoch) = current_input_epoch {
+        match a12.state.run.as_ref() {
+            Some(run) if run.source_input_epoch == current_epoch => {}
+            Some(run) => {
+                return Some(format!(
+                    "A12 run input epoch {} drifted from live epoch {current_epoch}",
+                    run.source_input_epoch
+                ));
+            }
+            None => return Some("A12 run has no live-input attestation".to_string()),
+        }
     }
     if entry.verdict != A12CalibrationVerdict::Ship {
         return Some(format!("A12 holdout verdict is {:?}", entry.verdict));
