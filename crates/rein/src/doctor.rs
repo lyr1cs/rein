@@ -158,7 +158,7 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
                             checks.push(check_dedup_threshold_observability(&store, config));
                             checks.push(check_recall_fusion_calibration(&store, config));
                             checks.push(check_a12_input_epoch(&store));
-                            checks.push(check_adaptive_pipeline_last_run(&store));
+                            checks.push(check_adaptive_pipeline_last_run(&store, config));
                             // v0.27.x judge checks
                             checks.push(check_judge_calibration(&store, config));
                             checks.push(check_judge_call_ledger(&store, config));
@@ -3258,12 +3258,20 @@ fn check_recall_fusion_calibration(
 /// [`crate::ops::pipeline_run`]: outcome, age, total time and the slowest
 /// stages. Warns when the pipeline never ran, failed, or has reported
 /// `running` for longer than six hours (a killed pass).
-fn check_adaptive_pipeline_last_run(store: &crate::store::SqliteStore) -> DoctorCheck {
-    check_adaptive_pipeline_last_run_at(store, chrono::Utc::now().timestamp_millis())
+fn check_adaptive_pipeline_last_run(
+    store: &crate::store::SqliteStore,
+    config: &ReinConfig,
+) -> DoctorCheck {
+    check_adaptive_pipeline_last_run_at(
+        store,
+        config.adaptive.enabled,
+        chrono::Utc::now().timestamp_millis(),
+    )
 }
 
 fn check_adaptive_pipeline_last_run_at(
     store: &crate::store::SqliteStore,
+    adaptive_enabled: bool,
     now_unix_ms: i64,
 ) -> DoctorCheck {
     use crate::ops::pipeline_run::{
@@ -3271,6 +3279,13 @@ fn check_adaptive_pipeline_last_run_at(
     };
 
     let Some(record) = load_last_run(store.conn()) else {
+        if !adaptive_enabled {
+            return ok_in(
+                DoctorCategory::Storage,
+                "adaptive_pipeline_last_run",
+                "adaptive pipeline is disabled ([adaptive].enabled = false); no run expected",
+            );
+        }
         let mut check = warn_in(
             DoctorCategory::Storage,
             "adaptive_pipeline_last_run",
@@ -5288,7 +5303,7 @@ provider = "inherit"
     #[test]
     fn adaptive_pipeline_last_run_never_run_warns() {
         let store = crate::store::SqliteStore::in_memory().unwrap();
-        let check = check_adaptive_pipeline_last_run(&store);
+        let check = check_adaptive_pipeline_last_run(&store, &ReinConfig::default());
         assert_eq!(check.status, CheckStatus::Warn);
         assert!(check.message.contains("never completed"));
         assert!(check
@@ -5299,13 +5314,23 @@ provider = "inherit"
     }
 
     #[test]
+    fn adaptive_pipeline_last_run_missing_is_ok_when_adaptive_disabled() {
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+        let mut config = ReinConfig::default();
+        config.adaptive.enabled = false;
+        let check = check_adaptive_pipeline_last_run(&store, &config);
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert!(check.message.contains("disabled"));
+    }
+
+    #[test]
     fn adaptive_pipeline_last_run_completed_is_ok() {
         use crate::ops::pipeline_run::{PipelineRunOutcome, PipelineRunRecorder};
         let store = crate::store::SqliteStore::in_memory().unwrap();
         let recorder = PipelineRunRecorder::start(&store, "gc");
         recorder.stage("m4_cluster", || ());
         recorder.finish(PipelineRunOutcome::Completed, None);
-        let check = check_adaptive_pipeline_last_run(&store);
+        let check = check_adaptive_pipeline_last_run(&store, &ReinConfig::default());
         assert_eq!(check.status, CheckStatus::Ok);
         assert!(check.message.contains("completed"));
         assert!(check.message.contains("trigger=gc"));
@@ -5319,7 +5344,7 @@ provider = "inherit"
         let recorder = PipelineRunRecorder::start(&store, "gc");
         recorder.stage("m4_cluster", || ());
         let started = recorder.record().started_at_unix_ms;
-        let fresh = check_adaptive_pipeline_last_run_at(&store, started + 1_000);
+        let fresh = check_adaptive_pipeline_last_run_at(&store, true, started + 1_000);
         assert_eq!(
             fresh.status,
             CheckStatus::Ok,
@@ -5327,6 +5352,7 @@ provider = "inherit"
         );
         let stale = check_adaptive_pipeline_last_run_at(
             &store,
+            true,
             started + PIPELINE_RUN_STALE_RUNNING_MS + 1,
         );
         assert_eq!(stale.status, CheckStatus::Warn);
@@ -5342,7 +5368,7 @@ provider = "inherit"
             PipelineRunOutcome::Failed,
             Some("snapshot save failed".into()),
         );
-        let check = check_adaptive_pipeline_last_run(&store);
+        let check = check_adaptive_pipeline_last_run(&store, &ReinConfig::default());
         assert_eq!(check.status, CheckStatus::Warn);
         assert!(check.message.contains("error=snapshot save failed"));
     }

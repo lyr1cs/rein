@@ -46,9 +46,12 @@ pub struct WarmupReport {
     /// stamping existed) and the caller did not attest them; only missing rows
     /// were filled and no stamp was written.
     pub provenance_unknown: bool,
-    /// Staged migration rows skipped at publish time because the memory was
-    /// edited, deprecated, or deleted while embeddings were being computed.
+    /// Rows skipped at write time because the memory was edited, deprecated,
+    /// or deleted while its embedding was being computed.
     pub revalidation_skipped: usize,
+    /// A model migration replaced the vector table (even if it published no
+    /// rows), so the HNSW index must be rebuilt.
+    pub vector_table_replaced: bool,
 }
 
 /// Operator choices for [`warmup_with_options`].
@@ -154,10 +157,11 @@ pub async fn warmup_with_embedder(
         "warmup complete"
     );
 
-    if report.rows_added() > 0 {
-        // Rebuild side indexes so the new rows are searchable. A model
-        // migration only counts rows once it was published atomically, so
-        // this can never promote a mixed old/new-model table.
+    if report.rows_added() > 0 || report.vector_table_replaced {
+        // Rebuild side indexes so the new rows are searchable (and so a
+        // migration that dropped rows does not leave stale vectors in HNSW).
+        // A model migration only counts rows once it was published
+        // atomically, so this can never promote a mixed old/new-model table.
         populate_hnsw(store, config);
     }
 
@@ -307,8 +311,9 @@ pub async fn backfill_missing_vec_rows(
     for (id, text) in pending {
         match EmbedCache::get(store.conn(), &text, &model) {
             Ok(Some(embedding)) if embedding.len() == dims => {
-                match replace_embedding_row(store.conn(), &id, &embedding, existing.contains(&id)) {
-                    Ok(()) => report.backfilled_from_cache += 1,
+                match write_validated_row(store, &id, &text, &embedding, existing.contains(&id)) {
+                    Ok(true) => report.backfilled_from_cache += 1,
+                    Ok(false) => report.revalidation_skipped += 1,
                     Err(e) => {
                         tracing::warn!(id, "warmup: failed to restore vector row from cache: {e}");
                         report.errors += 1;
@@ -348,9 +353,9 @@ pub async fn backfill_missing_vec_rows(
                     if let Err(e) = EmbedCache::put(store.conn(), text, &model, embedding) {
                         tracing::warn!(id, "warmup: failed to cache embedding: {e}");
                     }
-                    match replace_embedding_row(store.conn(), id, embedding, existing.contains(id))
-                    {
-                        Ok(()) => report.embedded += 1,
+                    match write_validated_row(store, id, text, embedding, existing.contains(id)) {
+                        Ok(true) => report.embedded += 1,
+                        Ok(false) => report.revalidation_skipped += 1,
                         Err(e) => {
                             tracing::warn!(id, "warmup: failed to insert vector row: {e}");
                             report.errors += 1;
@@ -379,6 +384,72 @@ pub async fn backfill_missing_vec_rows(
         write_metadata(store, VEC_ROWS_PROVENANCE_KEY, &provenance);
     }
     report
+}
+
+/// Whether `id` is still a live memory whose enriched text equals `text`.
+/// Embeddings are computed from a snapshot of the row; a memory edited,
+/// deprecated, or deleted in the meantime must not receive that embedding.
+pub(crate) fn memory_still_matches(
+    conn: &rusqlite::Connection,
+    id: &str,
+    text: &str,
+) -> crate::types::ReinResult<bool> {
+    use rusqlite::OptionalExtension;
+    let current: Option<(String, String, String, String)> = conn
+        .query_row(
+            "SELECT status, topic, summary, content FROM memories WHERE id = ?1",
+            rusqlite::params![id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    Ok(current
+        .as_ref()
+        .is_some_and(|(status, topic, summary, content)| {
+            (status == "active" || status == "updated")
+                && prepend_metadata(topic, summary, content) == text
+        }))
+}
+
+/// Revalidate `id` against `text` and write the row inside one savepoint.
+/// Returns `Ok(false)` when the memory changed and nothing was written.
+fn write_validated_row(
+    store: &SqliteStore,
+    id: &str,
+    text: &str,
+    embedding: &[f32],
+    existed: bool,
+) -> crate::types::ReinResult<bool> {
+    let conn = store.conn();
+    conn.execute_batch("SAVEPOINT vec_validated_write")?;
+    let result = (|| -> crate::types::ReinResult<bool> {
+        if !memory_still_matches(conn, id, text)? {
+            return Ok(false);
+        }
+        replace_embedding_row(conn, id, embedding, existed)?;
+        Ok(true)
+    })();
+    match result {
+        Ok(written) => {
+            if let Err(e) = conn.execute_batch("RELEASE vec_validated_write") {
+                let _ = conn.execute_batch("ROLLBACK TO vec_validated_write");
+                let _ = conn.execute_batch("RELEASE vec_validated_write");
+                return Err(e.into());
+            }
+            Ok(written)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO vec_validated_write");
+            let _ = conn.execute_batch("RELEASE vec_validated_write");
+            Err(e)
+        }
+    }
 }
 
 /// One staged migration row: the memory id, the exact text that was embedded,
@@ -500,30 +571,7 @@ pub(crate) fn publish_migration(
             let mut published_ids: std::collections::HashSet<&str> =
                 std::collections::HashSet::with_capacity(staged.len());
             for row in &staged {
-                let current: Option<(String, String, String, String)> = {
-                    use rusqlite::OptionalExtension;
-                    conn.query_row(
-                        "SELECT status, topic, summary, content FROM memories WHERE id = ?1",
-                        rusqlite::params![row.id],
-                        |r| {
-                            Ok((
-                                r.get::<_, String>(0)?,
-                                r.get::<_, String>(1)?,
-                                r.get::<_, String>(2)?,
-                                r.get::<_, String>(3)?,
-                            ))
-                        },
-                    )
-                    .optional()?
-                };
-                let still_current =
-                    current
-                        .as_ref()
-                        .is_some_and(|(status, topic, summary, content)| {
-                            (status == "active" || status == "updated")
-                                && prepend_metadata(topic, summary, content) == row.text
-                        });
-                if !still_current {
+                if !memory_still_matches(conn, &row.id, &row.text)? {
                     skipped += 1;
                     continue;
                 }
@@ -554,6 +602,7 @@ pub(crate) fn publish_migration(
     };
     match publish() {
         Ok(()) => {
+            report.vector_table_replaced = true;
             report.revalidation_skipped = skipped;
             report.embedded = published.saturating_sub(report.backfilled_from_cache.min(published));
             report.backfilled_from_cache = report.backfilled_from_cache.min(published);
@@ -2635,6 +2684,37 @@ mod tests {
             read_metadata(&store, VEC_ROWS_PROVENANCE_KEY).as_deref(),
             Some(provenance.as_str())
         );
+    }
+
+    #[test]
+    fn memory_still_matches_rejects_edited_deprecated_and_deleted_rows() {
+        use crate::types::{MemoryStatus, MemoryStore};
+        let store = SqliteStore::in_memory().unwrap();
+        let memory = live_memory("match", "original text");
+        let id = store.store(memory.clone()).unwrap();
+        let text = enriched(&store.get(&id).unwrap());
+        assert!(memory_still_matches(store.conn(), &id, &text).unwrap());
+
+        let mut edited = store.get(&id).unwrap();
+        edited.content = "edited text".into();
+        store.update(&edited).unwrap();
+        assert!(!memory_still_matches(store.conn(), &id, &text).unwrap());
+        let text = enriched(&store.get(&id).unwrap());
+        assert!(memory_still_matches(store.conn(), &id, &text).unwrap());
+
+        let mut deprecated = store.get(&id).unwrap();
+        deprecated.status = MemoryStatus::Deprecated;
+        store.update(&deprecated).unwrap();
+        assert!(!memory_still_matches(store.conn(), &id, &text).unwrap());
+
+        assert!(!memory_still_matches(store.conn(), "missing-id", &text).unwrap());
+
+        // write_validated_row refuses to write for a changed memory.
+        let dims = ReinConfig::default().embedding.dimensions;
+        assert!(!write_validated_row(&store, &id, &text, &vec![0.1; dims], false).unwrap());
+        assert!(crate::store::vec::get_embedding(store.conn(), &id)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

@@ -1035,8 +1035,11 @@ pub fn run_adaptive_pipeline_with_trigger(
     trigger: &str,
 ) -> Option<PipelineRunRecord> {
     if !config.adaptive.enabled {
-        let recorder = PipelineRunRecorder::start(store, trigger);
-        recorder.finish(PipelineRunOutcome::SkippedDisabled, None);
+        // Do not touch the shared last-run record here: this process holds
+        // no single-flight lock, and a peer with adaptive enabled may be
+        // mid-pass on the same database. Doctor reports the disabled state
+        // from config instead.
+        tracing::debug!(trigger, "adaptive pipeline disabled by config; skipping");
         return None;
     }
 
@@ -5598,6 +5601,23 @@ mod tests {
                 .iter()
                 .all(|entry| entry.generation == 1)
         );
+    }
+
+    #[test]
+    fn disabled_pipeline_leaves_the_last_run_record_untouched() {
+        let store = SqliteStore::in_memory().unwrap();
+        let peer = PipelineRunRecorder::start(&store, "gc");
+        peer.stage("m4_cluster", || ());
+        let before = crate::ops::pipeline_run::load_last_run(store.conn()).unwrap();
+        let mut config = ReinConfig::default();
+        config.adaptive.enabled = false;
+        assert!(run_adaptive_pipeline_with_trigger(&store, &config, "dedup").is_none());
+        let after = crate::ops::pipeline_run::load_last_run(store.conn()).unwrap();
+        assert_eq!(
+            after, before,
+            "a disabled process must not overwrite a live run"
+        );
+        assert_eq!(after.outcome, PipelineRunOutcome::Running);
     }
 
     #[test]
