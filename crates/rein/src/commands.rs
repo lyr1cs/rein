@@ -265,8 +265,18 @@ pub async fn handle_upgrade(
 
 pub async fn handle_warmup(config: &ReinConfig) -> anyhow::Result<()> {
     let store = config.open_store()?;
-    let (cached, errors) = search::warmup::warmup(&store, config).await;
-    println!("Warmup complete: {cached} embeddings cached, {errors} errors");
+    let report = search::warmup::warmup(&store, config).await;
+    let mut line = format!(
+        "Warmup complete: {} memories embedded, {} vector rows restored from cache, {} errors",
+        report.embedded, report.backfilled_from_cache, report.errors
+    );
+    if report.skipped_no_provider > 0 {
+        line.push_str(&format!(
+            ", {} skipped (no embedding provider configured)",
+            report.skipped_no_provider
+        ));
+    }
+    println!("{line}");
     Ok(())
 }
 

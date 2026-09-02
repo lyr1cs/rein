@@ -1088,7 +1088,7 @@ impl SqliteStore {
     {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, topic, summary, content, keywords FROM memories")?;
+            .prepare("SELECT id, topic, summary, content, keywords, status FROM memories")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let warmup_row = WarmupRow {
@@ -1097,6 +1097,7 @@ impl SqliteStore {
                 summary: row.get::<_, String>(2)?,
                 content: row.get::<_, String>(3)?,
                 keywords: row.get::<_, String>(4)?,
+                status: row.get::<_, String>(5)?,
             };
             f(warmup_row)?;
         }
@@ -1199,6 +1200,8 @@ pub struct WarmupRow {
     pub summary: String,
     pub content: String,
     pub keywords: String,
+    /// `memories.status` as stored (`active` / `updated` / `deprecated`).
+    pub status: String,
 }
 
 #[cfg(test)]

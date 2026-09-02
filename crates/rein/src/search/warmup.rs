@@ -26,7 +26,37 @@ pub enum TantivyRebuildState {
 
 /// Warm up the embedding cache by pre-computing embeddings for uncached memories.
 /// Returns (cached_count, error_count).
-pub async fn warmup(store: &SqliteStore, config: &ReinConfig) -> (usize, usize) {
+/// Outcome of one `warmup` pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WarmupReport {
+    /// Live memories that had neither a vector row nor a cache entry and were
+    /// embedded through the provider.
+    pub embedded: usize,
+    /// Live memories whose embedding was still in `embed_cache` but had no
+    /// `vec_memories` row; the row was written without a provider call.
+    pub backfilled_from_cache: usize,
+    /// Provider or storage failures.
+    pub errors: usize,
+    /// Cache misses left unembedded because no embedding provider is configured.
+    pub skipped_no_provider: usize,
+}
+
+impl WarmupReport {
+    /// Rows added to `vec_memories` by this pass.
+    pub fn rows_added(&self) -> usize {
+        self.embedded + self.backfilled_from_cache
+    }
+}
+
+/// Make every live memory (`status IN ('active', 'updated')`) durable in the
+/// vector store, then rebuild HNSW.
+///
+/// `embed_cache` is a bounded, time-evicting cache (30-day cleanup once it
+/// exceeds 5 000 rows), so an embedding that only lives there disappears; the
+/// `vec_memories` row is the durable copy that recall, sqlite-vec replay and
+/// the HNSW rebuild read. Earlier versions only refilled the cache, which is
+/// why coverage never converged on long-lived databases.
+pub async fn warmup(store: &SqliteStore, config: &ReinConfig) -> WarmupReport {
     // v0.30.2 B3 / B6: orphan-stage cleanup BEFORE any rebuild decision so a
     // crash mid-swap from a previous run can't leave the search subsystem
     // staring at a half-built `.new` dir.
@@ -69,87 +99,149 @@ pub async fn warmup(store: &SqliteStore, config: &ReinConfig) -> (usize, usize) 
         tracing::debug!("warmup: skipping cold-start hnsw rebuild (gate satisfied)");
     }
 
-    let embedder = match create_embedder(config) {
-        Some(e) => e,
-        None => {
-            tracing::info!("no embedding provider configured, skipping warmup");
-            return (0, 0);
+    let embedder = create_embedder(config);
+    if embedder.is_none() {
+        tracing::info!(
+            "no embedding provider configured; warmup restores vector rows from cache only"
+        );
+    }
+    let report = backfill_missing_vec_rows(store, config, embedder.as_ref()).await;
+    tracing::info!(
+        embedded = report.embedded,
+        backfilled_from_cache = report.backfilled_from_cache,
+        errors = report.errors,
+        skipped_no_provider = report.skipped_no_provider,
+        "warmup complete"
+    );
+
+    if report.rows_added() > 0 {
+        // Rebuild side indexes so the new rows are searchable.
+        populate_hnsw(store, config);
+    }
+
+    report
+}
+
+/// Insert a `vec_memories` row for every live memory that lacks one, using
+/// the cache when it still holds the embedding and the provider otherwise.
+/// Rows are written inside SQLite; the HNSW side index is left to the caller
+/// (`populate_hnsw`), matching the side-index discipline used everywhere else.
+pub async fn backfill_missing_vec_rows(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    embedder: Option<&crate::embed::EmbedderKind>,
+) -> WarmupReport {
+    let model = config.embedding_model();
+    let dims = config.embedding.dimensions;
+    let mut report = WarmupReport::default();
+
+    let indexed = match crate::store::vec::list_embedding_ids(store.conn()) {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::warn!("warmup: failed to list vector rows: {e}");
+            report.errors += 1;
+            return report;
         }
     };
 
-    let model = config.embedding_model();
-
-    // Stream memory rows; only retain the *uncached* ones in a Vec.
-    // F6 D-M3: the legacy `get_all_for_warmup` returned a Vec of every
-    // memory in the table, which OOM'd on 384 MB+ DBs. Streaming
-    // bounds the Vec at the uncached-subset size — typically small
-    // after the first warmup. First-run cost is unchanged (every row
-    // is uncached then) but at least pays it only once.
-    let mut total = 0usize;
-    let mut uncached: Vec<(String, String, String, String, String)> = Vec::new();
+    // Collect only the missing subset so memory stays bounded by the gap,
+    // not by the table size, and so no write happens while the row cursor
+    // is open.
+    let mut missing: Vec<(String, String)> = Vec::new();
+    let mut live_total = 0_usize;
     if let Err(e) = store.for_each_for_warmup(|row| {
-        total += 1;
-        let text = prepend_metadata(&row.topic, &row.summary, &row.content);
-        let already_cached = EmbedCache::get(store.conn(), &text, &model)
-            .ok()
-            .flatten()
-            .is_some();
-        if !already_cached {
-            uncached.push((row.id, row.topic, row.summary, row.content, row.keywords));
+        if row.status != "active" && row.status != "updated" {
+            return Ok(());
         }
+        live_total += 1;
+        if indexed.contains(&row.id) {
+            return Ok(());
+        }
+        missing.push((
+            row.id,
+            prepend_metadata(&row.topic, &row.summary, &row.content),
+        ));
         Ok(())
     }) {
-        tracing::warn!("failed to list memories for warmup: {e}");
-        return (0, 0);
+        tracing::warn!("warmup: failed to list memories: {e}");
+        report.errors += 1;
+        return report;
+    }
+    if missing.is_empty() {
+        tracing::info!(
+            live_total,
+            "warmup: every live memory already has a vector row"
+        );
+        return report;
+    }
+    tracing::info!(
+        live_total,
+        missing = missing.len(),
+        "warmup: live memories without a vector row"
+    );
+
+    let mut to_embed: Vec<(String, String)> = Vec::new();
+    for (id, text) in missing {
+        match EmbedCache::get(store.conn(), &text, &model) {
+            Ok(Some(embedding)) if embedding.len() == dims => {
+                match crate::store::vec::insert_embedding(store.conn(), &id, &embedding) {
+                    Ok(()) => report.backfilled_from_cache += 1,
+                    Err(e) => {
+                        tracing::warn!(id, "warmup: failed to restore vector row from cache: {e}");
+                        report.errors += 1;
+                    }
+                }
+            }
+            _ => to_embed.push((id, text)),
+        }
     }
 
-    if total == 0 {
-        return (0, 0);
+    if to_embed.is_empty() {
+        return report;
     }
+    let Some(embedder) = embedder else {
+        report.skipped_no_provider = to_embed.len();
+        return report;
+    };
 
-    if uncached.is_empty() {
-        tracing::info!("warmup: all {total} memories already cached");
-        return (0, 0);
-    }
-
-    tracing::info!("warmup: {}/{total} memories need embedding", uncached.len());
-
-    let mut cached = 0usize;
-    let mut errors = 0usize;
-
-    // Process in batches of 100
-    for chunk in uncached.chunks(100) {
-        let texts: Vec<String> = chunk
-            .iter()
-            .map(|(_, topic, summary, content, _)| prepend_metadata(topic, summary, content))
-            .collect();
-        let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-
-        match embedder.embed_batch(&text_refs).await {
+    for chunk in to_embed.chunks(100) {
+        let texts: Vec<&str> = chunk.iter().map(|(_, text)| text.as_str()).collect();
+        match embedder.embed_batch(&texts).await {
             Ok(embeddings) => {
-                for (i, emb) in embeddings.iter().enumerate() {
-                    if i < texts.len() {
-                        if EmbedCache::put(store.conn(), &texts[i], &model, emb).is_ok() {
-                            cached += 1;
-                        } else {
-                            errors += 1;
+                for ((id, text), embedding) in chunk.iter().zip(embeddings.iter()) {
+                    if embedding.len() != dims {
+                        tracing::warn!(
+                            id,
+                            got = embedding.len(),
+                            expected = dims,
+                            "warmup: provider returned an embedding of the wrong size"
+                        );
+                        report.errors += 1;
+                        continue;
+                    }
+                    if let Err(e) = EmbedCache::put(store.conn(), text, &model, embedding) {
+                        tracing::warn!(id, "warmup: failed to cache embedding: {e}");
+                    }
+                    match crate::store::vec::insert_embedding(store.conn(), id, embedding) {
+                        Ok(()) => report.embedded += 1,
+                        Err(e) => {
+                            tracing::warn!(id, "warmup: failed to insert vector row: {e}");
+                            report.errors += 1;
                         }
                     }
+                }
+                if embeddings.len() < chunk.len() {
+                    report.errors += chunk.len() - embeddings.len();
                 }
             }
             Err(e) => {
                 tracing::warn!("warmup batch failed: {e}");
-                errors += chunk.len();
+                report.errors += chunk.len();
             }
         }
     }
 
-    tracing::info!("warmup complete: {cached} cached, {errors} errors");
-
-    // Rebuild side indexes again to include newly-cached embeddings
-    populate_hnsw(store, config);
-
-    (cached, errors)
+    report
 }
 
 /// Populate (or rebuild) the HNSW index from all cached embeddings in SQLite.
@@ -1868,5 +1960,162 @@ mod tests {
         // Release lock for cleanup.
         let _ = unsafe { libc::flock(fd, libc::LOCK_UN) };
         drop(lock_file);
+    }
+
+    fn live_memory(topic: &str, content: &str) -> crate::types::Memory {
+        use crate::types::{Importance, MemoryLayer, MemoryStatus, MemoryTier, Source};
+        let now = chrono::Utc::now();
+        crate::types::Memory {
+            id: ulid::Ulid::new().to_string(),
+            layer: MemoryLayer::LTM,
+            topic: topic.to_string(),
+            summary: content.to_string(),
+            content: content.to_string(),
+            keywords: vec![],
+            importance: Importance::Medium,
+            source: Source::Manual,
+            strength: 1.0,
+            decay_lambda: 0.06,
+            access_count: 0,
+            superseded_by: None,
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: 1.0,
+            source_diversity: 1.0,
+            contradiction_score: 0.0,
+            related_ids: vec![],
+            concept_ids: vec![],
+            status: MemoryStatus::Active,
+            embedding: None,
+            tier: MemoryTier::Warm,
+            cluster_id: None,
+            archival_summary: None,
+            archival_summary_at: None,
+            archival_summary_version: None,
+            created_at: now,
+            updated_at: now,
+            last_accessed: now,
+        }
+    }
+
+    fn enriched(memory: &crate::types::Memory) -> String {
+        prepend_metadata(&memory.topic, &memory.summary, &memory.content)
+    }
+
+    #[tokio::test]
+    async fn warmup_backfills_live_memory_without_vec_row_from_cache() {
+        use crate::types::MemoryStore;
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+        let dims = config.embedding.dimensions;
+        let memory = live_memory("backfill", "cached but never written as a vector row");
+        let id = store.store(memory.clone()).unwrap();
+        assert!(crate::store::vec::get_embedding(store.conn(), &id)
+            .unwrap()
+            .is_none());
+        EmbedCache::put(
+            store.conn(),
+            &enriched(&memory),
+            &config.embedding_model(),
+            &vec![0.5; dims],
+        )
+        .unwrap();
+
+        let report = backfill_missing_vec_rows(&store, &config, None).await;
+
+        assert_eq!(report.backfilled_from_cache, 1);
+        assert_eq!(report.embedded, 0);
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.skipped_no_provider, 0);
+        let stored = crate::store::vec::get_embedding(store.conn(), &id)
+            .unwrap()
+            .expect("vector row restored from cache");
+        assert_eq!(stored.len(), dims);
+
+        // Idempotent: a second pass finds nothing to do.
+        let again = backfill_missing_vec_rows(&store, &config, None).await;
+        assert_eq!(again, WarmupReport::default());
+    }
+
+    #[tokio::test]
+    async fn warmup_backfill_skips_deprecated_and_already_indexed_rows() {
+        use crate::types::{MemoryStatus, MemoryStore};
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+        let dims = config.embedding.dimensions;
+
+        let mut deprecated = live_memory("deprecated", "a deprecated row without a vector");
+        deprecated.status = MemoryStatus::Deprecated;
+        let deprecated_id = store.store(deprecated.clone()).unwrap();
+        EmbedCache::put(
+            store.conn(),
+            &enriched(&deprecated),
+            &config.embedding_model(),
+            &vec![0.1; dims],
+        )
+        .unwrap();
+
+        let mut indexed = live_memory("indexed", "already has a vector row");
+        indexed.embedding = Some(vec![0.2; dims]);
+        let indexed_id = store.store(indexed).unwrap();
+
+        let report = backfill_missing_vec_rows(&store, &config, None).await;
+
+        assert_eq!(report, WarmupReport::default());
+        assert!(
+            crate::store::vec::get_embedding(store.conn(), &deprecated_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(crate::store::vec::get_embedding(store.conn(), &indexed_id)
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn warmup_backfill_counts_cache_misses_without_provider() {
+        use crate::types::MemoryStore;
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+        let memory = live_memory("miss", "no cache entry and no provider");
+        let id = store.store(memory).unwrap();
+
+        let report = backfill_missing_vec_rows(&store, &config, None).await;
+
+        assert_eq!(report.skipped_no_provider, 1);
+        assert_eq!(report.rows_added(), 0);
+        assert!(crate::store::vec::get_embedding(store.conn(), &id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn warmup_backfill_embeds_cache_misses_with_provider() {
+        use crate::types::MemoryStore;
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+        let dims = config.embedding.dimensions;
+        let memory = live_memory("embed", "no cache entry, provider available");
+        let id = store.store(memory.clone()).unwrap();
+        let embedder = crate::embed::EmbedderKind::Mock(
+            crate::embed::MockEmbedder::with_fixed_vector(dims, vec![0.25; dims]),
+        );
+
+        let report = backfill_missing_vec_rows(&store, &config, Some(&embedder)).await;
+
+        assert_eq!(report.embedded, 1);
+        assert_eq!(report.errors, 0);
+        let stored = crate::store::vec::get_embedding(store.conn(), &id)
+            .unwrap()
+            .expect("vector row written after embedding");
+        assert_eq!(stored.len(), dims);
+        assert!(
+            EmbedCache::get(store.conn(), &enriched(&memory), &config.embedding_model())
+                .unwrap()
+                .is_some(),
+            "the embedding is also cached for store-time reuse"
+        );
     }
 }

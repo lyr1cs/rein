@@ -180,6 +180,15 @@ pub fn search_vec(
 }
 
 /// Fetch an embedding vector by memory id, if present.
+/// Ids that currently have a stored vector row.
+pub fn list_embedding_ids(conn: &Connection) -> ReinResult<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare("SELECT id FROM vec_memories")?;
+    let ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<std::collections::HashSet<String>, _>>()?;
+    Ok(ids)
+}
+
 pub fn get_embedding(conn: &Connection, id: &str) -> ReinResult<Option<Vec<f32>>> {
     let result: Result<Vec<u8>, _> = conn.query_row(
         "SELECT embedding FROM vec_memories WHERE id = ?1",
