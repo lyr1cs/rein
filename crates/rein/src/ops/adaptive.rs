@@ -1533,17 +1533,8 @@ pub fn run_adaptive_pipeline_with_trigger(
         );
     }
 
-    if snapshot_saved {
-        recorder.finish_from_stages();
-    } else {
-        recorder.finish(
-            PipelineRunOutcome::Failed,
-            Some("adaptive snapshot save failed".to_string()),
-        );
-    }
-
     // Convergence health summary
-    {
+    recorder.stage("convergence_summary", || {
         let max_alpha_delta = state
             .learned_alpha
             .iter()
@@ -1579,18 +1570,31 @@ pub fn run_adaptive_pipeline_with_trigger(
             cold_threshold = %format!("{:.4}", state.cold_threshold),
             "adaptive convergence summary"
         );
-    }
+    });
 
     // Step 7: Cleanup expired events
-    let cleaned = crate::store::adaptive::cleanup_expired_events(
-        store.conn(),
-        config.adaptive.event_retention_days,
-    )
-    .unwrap_or(0);
+    let cleaned = recorder.stage("event_cleanup", || {
+        crate::store::adaptive::cleanup_expired_events(
+            store.conn(),
+            config.adaptive.event_retention_days,
+        )
+        .unwrap_or(0)
+    });
     if cleaned > 0 {
         tracing::debug!("cleaned {cleaned} expired events");
     }
 
+    // Finalize only after the last piece of work so the recorded duration
+    // covers the whole pass and a kill during cleanup still reads as
+    // `running`, not `completed`.
+    if snapshot_saved {
+        recorder.finish_from_stages();
+    } else {
+        recorder.finish(
+            PipelineRunOutcome::Failed,
+            Some("adaptive snapshot save failed".to_string()),
+        );
+    }
     Some(recorder.record())
 }
 

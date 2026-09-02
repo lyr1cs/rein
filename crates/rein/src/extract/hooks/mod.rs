@@ -242,7 +242,7 @@ pub async fn hook_prompt(config: &ReinConfig) -> anyhow::Result<()> {
     let is_codex = crate::extract::hooks::parsing::hook_runtime_is_codex();
     let policy = prompt_context_policy(config, is_codex);
     let store = if policy.enabled && policy.source == PromptContextSource::Recall {
-        Some(config.open_store()?)
+        prompt_recall_store(config)
     } else {
         None
     };
@@ -250,6 +250,18 @@ pub async fn hook_prompt(config: &ReinConfig) -> anyhow::Result<()> {
         print_codex_json_output(&output)?;
     }
     Ok(())
+}
+
+/// Open the store for prompt-time recall, failing open: a transient open or
+/// migration error only costs this prompt its context, never the prompt.
+fn prompt_recall_store(config: &ReinConfig) -> Option<crate::store::SqliteStore> {
+    match config.open_store() {
+        Ok(store) => Some(store),
+        Err(error) => {
+            tracing::warn!(%error, "hook prompt: store unavailable; no context injected");
+            None
+        }
+    }
 }
 
 /// Effective UserPromptSubmit policy for the calling runtime: Codex (see
@@ -1261,6 +1273,15 @@ mod tests {
         )
         .is_none());
         assert!(hook_prompt_output(&config, &prompt_payload("   "), false, Some(&store)).is_none());
+    }
+
+    #[test]
+    fn prompt_recall_store_fails_open_when_database_cannot_open() {
+        let mut config = recall_config();
+        config.database.path = "/dev/null/rein-cannot-exist/memories.db".to_string();
+        assert!(prompt_recall_store(&config).is_none());
+        // And the reply path with no store is silence, not an error.
+        assert!(hook_prompt_output(&config, &prompt_payload("zebra"), false, None).is_none());
     }
 
     #[test]

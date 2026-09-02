@@ -126,21 +126,10 @@ pub async fn warmup_with_embedder(
         "warmup complete"
     );
 
-    if report.model_changed && report.errors > 0 {
-        // A partial model migration would leave old- and new-model vectors
-        // side by side. Publishing that index would compare query vectors
-        // against incompatible document vectors, so keep HNSW flagged dirty
-        // and let the next successful warmup rebuild it.
-        tracing::warn!(
-            errors = report.errors,
-            "warmup: model migration incomplete; HNSW stays dirty until a clean pass"
-        );
-        let db_path = store.db_path();
-        if db_path.to_str() != Some(":memory:") {
-            crate::store::hnsw::HnswIndex::mark_dirty(&db_path.with_extension(""));
-        }
-    } else if report.rows_added() > 0 {
-        // Rebuild side indexes so the new rows are searchable.
+    if report.rows_added() > 0 {
+        // Rebuild side indexes so the new rows are searchable. A model
+        // migration only counts rows once it was published atomically, so
+        // this can never promote a mixed old/new-model table.
         populate_hnsw(store, config);
     }
 
@@ -203,14 +192,6 @@ pub async fn backfill_missing_vec_rows(
     let reembed_all = stored_provenance
         .as_deref()
         .is_some_and(|stored| stored != provenance);
-    if reembed_all {
-        report.model_changed = true;
-        tracing::warn!(
-            stored = stored_provenance.as_deref().unwrap_or(""),
-            current = %provenance,
-            "warmup: embedding model changed since the last warmup; re-embedding every live memory"
-        );
-    }
 
     let existing = match crate::store::vec::list_embedding_ids(store.conn()) {
         Ok(ids) => ids,
@@ -220,31 +201,21 @@ pub async fn backfill_missing_vec_rows(
             return report;
         }
     };
-    let indexed = if reembed_all {
-        std::collections::HashSet::new()
-    } else {
-        existing.clone()
-    };
-    // sqlite-vec rejects a second row for an existing primary key, so a
-    // re-embed must drop the stale row before inserting the new vector.
-    let write_row = |id: &str, embedding: &[f32]| -> crate::types::ReinResult<()> {
-        replace_embedding_row(store.conn(), id, embedding, existing.contains(id))
-    };
 
-    // Collect only the missing subset so memory stays bounded by the gap,
-    // not by the table size, and so no write happens while the row cursor
-    // is open.
-    let mut missing: Vec<(String, String)> = Vec::new();
+    // Collect the rows to work on so memory stays bounded by the gap (or,
+    // for a migration, by the live set) and no write happens while the row
+    // cursor is open.
+    let mut pending: Vec<(String, String)> = Vec::new();
     let mut live_total = 0_usize;
     if let Err(e) = store.for_each_for_warmup(|row| {
         if row.status != "active" && row.status != "updated" {
             return Ok(());
         }
         live_total += 1;
-        if indexed.contains(&row.id) {
+        if !reembed_all && existing.contains(&row.id) {
             return Ok(());
         }
-        missing.push((
+        pending.push((
             row.id,
             prepend_metadata(&row.topic, &row.summary, &row.content),
         ));
@@ -254,7 +225,30 @@ pub async fn backfill_missing_vec_rows(
         report.errors += 1;
         return report;
     }
-    if missing.is_empty() {
+
+    if reembed_all {
+        report.model_changed = true;
+        tracing::warn!(
+            stored = stored_provenance.as_deref().unwrap_or(""),
+            current = %provenance,
+            live_total,
+            "warmup: embedding model changed since the last warmup; re-embedding every live memory"
+        );
+        migrate_live_rows(
+            store,
+            embedder,
+            &model,
+            dims,
+            &provenance,
+            &existing,
+            pending,
+            &mut report,
+        )
+        .await;
+        return report;
+    }
+
+    if pending.is_empty() {
         tracing::info!(
             live_total,
             "warmup: every live memory already has a vector row"
@@ -264,20 +258,22 @@ pub async fn backfill_missing_vec_rows(
     }
     tracing::info!(
         live_total,
-        missing = missing.len(),
+        missing = pending.len(),
         "warmup: live memories without a vector row"
     );
 
     let mut to_embed: Vec<(String, String)> = Vec::new();
-    for (id, text) in missing {
+    for (id, text) in pending {
         match EmbedCache::get(store.conn(), &text, &model) {
-            Ok(Some(embedding)) if embedding.len() == dims => match write_row(&id, &embedding) {
-                Ok(()) => report.backfilled_from_cache += 1,
-                Err(e) => {
-                    tracing::warn!(id, "warmup: failed to restore vector row from cache: {e}");
-                    report.errors += 1;
+            Ok(Some(embedding)) if embedding.len() == dims => {
+                match replace_embedding_row(store.conn(), &id, &embedding, existing.contains(&id)) {
+                    Ok(()) => report.backfilled_from_cache += 1,
+                    Err(e) => {
+                        tracing::warn!(id, "warmup: failed to restore vector row from cache: {e}");
+                        report.errors += 1;
+                    }
                 }
-            },
+            }
             _ => to_embed.push((id, text)),
         }
     }
@@ -311,7 +307,8 @@ pub async fn backfill_missing_vec_rows(
                     if let Err(e) = EmbedCache::put(store.conn(), text, &model, embedding) {
                         tracing::warn!(id, "warmup: failed to cache embedding: {e}");
                     }
-                    match write_row(id, embedding) {
+                    match replace_embedding_row(store.conn(), id, embedding, existing.contains(id))
+                    {
                         Ok(()) => report.embedded += 1,
                         Err(e) => {
                             tracing::warn!(id, "warmup: failed to insert vector row: {e}");
@@ -334,6 +331,131 @@ pub async fn backfill_missing_vec_rows(
         write_metadata(store, VEC_ROWS_PROVENANCE_KEY, &provenance);
     }
     report
+}
+
+/// Embedding-model migration: every live row is re-embedded under the new
+/// model and the vector table is replaced in ONE transaction only after every
+/// embedding succeeded. A partial result is never written, so old- and
+/// new-model vectors can never coexist in `vec_memories` (which recall reads
+/// directly and the HNSW rebuild promotes). Successful embeddings are cached
+/// before the publish step so a retry after a provider failure is cheap.
+#[allow(clippy::too_many_arguments)]
+async fn migrate_live_rows(
+    store: &SqliteStore,
+    embedder: Option<&crate::embed::EmbedderKind>,
+    model: &str,
+    dims: usize,
+    provenance: &str,
+    existing: &std::collections::HashSet<String>,
+    pending: Vec<(String, String)>,
+    report: &mut WarmupReport,
+) {
+    let mut staged: Vec<(String, Vec<f32>)> = Vec::with_capacity(pending.len());
+    let mut to_embed: Vec<(String, String)> = Vec::new();
+    for (id, text) in pending {
+        match EmbedCache::get(store.conn(), &text, model) {
+            Ok(Some(embedding)) if embedding.len() == dims => {
+                report.backfilled_from_cache += 1;
+                staged.push((id, embedding));
+            }
+            _ => to_embed.push((id, text)),
+        }
+    }
+    if !to_embed.is_empty() {
+        let Some(embedder) = embedder else {
+            report.skipped_no_provider = to_embed.len();
+            report.backfilled_from_cache = 0;
+            tracing::warn!(
+                "warmup: model migration needs an embedding provider; no rows were changed"
+            );
+            return;
+        };
+        for chunk in to_embed.chunks(100) {
+            let texts: Vec<&str> = chunk.iter().map(|(_, text)| text.as_str()).collect();
+            match embedder.embed_batch(&texts).await {
+                Ok(embeddings) if embeddings.len() == chunk.len() => {
+                    for ((id, text), embedding) in chunk.iter().zip(embeddings.into_iter()) {
+                        if embedding.len() != dims {
+                            report.errors += 1;
+                            continue;
+                        }
+                        if let Err(e) = EmbedCache::put(store.conn(), text, model, &embedding) {
+                            tracing::warn!(id, "warmup: failed to cache embedding: {e}");
+                        }
+                        staged.push((id.clone(), embedding));
+                    }
+                }
+                Ok(embeddings) => {
+                    report.errors += chunk.len() - embeddings.len().min(chunk.len());
+                }
+                Err(e) => {
+                    tracing::warn!("warmup migration batch failed: {e}");
+                    report.errors += chunk.len();
+                }
+            }
+            if report.errors > 0 {
+                break;
+            }
+        }
+    }
+    if report.errors > 0 {
+        tracing::warn!(
+            errors = report.errors,
+            staged = staged.len(),
+            "warmup: model migration incomplete; vector rows left untouched (re-run warmup)"
+        );
+        report.embedded = 0;
+        report.backfilled_from_cache = 0;
+        return;
+    }
+
+    // Publish atomically: replace live rows, drop rows for memories that are
+    // no longer live, record provenance.
+    let conn = store.conn();
+    let publish = || -> crate::types::ReinResult<()> {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> crate::types::ReinResult<()> {
+            let staged_ids: std::collections::HashSet<&str> =
+                staged.iter().map(|(id, _)| id.as_str()).collect();
+            for stale in existing
+                .iter()
+                .filter(|id| !staged_ids.contains(id.as_str()))
+            {
+                crate::store::vec::delete_embedding(conn, stale)?;
+            }
+            for (id, embedding) in &staged {
+                replace_embedding_row(conn, id, embedding, existing.contains(id))?;
+            }
+            conn.execute(
+                "INSERT INTO metadata(key, value) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![VEC_ROWS_PROVENANCE_KEY, provenance],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT").map_err(Into::into),
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    };
+    match publish() {
+        Ok(()) => {
+            report.embedded = staged.len() - report.backfilled_from_cache;
+            tracing::info!(
+                rows = staged.len(),
+                "warmup: embedding model migration published"
+            );
+        }
+        Err(e) => {
+            tracing::warn!("warmup: model migration publish failed, rolled back: {e}");
+            report.errors += 1;
+            report.embedded = 0;
+            report.backfilled_from_cache = 0;
+        }
+    }
 }
 
 /// Metadata key recording `"<model>:<dims>"` of the last complete warmup.
@@ -2211,14 +2333,14 @@ mod tests {
 
     #[cfg(feature = "test-support")]
     #[tokio::test]
-    async fn warmup_keeps_hnsw_dirty_after_partial_model_migration() {
+    async fn warmup_aborts_model_migration_without_writing_rows() {
         use crate::types::MemoryStore;
         let (_dir, store) = test_store();
         let config = ReinConfig::default();
         let dims = config.embedding.dimensions;
         let mut memory = live_memory("partial", "row from the previous model");
         memory.embedding = Some(vec![0.9; dims]);
-        store.store(memory).unwrap();
+        let id = store.store(memory).unwrap();
         store.conn().execute("DELETE FROM embed_cache", []).unwrap();
         write_metadata(
             &store,
@@ -2234,11 +2356,10 @@ mod tests {
         assert!(report.model_changed);
         assert!(report.errors > 0);
         assert_eq!(report.rows_added(), 0);
-        let hnsw_path = store.db_path().with_extension("");
-        assert!(
-            crate::store::hnsw::HnswIndex::is_dirty(&hnsw_path),
-            "a failed model migration must leave HNSW flagged for rebuild"
-        );
+        let kept = crate::store::vec::get_embedding(store.conn(), &id)
+            .unwrap()
+            .expect("old-model row is left untouched by a failed migration");
+        assert!((kept[0] - 0.9).abs() < 1e-6);
         assert_eq!(
             read_metadata(&store, VEC_ROWS_PROVENANCE_KEY).as_deref(),
             Some(format!("old-model:{dims}").as_str()),

@@ -807,11 +807,24 @@ fn check_claude_hooks_at(settings_path: &Path) -> DoctorCheck {
         .map(|(event, _)| *event)
         .filter(|event| !installed.contains(event))
         .collect();
-    if installed.is_empty() {
+    // UserPromptSubmit only injects context; only these three feed sessions
+    // into the memory database.
+    let ingestion_installed = installed
+        .iter()
+        .any(|event| matches!(*event, "PostToolUse" | "PreCompact" | "Stop"));
+    if !ingestion_installed {
+        let message = if installed.is_empty() {
+            "no rein hooks in Claude Code settings.json; Claude Code sessions are not feeding the memory database".to_string()
+        } else {
+            format!(
+                "only {} installed; without PostToolUse / PreCompact / Stop, Claude Code sessions are not feeding the memory database",
+                installed.join(", ")
+            )
+        };
         return warn_with_hint(
             DoctorCategory::Configuration,
             "claude_hooks",
-            "no rein hooks in Claude Code settings.json; Claude Code sessions are not feeding the memory database",
+            message,
             "add the PostToolUse / PreCompact / Stop (and optional UserPromptSubmit) `rein hook` entries from the README \"Hook Setup for Claude Code\" section",
         );
     }
@@ -5356,6 +5369,24 @@ provider = "inherit"
         let bad = check_claude_hooks_at(&path);
         assert_eq!(bad.status, CheckStatus::Warn);
         assert!(bad.message.contains("not valid JSON"));
+    }
+
+    #[test]
+    fn claude_hooks_prompt_only_warns_about_missing_ingestion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"hooks":{"UserPromptSubmit":[{"matcher":"","hooks":[{"type":"command","command":"rein hook prompt","timeout":10}]}]}}"#,
+        )
+        .unwrap();
+        let check = check_claude_hooks_at(&path);
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(
+            check.message.contains("only UserPromptSubmit installed"),
+            "{}",
+            check.message
+        );
     }
 
     #[test]
