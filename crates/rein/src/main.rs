@@ -111,8 +111,19 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Pre-compute embeddings for uncached memories
-    Warmup,
+    /// Make every live memory durable in the vector store (fill missing
+    /// vector rows, rebuild HNSW)
+    Warmup {
+        /// Attest that existing vector rows were produced by the configured
+        /// embedding model (first warmup on a database created before
+        /// provenance stamping); stamps provenance after a clean pass.
+        #[arg(long)]
+        trust_existing_vectors: bool,
+        /// Re-embed every live memory under the configured model and replace
+        /// the vector table atomically.
+        #[arg(long)]
+        reembed_all: bool,
+    },
     // Config migrated to #[op] inventory (see ops/handlers/diagnostics.rs).
     // CLI-only surface — producing a typed ConfigSnapshot keeps the subset
     // of non-secret fields explicit in case the op is later exposed to
@@ -281,7 +292,19 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Upgrade { topic, dry_run }) => {
             commands::handle_upgrade(&config, topic, dry_run).await?
         }
-        Some(Commands::Warmup) => commands::handle_warmup(&config).await?,
+        Some(Commands::Warmup {
+            trust_existing_vectors,
+            reembed_all,
+        }) => {
+            commands::handle_warmup(
+                &config,
+                rein::search::warmup::WarmupOptions {
+                    trust_existing_vectors,
+                    reembed_all,
+                },
+            )
+            .await?
+        }
         Some(Commands::Worker { action }) => match action {
             WorkerAction::Memory => commands::handle_worker_memory(&config).await?,
             WorkerAction::DedupQueue => commands::handle_worker_dedup_queue(&config).await?,

@@ -263,9 +263,12 @@ pub async fn handle_upgrade(
     Ok(())
 }
 
-pub async fn handle_warmup(config: &ReinConfig) -> anyhow::Result<()> {
+pub async fn handle_warmup(
+    config: &ReinConfig,
+    options: search::warmup::WarmupOptions,
+) -> anyhow::Result<()> {
     let store = config.open_store()?;
-    let report = search::warmup::warmup(&store, config).await;
+    let report = search::warmup::warmup_with_options(&store, config, options).await;
     let mut line = format!(
         "Warmup complete: {} memories embedded, {} vector rows restored from cache, {} errors",
         report.embedded, report.backfilled_from_cache, report.errors
@@ -276,7 +279,20 @@ pub async fn handle_warmup(config: &ReinConfig) -> anyhow::Result<()> {
             report.skipped_no_provider
         ));
     }
+    if report.revalidation_skipped > 0 {
+        line.push_str(&format!(
+            ", {} skipped at publish (changed during migration; next warmup fills them)",
+            report.revalidation_skipped
+        ));
+    }
     println!("{line}");
+    if report.provenance_unknown {
+        println!(
+            "Existing vector rows have no model provenance. If they were produced by the configured \
+             embedding model, re-run `rein warmup --trust-existing-vectors`; if the model changed, run \
+             `rein warmup --reembed-all` or `rein migrate --reindex`."
+        );
+    }
     Ok(())
 }
 

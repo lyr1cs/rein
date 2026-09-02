@@ -935,6 +935,14 @@ impl OpsRuntime {
                 crate::store::migrate::reindex(&store, &config)
                     .await
                     .map_err(|e| ReinError::Config(e.to_string()))
+                    .inspect(|report| {
+                        // A clean reindex rebuilt every vector under the
+                        // configured model: that is the provenance warmup
+                        // relies on.
+                        if report.errors == 0 {
+                            crate::search::warmup::stamp_vec_rows_provenance(&store, &config);
+                        }
+                    })
                     .map(|report| MigrateOutput {
                         summary: report.to_string(),
                         reindex: true,

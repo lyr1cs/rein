@@ -44,7 +44,12 @@ pub(crate) struct A12RecallTrace {
 
 #[derive(Debug, Clone, Copy)]
 enum RecallExecutionMode<'a> {
-    Live,
+    Live {
+        /// Whether returned memories count as recall hits. Prompt-time
+        /// context injection records hits itself, only for the memories it
+        /// actually injected.
+        record_hits: bool,
+    },
     A12Loo {
         case: &'a crate::ops::a12_autocalibration::A12LooCase,
         evaluation_at: chrono::DateTime<chrono::Utc>,
@@ -54,16 +59,20 @@ enum RecallExecutionMode<'a> {
 impl<'a> RecallExecutionMode<'a> {
     fn loo_case(self) -> Option<&'a crate::ops::a12_autocalibration::A12LooCase> {
         match self {
-            Self::Live => None,
+            Self::Live { .. } => None,
             Self::A12Loo { case, .. } => Some(case),
         }
     }
 
     fn evaluation_at(self) -> chrono::DateTime<chrono::Utc> {
         match self {
-            Self::Live => chrono::Utc::now(),
+            Self::Live { .. } => chrono::Utc::now(),
             Self::A12Loo { evaluation_at, .. } => evaluation_at,
         }
+    }
+
+    fn records_hits(self) -> bool {
+        matches!(self, Self::Live { record_hits: true })
     }
 
     fn is_loo(self) -> bool {
@@ -724,7 +733,35 @@ pub fn recall_temporal_with_request_id(
         expand_override,
         fast,
         request_id,
-        RecallExecutionMode::Live,
+        RecallExecutionMode::Live { record_hits: true },
+    )?
+    .results)
+}
+
+/// Fast local recall for prompt-time context injection: like [`recall_fast`]
+/// (no expansion, LLM reranker, Supermemory, or remote embedding) and it
+/// still emits `RecallComplete` under `request_id`, but it records no recall
+/// hits. The caller records hits for the memories it actually surfaces.
+pub fn recall_fast_for_context(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    query: &str,
+    limit: usize,
+    request_id: String,
+) -> ReinResult<Vec<RecallResult>> {
+    Ok(recall_temporal_with_execution_mode(
+        store,
+        config,
+        query,
+        None,
+        None,
+        limit,
+        None,
+        None,
+        Some(false),
+        true,
+        Some(request_id),
+        RecallExecutionMode::Live { record_hits: false },
     )?
     .results)
 }
@@ -2666,7 +2703,9 @@ fn recall_temporal_with_execution_mode(
         .filter(|r| !r.memory.id.starts_with("sm:") && !r.memory.id.starts_with("auto:"))
         .map(|r| r.memory.id.clone())
         .collect();
-    store.record_recall_hit(&recall_ids);
+    if execution_mode.records_hits() {
+        store.record_recall_hit(&recall_ids);
+    }
 
     // Periodically update quality weights (every ~50 recalls)
     let total_recalls: u64 = store.quality_metrics().map(|(_, r, _)| r).unwrap_or(0);
@@ -3923,7 +3962,7 @@ mod tests {
             evaluation_at: Utc::now(),
         }
         .allows_dynamic_six_weights());
-        assert!(RecallExecutionMode::Live.allows_dynamic_six_weights());
+        assert!(RecallExecutionMode::Live { record_hits: true }.allows_dynamic_six_weights());
         assert_eq!(legacy_cc_alpha(Some(0.73), Some(0.11), 0.4), 0.73);
         assert_eq!(legacy_cc_alpha(None, Some(0.11), 0.4), 0.11);
         assert_eq!(legacy_cc_alpha(None, None, 0.4), 0.4);

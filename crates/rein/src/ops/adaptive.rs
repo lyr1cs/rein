@@ -1162,14 +1162,18 @@ pub fn run_adaptive_pipeline_with_trigger(
     // Drives adaptive `target_bytes` for resummerize compression. Cheap DB
     // scan; runs even without clusters so the global fallback accumulates
     // from day one.
-    recorder.stage("canonical_length_stats", || {
+    let _ = recorder.stage_result("canonical_length_stats", || -> Result<(), String> {
         match crate::store::adaptive::recompute_canonical_length_stats(store.conn()) {
             Ok((per_cluster, global)) => {
                 state.canonical_length_stats = per_cluster;
                 state.global_canonical_length = global;
             }
-            Err(e) => tracing::warn!("failed to recompute canonical_length_stats: {e}"),
+            Err(e) => {
+                tracing::warn!("failed to recompute canonical_length_stats: {e}");
+                return Err(e.to_string());
+            }
         }
+        Ok(())
     });
 
     // v0.24 peek+commit: collect (consumer, max_event_id) batches from
@@ -1191,7 +1195,7 @@ pub fn run_adaptive_pipeline_with_trigger(
     // `CONCEPT_REFRESH_MIN_SAMPLES` samples accumulate, the trigger
     // threshold helpers fall back to bootstrap constants — see
     // `AdaptiveState::concept_refresh_revision_threshold`.
-    recorder.stage("concept_refresh_stats", || {
+    let _ = recorder.stage_result("concept_refresh_stats", || -> Result<(), String> {
         match crate::store::adaptive::recompute_concept_refresh_stats(
             store.conn(),
             state.concept_refresh_stats.clone(),
@@ -1202,8 +1206,12 @@ pub fn run_adaptive_pipeline_with_trigger(
                     pending_offset_batches.push(vec![("concept_refresh_stats", id)]);
                 }
             }
-            Err(e) => tracing::warn!("failed to recompute concept_refresh_stats: {e}"),
+            Err(e) => {
+                tracing::warn!("failed to recompute concept_refresh_stats: {e}");
+                return Err(e.to_string());
+            }
         }
+        Ok(())
     });
 
     // Step 1e: v0.26 D direction — synthesis interaction feedback. Drains any
@@ -1306,7 +1314,7 @@ pub fn run_adaptive_pipeline_with_trigger(
         crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE,
         effective_judge_weight_decay_rate,
     );
-    recorder.stage("synthesis_feedback", || {
+    let _ = recorder.stage_result("synthesis_feedback", || -> Result<(), String> {
         match crate::store::adaptive::recompute_synthesis_feedback_stats_with_judge_and_weights(
             store.conn(),
             state.synthesis_feedback_stats.clone(),
@@ -1323,8 +1331,12 @@ pub fn run_adaptive_pipeline_with_trigger(
                     pending_offset_batches.push(vec![("synthesis_feedback", id)]);
                 }
             }
-            Err(e) => tracing::warn!("failed to recompute synthesis_feedback_stats: {e}"),
+            Err(e) => {
+                tracing::warn!("failed to recompute synthesis_feedback_stats: {e}");
+                return Err(e.to_string());
+            }
         }
+        Ok(())
     });
 
     // Step 1f: v0.27 Cap A mirror — concept-summary interaction feedback.
@@ -1349,7 +1361,7 @@ pub fn run_adaptive_pipeline_with_trigger(
         crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE,
         effective_judge_weight_decay_rate,
     );
-    recorder.stage("concept_summary_feedback", || {
+    let _ = recorder.stage_result("concept_summary_feedback", || -> Result<(), String> {
         match crate::store::adaptive::recompute_concept_summary_feedback_stats_with_judge_and_weights(
             store.conn(),
             state.concept_summary_feedback_stats.clone(),
@@ -1366,8 +1378,12 @@ pub fn run_adaptive_pipeline_with_trigger(
                     pending_offset_batches.push(vec![("concept_summary_feedback", id)]);
                 }
             }
-            Err(e) => tracing::warn!("failed to recompute concept_summary_feedback_stats: {e}"),
+            Err(e) => {
+                tracing::warn!("failed to recompute concept_summary_feedback_stats: {e}");
+                return Err(e.to_string());
+            }
         }
+        Ok(())
     });
 
     // Step 1f-bis: v0.27.1 E direction — drain the judge worker queue
@@ -1458,7 +1474,7 @@ pub fn run_adaptive_pipeline_with_trigger(
     // always sees the original content even when strip ran first
     // (v0.26.0 patch: Option C — defended inside the worker rather than
     // by reordering pipeline steps).
-    recorder.stage("cold_archive_worker", || {
+    let _ = recorder.stage_result("cold_archive_worker", || -> Result<(), String> {
         let cold_config =
             crate::ops::cold_archive_summary::ColdArchiveConfig::from_ars(&config.ars);
         match crate::ops::cold_archive_summary::run_cold_archive_summary(
@@ -1479,8 +1495,12 @@ pub fn run_adaptive_pipeline_with_trigger(
                     );
                 }
             }
-            Err(e) => tracing::warn!("Cap C: cold-archive worker failed: {e}"),
+            Err(e) => {
+                tracing::warn!("Cap C: cold-archive worker failed: {e}");
+                return Err(e.to_string());
+            }
         }
+        Ok(())
     });
 
     // Step 4: M2 — Counterfactual alpha optimization (peek events, learn alphas)
@@ -1590,13 +1610,15 @@ pub fn run_adaptive_pipeline_with_trigger(
     });
 
     // Step 7: Cleanup expired events
-    let cleaned = recorder.stage("event_cleanup", || {
-        crate::store::adaptive::cleanup_expired_events(
-            store.conn(),
-            config.adaptive.event_retention_days,
-        )
-        .unwrap_or(0)
-    });
+    let cleaned = recorder
+        .stage_result("event_cleanup", || {
+            crate::store::adaptive::cleanup_expired_events(
+                store.conn(),
+                config.adaptive.event_retention_days,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap_or(0);
     if cleaned > 0 {
         tracing::debug!("cleaned {cleaned} expired events");
     }

@@ -343,18 +343,12 @@ fn recall_prompt_context(
         return None;
     }
     let request_id = ulid::Ulid::new().to_string();
-    let results = match crate::search::recall::recall_temporal_with_request_id(
+    let results = match crate::search::recall::recall_fast_for_context(
         store,
         config,
         prompt,
-        None,
-        None,
         max_items,
-        None,
-        None,
-        Some(false),
-        true,
-        Some(request_id.clone()),
+        request_id.clone(),
     ) {
         Ok(results) => results,
         Err(error) => {
@@ -383,7 +377,11 @@ fn recall_prompt_context(
             )
         })
         .collect();
-    build_recall_context(&request_id, items, max_chars, max_items)
+    let (context, emitted) = build_recall_context(&request_id, items, max_chars, max_items)?;
+    // Only the memories that made it into the injected text count as recall
+    // hits; the recall itself ran without recording any.
+    store.record_recall_hit(&emitted);
+    Some(context)
 }
 
 fn recall_feedback_trailer(request_id: &str, memory_ids: &[&str]) -> String {
@@ -421,7 +419,7 @@ fn build_recall_context(
     items: Vec<(String, WorkingSetItem)>,
     max_chars: usize,
     max_items: usize,
-) -> Option<String> {
+) -> Option<(String, Vec<String>)> {
     if max_chars == 0 || max_items == 0 {
         return None;
     }
@@ -446,10 +444,8 @@ fn build_recall_context(
         return None;
     }
     let ids: Vec<&str> = emitted.iter().map(String::as_str).collect();
-    Some(format!(
-        "{text}\n{}",
-        recall_feedback_trailer(request_id, &ids)
-    ))
+    let text = format!("{text}\n{}", recall_feedback_trailer(request_id, &ids));
+    Some((text, emitted))
 }
 
 /// Layer 3: Stop — full knowledge extraction on session end.
@@ -1303,6 +1299,19 @@ mod tests {
             }
         }
         let (min_cap, context) = first_hit.expect("some cap fits one item");
+        // Recall hits were recorded only for injected memories: across the
+        // sweep every output listed exactly its emitted ids, so the total
+        // hit count must equal the number of emitted lines, never the
+        // number of recalled results.
+        let hit_total: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COALESCE(SUM(CAST(value AS INTEGER)), 0) FROM metadata WHERE key LIKE 'recall_hit:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(hit_total >= 1, "hits recorded for injected memories");
         let header_len = context.lines().next().unwrap().chars().count();
         let line_len = context.lines().nth(1).unwrap().chars().count();
         let trailer_len = |k: usize| {
