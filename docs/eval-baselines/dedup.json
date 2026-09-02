@@ -2,12 +2,12 @@
   "schema_version": 2,
   "gate_name": "dedup",
   "kind": "baseline",
-  "created_at": 1780133447,
-  "rein_version": "0.38.0",
-  "build_fingerprint": "cb0bea30bb7c950b888d13bbbd3ff5f4",
+  "created_at": 1788343229,
+  "rein_version": "1.3.0",
+  "build_fingerprint": "c2211f572f48cfe9a44939040c4aaca9",
   "fixture_fingerprint": "3ce33481cf28928b46f3eecedab18f46",
   "fixture_count": 20,
-  "score": 0.85,
+  "score": 0.8,
   "per_fixture": [
     {
       "fixture_id": "distinct_cjk_01",
@@ -87,7 +87,7 @@
     },
     {
       "fixture_id": "dup_paraphrase_03",
-      "hit": true
+      "hit": false
     }
   ]
 }
