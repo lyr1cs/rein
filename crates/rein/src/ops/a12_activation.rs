@@ -213,15 +213,28 @@ pub fn resolve_recall_fusion_evidence(
         expected_noise_floor,
         now_millis,
         recall_gate,
-        None,
+        LiveInputEpoch::Unknown,
     )
 }
 
-/// [`resolve_recall_fusion_evidence`] with the live A12 input epoch. When
-/// `current_input_epoch` is `Some`, an automatic scope whose sealed run was
+/// The live A12 input epoch as seen by an offline resolver call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveInputEpoch {
+    /// Caller did not consult the live epoch (offline report / tests);
+    /// automatic evidence is not epoch-checked here.
+    Unknown,
+    /// The epoch row could not be read. Fail closed: no automatic evidence.
+    Unavailable(String),
+    /// The current durable epoch.
+    Current(u64),
+}
+
+/// [`resolve_recall_fusion_evidence`] with the live A12 input epoch. With
+/// `LiveInputEpoch::Current`, an automatic scope whose sealed run was
 /// calibrated at a different epoch is ineligible, so the offline policy
 /// refresh agrees with the per-recall live resolver instead of publishing an
-/// adoption weight the runtime immediately rejects.
+/// adoption weight the runtime immediately rejects. `Unavailable` blocks every
+/// automatic scope (fail closed); `Unknown` skips the check.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_recall_fusion_evidence_at_epoch(
     adaptive: &AdaptiveState,
@@ -230,7 +243,7 @@ pub fn resolve_recall_fusion_evidence_at_epoch(
     expected_noise_floor: f64,
     now_millis: i64,
     recall_gate: &RecallEvalGateAttestation,
-    current_input_epoch: Option<u64>,
+    current_input_epoch: LiveInputEpoch,
 ) -> BTreeMap<String, ArsRecallFusionEvidence> {
     let floor = u64::try_from(min_samples_alpha.max(10)).unwrap_or(u64::MAX);
     let mut scopes = BTreeSet::new();
@@ -264,7 +277,7 @@ pub fn resolve_recall_fusion_evidence_at_epoch(
                     floor,
                     expected_noise_floor,
                     now_millis,
-                    current_input_epoch,
+                    &current_input_epoch,
                     recall_gate,
                 )
             });
@@ -390,15 +403,21 @@ fn automatic_ineligibility_reason(
     floor: u64,
     expected_noise_floor: f64,
     now_millis: i64,
-    current_input_epoch: Option<u64>,
+    current_input_epoch: &LiveInputEpoch,
     recall_gate: &RecallEvalGateAttestation,
 ) -> Option<String> {
     if has_judge_drift(adaptive) {
         return Some("judge drift blocks automatic recall fusion".to_string());
     }
-    if let Some(current_epoch) = current_input_epoch {
-        match a12.state.run.as_ref() {
-            Some(run) if run.source_input_epoch == current_epoch => {}
+    match current_input_epoch {
+        LiveInputEpoch::Unknown => {}
+        LiveInputEpoch::Unavailable(error) => {
+            return Some(format!(
+                "live A12 input epoch unavailable, automatic evidence blocked: {error}"
+            ));
+        }
+        LiveInputEpoch::Current(current_epoch) => match a12.state.run.as_ref() {
+            Some(run) if run.source_input_epoch == *current_epoch => {}
             Some(run) => {
                 return Some(format!(
                     "A12 run input epoch {} drifted from live epoch {current_epoch}",
@@ -406,7 +425,7 @@ fn automatic_ineligibility_reason(
                 ));
             }
             None => return Some("A12 run has no live-input attestation".to_string()),
-        }
+        },
     }
     if entry.verdict != A12CalibrationVerdict::Ship {
         return Some(format!("A12 holdout verdict is {:?}", entry.verdict));

@@ -1015,6 +1015,15 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     let _ = run_adaptive_pipeline_with_trigger(store, config, "other");
 }
 
+/// Single-flight lock file next to the database. The suffix is appended to
+/// the full file name (not swapped for the extension) so `vault.db` and
+/// `vault.sqlite` never share a lock.
+pub(crate) fn adaptive_pipeline_lock_path(db_path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = db_path.as_os_str().to_os_string();
+    name.push(".adaptive_pipeline.lock");
+    std::path::PathBuf::from(name)
+}
+
 /// Run the pipeline and record it under `trigger` (`gc`, `consolidate`,
 /// `dedup`, `other`) in the `adaptive_pipeline_last_run` metadata row. See
 /// [`crate::ops::pipeline_run`]. Returns the record of the pass this call
@@ -1045,7 +1054,7 @@ pub fn run_adaptive_pipeline_with_trigger(
     // In-memory DBs are process-private — no cross-process peer can exist,
     // and a lock file would pollute the CWD in tests.
     let is_memory_db = store.db_path().to_str() == Some(":memory:");
-    let pipeline_lock_path = store.db_path().with_extension("adaptive_pipeline.lock");
+    let pipeline_lock_path = adaptive_pipeline_lock_path(store.db_path());
     let pipeline_lock = if is_memory_db {
         None
     } else {
@@ -1074,6 +1083,14 @@ pub fn run_adaptive_pipeline_with_trigger(
                 );
                 return None;
             }
+        }
+        #[cfg(not(unix))]
+        {
+            // Opening the file alone gives no mutual exclusion here; see the
+            // backlog entry for a cross-platform lock.
+            tracing::warn!(
+                "adaptive pipeline: single-flight lock is not enforced on this platform; overlapping passes are not prevented"
+            );
         }
         Some(file)
     };
@@ -1679,7 +1696,15 @@ fn refresh_ars_parameter_policy_with_inputs(
         return;
     }
 
-    let current_input_epoch = crate::store::a12_calibration::load_a12_input_epoch(conn).ok();
+    // Fail closed: an unreadable epoch blocks every automatic scope instead
+    // of skipping the check.
+    let current_input_epoch = match crate::store::a12_calibration::load_a12_input_epoch(conn) {
+        Ok(epoch) => crate::ops::a12_activation::LiveInputEpoch::Current(epoch),
+        Err(error) => {
+            tracing::warn!(%error, "ARS policy refresh: A12 input epoch unreadable; automatic recall-fusion evidence blocked");
+            crate::ops::a12_activation::LiveInputEpoch::Unavailable(error.to_string())
+        }
+    };
     let mut recall_fusion_evidence =
         crate::ops::a12_activation::resolve_recall_fusion_evidence_at_epoch(
             state,
@@ -5546,6 +5571,17 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_lock_path_keeps_the_database_extension() {
+        let db = adaptive_pipeline_lock_path(std::path::Path::new("/tmp/vault.db"));
+        let sqlite = adaptive_pipeline_lock_path(std::path::Path::new("/tmp/vault.sqlite"));
+        assert_eq!(
+            db,
+            std::path::PathBuf::from("/tmp/vault.db.adaptive_pipeline.lock")
+        );
+        assert_ne!(db, sqlite);
+    }
+
+    #[test]
     fn post_snapshot_refreshes_record_failed_stage_when_state_cannot_be_restored() {
         let store = SqliteStore::in_memory().unwrap();
         let config = a12_enabled_config();
@@ -5694,13 +5730,30 @@ mod tests {
                 crate::store::a12_calibration::A12_DEFAULT_NOISE_FLOOR,
                 at.timestamp_millis(),
                 &gate,
-                Some(epoch_after),
+                crate::ops::a12_activation::LiveInputEpoch::Current(epoch_after),
             );
             for (key, value) in &evidence {
                 assert_eq!(
                     value.basis,
                     crate::store::ars_parameter_policy::ArsRecallFusionEvidenceBasis::Static,
                     "surface={surface} scope={key}: stale generation must resolve static"
+                );
+            }
+            // An unreadable live epoch blocks automatic evidence too.
+            let blocked = crate::ops::a12_activation::resolve_recall_fusion_evidence_at_epoch(
+                &durable,
+                &active,
+                config.adaptive.min_samples_alpha,
+                crate::store::a12_calibration::A12_DEFAULT_NOISE_FLOOR,
+                at.timestamp_millis(),
+                &gate,
+                crate::ops::a12_activation::LiveInputEpoch::Unavailable("boom".into()),
+            );
+            for (key, value) in &blocked {
+                assert_eq!(
+                    value.basis,
+                    crate::store::ars_parameter_policy::ArsRecallFusionEvidenceBasis::Static,
+                    "surface={surface} scope={key}: unreadable epoch must fail closed"
                 );
             }
             // Live per-recall resolver: the same epoch mismatch blocks it.

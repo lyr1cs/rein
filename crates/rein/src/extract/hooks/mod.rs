@@ -383,18 +383,7 @@ fn recall_prompt_context(
             )
         })
         .collect();
-    // Budget the body against the longest possible trailer (every id) so the
-    // final text never exceeds `max_chars`, then list only the ids whose
-    // lines were actually emitted: feedback must not label memories the
-    // agent never saw.
-    let all_ids: Vec<&str> = items.iter().map(|(id, _)| id.as_str()).collect();
-    let longest_trailer = recall_feedback_trailer(&request_id, &all_ids);
-    let body_budget = max_chars.saturating_sub(longest_trailer.chars().count() + 1);
-    let (body, emitted_ids) =
-        format_context_with_ids("Rein memory", items, body_budget, max_items)?;
-    let emitted: Vec<&str> = emitted_ids.iter().map(String::as_str).collect();
-    let trailer = recall_feedback_trailer(&request_id, &emitted);
-    Some(format!("{body}\n{trailer}"))
+    build_recall_context(&request_id, items, max_chars, max_items)
 }
 
 fn recall_feedback_trailer(request_id: &str, memory_ids: &[&str]) -> String {
@@ -404,54 +393,63 @@ fn recall_feedback_trailer(request_id: &str, memory_ids: &[&str]) -> String {
     )
 }
 
-/// Like [`format_codex_context`] but never cuts an item in half: lines are
-/// added while the running text fits in `max_chars`, and the ids of the
-/// items that made it in are returned alongside the text.
-fn format_context_with_ids(
-    title: &str,
+/// One `- label: body` line, or `None` when the item has nothing to show.
+fn render_context_line(item: &WorkingSetItem) -> Option<String> {
+    let topic = cap_chars(&clean_codex_context_field(&item.topic), 48);
+    let summary = cap_chars(&clean_codex_context_field(&item.summary), 96);
+    let detail = cap_chars(&clean_codex_context_field(&item.detail), 160);
+    if summary.is_empty() && detail.is_empty() {
+        return None;
+    }
+    let label = if topic.is_empty() { "memory" } else { &topic };
+    let body = if summary.is_empty() || context_detail_is_redundant(&summary, &detail) {
+        detail
+    } else if detail.is_empty() {
+        summary
+    } else {
+        format!("{summary}; {detail}")
+    };
+    Some(format!("- {label}: {body}"))
+}
+
+/// Body + `rein_feedback` trailer within `max_chars`, built incrementally:
+/// an item is emitted only if header, the lines so far, this line and the
+/// trailer naming exactly the emitted ids all fit. No line is cut in half and
+/// the trailer never names a memory the agent did not see.
+fn build_recall_context(
+    request_id: &str,
     items: Vec<(String, WorkingSetItem)>,
     max_chars: usize,
     max_items: usize,
-) -> Option<(String, Vec<String>)> {
+) -> Option<String> {
     if max_chars == 0 || max_items == 0 {
         return None;
     }
-    let header = format!("{title} (background; user/repo instructions win):");
-    if header.chars().count() > max_chars {
-        return None;
-    }
-    let mut text = header;
-    let mut used = text.chars().count();
-    let mut emitted = Vec::new();
+    let mut text = "Rein memory (background; user/repo instructions win):".to_string();
+    let mut emitted: Vec<String> = Vec::new();
     for (id, item) in items.into_iter().take(max_items) {
-        let topic = cap_chars(&clean_codex_context_field(&item.topic), 48);
-        let summary = cap_chars(&clean_codex_context_field(&item.summary), 96);
-        let detail = cap_chars(&clean_codex_context_field(&item.detail), 160);
-        if summary.is_empty() && detail.is_empty() {
+        let Some(line) = render_context_line(&item) else {
             continue;
-        }
-        let label = if topic.is_empty() { "memory" } else { &topic };
-        let body = if summary.is_empty() || context_detail_is_redundant(&summary, &detail) {
-            detail
-        } else if detail.is_empty() {
-            summary
-        } else {
-            format!("{summary}; {detail}")
         };
-        let line = format!("- {label}: {body}");
-        let line_len = line.chars().count() + 1;
-        if used + line_len > max_chars {
+        let mut next_ids: Vec<&str> = emitted.iter().map(String::as_str).collect();
+        next_ids.push(&id);
+        let trailer = recall_feedback_trailer(request_id, &next_ids);
+        let total = text.chars().count() + 1 + line.chars().count() + 1 + trailer.chars().count();
+        if total > max_chars {
             break;
         }
         text.push('\n');
         text.push_str(&line);
-        used += line_len;
         emitted.push(id);
     }
     if emitted.is_empty() {
         return None;
     }
-    Some((text, emitted))
+    let ids: Vec<&str> = emitted.iter().map(String::as_str).collect();
+    Some(format!(
+        "{text}\n{}",
+        recall_feedback_trailer(request_id, &ids)
+    ))
 }
 
 /// Layer 3: Stop — full knowledge extraction on session end.
@@ -1258,6 +1256,67 @@ mod tests {
         for id in &listed {
             assert!(ids.iter().any(|known| known == id));
         }
+    }
+
+    #[test]
+    fn hook_prompt_recall_budget_reserves_only_emitted_ids() {
+        use crate::types::MemoryStore;
+        let (store, first_id) = seeded_store();
+        let mut ids = vec![first_id];
+        for n in 0..2 {
+            let mut memory = store.get(&ids[0]).unwrap();
+            memory.id = ulid::Ulid::new().to_string();
+            memory.topic = format!("zebra-protocol-{n}");
+            ids.push(store.store(memory).unwrap());
+        }
+        let mut config = recall_config();
+        // Find the smallest cap that yields any context.
+        let mut first_hit: Option<(usize, String)> = None;
+        for cap in 60..600 {
+            config.hooks.claude.max_additional_context_chars = cap;
+            if let Some(output) = hook_prompt_output(
+                &config,
+                &prompt_payload("zebra protocol handshake nonce"),
+                false,
+                Some(&store),
+            ) {
+                let context = output["hookSpecificOutput"]["additionalContext"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                assert!(context.chars().count() <= cap, "cap={cap}: {context}");
+                let listed = context
+                    .lines()
+                    .last()
+                    .unwrap()
+                    .split("memory_ids=")
+                    .nth(1)
+                    .unwrap()
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .count();
+                let lines = context.lines().filter(|l| l.starts_with("- ")).count();
+                assert_eq!(listed, lines, "cap={cap}: {context}");
+                if first_hit.is_none() {
+                    first_hit = Some((cap, context));
+                }
+            }
+        }
+        let (min_cap, context) = first_hit.expect("some cap fits one item");
+        let header_len = context.lines().next().unwrap().chars().count();
+        let line_len = context.lines().nth(1).unwrap().chars().count();
+        let trailer_len = |k: usize| {
+            "rein_feedback: request_id=".len() + 26 + " memory_ids=".len() + 26 * k + (k - 1)
+        };
+        // Exactly one item at the minimal cap, and that cap is the size of
+        // header + line + a one-id trailer, not a trailer for all three ids.
+        assert_eq!(
+            context.lines().filter(|l| l.starts_with("- ")).count(),
+            1,
+            "{context}"
+        );
+        assert_eq!(min_cap, header_len + 1 + line_len + 1 + trailer_len(1));
+        assert!(min_cap < header_len + 1 + line_len + 1 + trailer_len(3));
     }
 
     #[test]
