@@ -111,6 +111,7 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
     checks.push(check_oauth_provider(config));
     checks.push(check_proxy_auth(config));
     checks.push(check_codex_hooks());
+    checks.push(check_claude_hooks());
     checks.push(check_codex_mcp_server(config));
     checks.push(check_gui_runtime(config));
     checks.push(check_proxy_runtime(config));
@@ -733,6 +734,92 @@ fn count_rest_operations_in_source(source: &str) -> usize {
         .lines()
         .filter(|line| line.trim_start().starts_with("(&Method::"))
         .count()
+}
+
+/// Claude Code hook wiring in `~/.claude/settings.json`: which `rein hook`
+/// commands are installed. Hooks are what feed Claude Code sessions into the
+/// memory database (PostToolUse / PreCompact / Stop) and, with
+/// `[hooks.claude].inject_prompt_context`, inject prompt-time context
+/// (UserPromptSubmit).
+fn check_claude_hooks() -> DoctorCheck {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return ok_in(
+            DoctorCategory::Configuration,
+            "claude_hooks",
+            "HOME not set; skipping Claude Code hook checks",
+        );
+    };
+    check_claude_hooks_at(&home.join(".claude").join("settings.json"))
+}
+
+const CLAUDE_HOOK_EVENTS: [(&str, &str); 4] = [
+    ("PostToolUse", "rein hook post"),
+    ("PreCompact", "rein hook compact"),
+    ("Stop", "rein hook stop"),
+    ("UserPromptSubmit", "rein hook prompt"),
+];
+
+fn check_claude_hooks_at(settings_path: &Path) -> DoctorCheck {
+    let raw = match std::fs::read_to_string(settings_path) {
+        Ok(raw) => raw,
+        Err(_) => {
+            return ok_in(
+                DoctorCategory::Configuration,
+                "claude_hooks",
+                "Claude Code settings.json not found; skipping Claude Code hook checks",
+            );
+        }
+    };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return warn_with_hint(
+            DoctorCategory::Configuration,
+            "claude_hooks",
+            "Claude Code settings.json is not valid JSON",
+            "fix ~/.claude/settings.json, then add the rein hook entries from the README",
+        );
+    };
+    let hooks = root.get("hooks").and_then(|value| value.as_object());
+    let installed: Vec<&str> = CLAUDE_HOOK_EVENTS
+        .iter()
+        .filter(|(event, command)| {
+            hooks
+                .and_then(|hooks| hooks.get(*event))
+                .and_then(|entries| entries.as_array())
+                .is_some_and(|entries| {
+                    entries.iter().any(|entry| {
+                        entry
+                            .get("hooks")
+                            .and_then(|inner| inner.as_array())
+                            .is_some_and(|inner| {
+                                inner.iter().any(|hook| {
+                                    hook.get("command")
+                                        .and_then(|value| value.as_str())
+                                        .is_some_and(|value| value.contains(command))
+                                })
+                            })
+                    })
+                })
+        })
+        .map(|(event, _)| *event)
+        .collect();
+    let missing: Vec<&str> = CLAUDE_HOOK_EVENTS
+        .iter()
+        .map(|(event, _)| *event)
+        .filter(|event| !installed.contains(event))
+        .collect();
+    if installed.is_empty() {
+        return warn_with_hint(
+            DoctorCategory::Configuration,
+            "claude_hooks",
+            "no rein hooks in Claude Code settings.json; Claude Code sessions are not feeding the memory database",
+            "add the PostToolUse / PreCompact / Stop (and optional UserPromptSubmit) `rein hook` entries from the README \"Hook Setup for Claude Code\" section",
+        );
+    }
+    let mut message = format!("Claude Code hooks installed: {}", installed.join(", "));
+    if !missing.is_empty() {
+        message.push_str(&format!("; not installed: {}", missing.join(", ")));
+    }
+    ok_in(DoctorCategory::Configuration, "claude_hooks", message)
 }
 
 fn check_codex_hooks() -> DoctorCheck {
@@ -5245,6 +5332,58 @@ provider = "inherit"
         let check = check_adaptive_pipeline_last_run(&store);
         assert_eq!(check.status, CheckStatus::Warn);
         assert!(check.message.contains("error=snapshot save failed"));
+    }
+
+    #[test]
+    fn claude_hooks_missing_file_is_ok_and_missing_entries_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = check_claude_hooks_at(&dir.path().join("settings.json"));
+        assert_eq!(absent.status, CheckStatus::Ok);
+        assert!(absent.message.contains("not found"));
+
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"rtk hook claude"}]}]}}"#).unwrap();
+        let none = check_claude_hooks_at(&path);
+        assert_eq!(none.status, CheckStatus::Warn);
+        assert!(none.message.contains("no rein hooks"));
+        assert!(none
+            .repair_hint
+            .as_deref()
+            .unwrap_or_default()
+            .contains("README"));
+
+        std::fs::write(&path, "{not json").unwrap();
+        let bad = check_claude_hooks_at(&path);
+        assert_eq!(bad.status, CheckStatus::Warn);
+        assert!(bad.message.contains("not valid JSON"));
+    }
+
+    #[test]
+    fn claude_hooks_present_reports_installed_and_missing_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"hooks":{
+                "PostToolUse":[{"matcher":"","hooks":[{"type":"command","command":"rein hook post","timeout":10}]}],
+                "Stop":[{"matcher":"","hooks":[{"type":"command","command":"rein hook stop","timeout":30}]}]
+            }}"#,
+        )
+        .unwrap();
+        let check = check_claude_hooks_at(&path);
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert!(
+            check.message.contains("installed: PostToolUse, Stop"),
+            "{}",
+            check.message
+        );
+        assert!(
+            check
+                .message
+                .contains("not installed: PreCompact, UserPromptSubmit"),
+            "{}",
+            check.message
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # Config schema version (metadata, not a tunable). Bumped only when the
 # config surface changes in a way that needs a load-time migration. A config
 # stamped newer than the running rein build understands is refused at load.
-config_version = 3
+config_version = 4
 
 [database]
 path = "auto"
@@ -103,6 +103,15 @@ inject_prompt_context = false
 inject_session_context = false
 guardrails_enabled = true
 max_additional_context_chars = 1200
+# "working_set" (hook buffers, no database recall) or "recall" (local
+# recall_fast over the memory database; emits a RecallComplete event).
+prompt_context_source = "working_set"
+
+# Claude Code UserPromptSubmit context. Same payload/reply shape as Codex.
+[hooks.claude]
+inject_prompt_context = false
+max_additional_context_chars = 1200
+prompt_context_source = "working_set"
 
 [ars.acceleration]
 enabled = true

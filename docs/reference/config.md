@@ -16,7 +16,7 @@ default TOML template is `crates/rein/config/default.toml`.
 | `[sync]` | Supermemory and auto-memory import settings. |
 | `[decay]` | Ebbinghaus-style decay constants, pruning threshold, and STM-to-LTM promotion count. |
 | `[server]` | HTTP/SSE bind, port, compact mode, GUI flag, loopback auth opt-in, and allowed hosts. |
-| `[hooks]`, `[hooks.codex]` | Hook extraction thresholds, context window, buffer location, signal keywords, and Codex hook policy. |
+| `[hooks]`, `[hooks.codex]`, `[hooks.claude]` | Hook extraction thresholds, context window, buffer location, signal keywords, and per-runtime prompt-context policy. |
 | `[extract]`, `[extract.google]`, `[extract.omlx]` | LLM extraction provider, model, endpoint, prompt cap, and local thinking-mode toggle. |
 | `[query_expansion]`, provider subtables | Query expansion provider and maximum expansion count. |
 | `[proxy]` | Record-only proxy bind, upstreams, extraction thresholds, retry and buffer limits, and auth opt-in. |
@@ -97,6 +97,10 @@ operator decision.
 | `[hooks.codex].inject_session_context` | `false` | When true, `SessionStart` emits bounded project context from the always-on index, falling back to the working set. |
 | `[hooks.codex].guardrails_enabled` | `true` | Enables deny-only `PreToolUse` and `PermissionRequest` checks for obviously destructive shell commands. |
 | `[hooks.codex].max_additional_context_chars` | `1200` | Hard cap for any Codex `additionalContext` payload. Set `0` to disable context output even if injection flags are true. |
+| `[hooks.codex].prompt_context_source` | `"working_set"` | `"working_set"` selects from the hook buffers without touching the database; `"recall"` runs a local fast recall (FTS / KG / cached vectors, no LLM, no Supermemory) and emits a `RecallComplete` event with a request id. |
+| `[hooks.claude].inject_prompt_context` | `false` | When true, Claude Code `UserPromptSubmit` (`rein hook prompt`) emits bounded `additionalContext`. |
+| `[hooks.claude].max_additional_context_chars` | `1200` | Hard cap for the Claude Code `additionalContext` payload. |
+| `[hooks.claude].prompt_context_source` | `"working_set"` | Same semantics as the Codex key. With `"recall"` the context ends with a `rein_feedback: request_id=... memory_ids=...` line so the agent can attribute what it used; `RecallComplete` alone is not a training sample. |
 
 ## Environment Variables
 

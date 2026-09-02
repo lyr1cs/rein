@@ -15,7 +15,7 @@ pub mod queue;
 pub mod scoring;
 pub mod working_set;
 
-use crate::config::ReinConfig;
+use crate::config::{PromptContextSource, ReinConfig};
 
 use self::buffer::{
     adaptive_flush_threshold, append_to_buffer, cleanup_stale_buffers, clear_flush_marker,
@@ -239,27 +239,142 @@ pub async fn hook_permission_request(config: &ReinConfig) -> anyhow::Result<()> 
 /// Codex UserPromptSubmit — optionally add bounded, relevant Rein memory context.
 pub async fn hook_prompt(config: &ReinConfig) -> anyhow::Result<()> {
     let input = std::io::read_to_string(std::io::stdin())?;
-    let Some(json) = parse_codex_event_payload(&input, "UserPromptSubmit") else {
-        return Ok(());
+    let runtime = crate::extract::hooks::parsing::runtime_agent_label();
+    let policy = prompt_context_policy(config, &runtime);
+    let store = if policy.enabled && policy.source == PromptContextSource::Recall {
+        Some(config.open_store()?)
+    } else {
+        None
     };
-    if !config.hooks.codex.inject_prompt_context {
-        return Ok(());
-    }
-
-    let prompt = json.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
-    let items = working_set::select_relevant_items(config, prompt);
-    if let Some(context) = format_codex_context(
-        "Rein memory",
-        items,
-        config.hooks.codex.max_additional_context_chars,
-        config.async_memory.selection_limit,
-    ) {
-        print_codex_json_output(&codex_additional_context_output(
-            "UserPromptSubmit",
-            &context,
-        ))?;
+    if let Some(output) = hook_prompt_output(config, &input, &runtime, store.as_ref()) {
+        print_codex_json_output(&output)?;
     }
     Ok(())
+}
+
+/// Effective UserPromptSubmit policy for the calling runtime: Codex uses
+/// `[hooks.codex]`, everything else (Claude Code and its subagents) uses
+/// `[hooks.claude]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PromptContextPolicy {
+    enabled: bool,
+    max_chars: usize,
+    source: PromptContextSource,
+}
+
+fn prompt_context_policy(config: &ReinConfig, runtime: &str) -> PromptContextPolicy {
+    if runtime == "codex" {
+        PromptContextPolicy {
+            enabled: config.hooks.codex.inject_prompt_context,
+            max_chars: config.hooks.codex.max_additional_context_chars,
+            source: config.hooks.codex.prompt_context_source,
+        }
+    } else {
+        PromptContextPolicy {
+            enabled: config.hooks.claude.inject_prompt_context,
+            max_chars: config.hooks.claude.max_additional_context_chars,
+            source: config.hooks.claude.prompt_context_source,
+        }
+    }
+}
+
+/// Build the UserPromptSubmit reply for `input` (the hook payload JSON).
+/// `store` is required only for the `recall` source; without it that source
+/// degrades to no output rather than opening a database implicitly.
+fn hook_prompt_output(
+    config: &ReinConfig,
+    input: &str,
+    runtime: &str,
+    store: Option<&crate::store::SqliteStore>,
+) -> Option<serde_json::Value> {
+    let json = parse_codex_event_payload(input, "UserPromptSubmit")?;
+    let policy = prompt_context_policy(config, runtime);
+    if !policy.enabled {
+        return None;
+    }
+    let prompt = json.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+    if prompt.trim().is_empty() {
+        return None;
+    }
+    let max_items = config.async_memory.selection_limit;
+    let context = match policy.source {
+        PromptContextSource::WorkingSet => format_codex_context(
+            "Rein memory",
+            working_set::select_relevant_items(config, prompt),
+            policy.max_chars,
+            max_items,
+        ),
+        PromptContextSource::Recall => {
+            let store = store?;
+            recall_prompt_context(store, config, prompt, policy.max_chars, max_items)
+        }
+    }?;
+    Some(codex_additional_context_output(
+        "UserPromptSubmit",
+        &context,
+    ))
+}
+
+/// Prompt-time context from the recall pipeline in fast mode. The recall
+/// emits `RecallComplete` under `request_id`; the trailer line carries that id
+/// and the surfaced memory ids so an agent can call `rein_feedback` with what
+/// it actually used. `RecallComplete` alone is not a training sample — only
+/// that feedback turns it into one.
+fn recall_prompt_context(
+    store: &crate::store::SqliteStore,
+    config: &ReinConfig,
+    prompt: &str,
+    max_chars: usize,
+    max_items: usize,
+) -> Option<String> {
+    if max_chars == 0 || max_items == 0 {
+        return None;
+    }
+    let request_id = ulid::Ulid::new().to_string();
+    let results = match crate::search::recall::recall_temporal_with_request_id(
+        store,
+        config,
+        prompt,
+        None,
+        None,
+        max_items,
+        None,
+        None,
+        Some(false),
+        true,
+        Some(request_id.clone()),
+    ) {
+        Ok(results) => results,
+        Err(error) => {
+            tracing::warn!(%error, "hook prompt: fast recall failed; no context injected");
+            return None;
+        }
+    };
+    if results.is_empty() {
+        return None;
+    }
+    let memory_ids: Vec<String> = results
+        .iter()
+        .take(max_items)
+        .map(|result| result.memory.id.clone())
+        .collect();
+    let trailer = format!(
+        "rein_feedback: request_id={request_id} memory_ids={}",
+        memory_ids.join(",")
+    );
+    let items = results.into_iter().map(|result| WorkingSetItem {
+        kind: "memory".to_string(),
+        topic: result.memory.topic.clone(),
+        summary: result.memory.summary.clone(),
+        detail: result.memory.content.clone(),
+        agent_label: String::new(),
+        is_subagent: false,
+        score: result.score,
+        updated_at: result.memory.updated_at,
+    });
+    let body_budget = max_chars.saturating_sub(trailer.chars().count() + 1);
+    let body = format_codex_context("Rein memory", items, body_budget, max_items)?;
+    Some(format!("{body}\n{trailer}"))
 }
 
 /// Layer 3: Stop — full knowledge extraction on session end.
@@ -865,5 +980,184 @@ mod tests {
         assert!(context.contains("detail 1"));
         assert!(!context.contains("detail 2"));
         assert!(!context.contains("detail 3"));
+    }
+
+    fn prompt_payload(prompt: &str) -> String {
+        serde_json::json!({
+            "session_id": "s1",
+            "transcript_path": "/tmp/t.jsonl",
+            "cwd": "/tmp",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": prompt,
+        })
+        .to_string()
+    }
+
+    fn recall_complete_count(store: &crate::store::SqliteStore) -> i64 {
+        store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM feedback_events WHERE event_type = 'recall_complete'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn seeded_store() -> (crate::store::SqliteStore, String) {
+        use crate::types::{
+            Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, MemoryTier, Source,
+        };
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+        let now = chrono::Utc::now();
+        let id = store
+            .store(Memory {
+                id: ulid::Ulid::new().to_string(),
+                layer: MemoryLayer::LTM,
+                topic: "zebra-protocol".to_string(),
+                summary: "zebra protocol handshake uses a nonce".to_string(),
+                content: "The zebra protocol handshake uses a nonce before the session key."
+                    .to_string(),
+                keywords: vec!["zebra".to_string(), "handshake".to_string()],
+                importance: Importance::High,
+                source: Source::Manual,
+                strength: 1.0,
+                decay_lambda: 0.02,
+                access_count: 0,
+                superseded_by: None,
+                canonical_id: None,
+                support_count: 1,
+                merge_count: 0,
+                dedup_confidence: 1.0,
+                source_diversity: 1.0,
+                contradiction_score: 0.0,
+                related_ids: vec![],
+                concept_ids: vec![],
+                status: MemoryStatus::Active,
+                embedding: None,
+                tier: MemoryTier::Hot,
+                cluster_id: None,
+                archival_summary: None,
+                archival_summary_at: None,
+                archival_summary_version: None,
+                created_at: now,
+                updated_at: now,
+                last_accessed: now,
+            })
+            .unwrap();
+        (store, id)
+    }
+
+    fn recall_config() -> ReinConfig {
+        let mut config = ReinConfig::default();
+        config.hooks.claude.inject_prompt_context = true;
+        config.hooks.claude.prompt_context_source = PromptContextSource::Recall;
+        config.hooks.claude.max_additional_context_chars = 1200;
+        config
+    }
+
+    #[test]
+    fn hook_prompt_uses_claude_table_when_runtime_is_not_codex() {
+        let mut config = ReinConfig::default();
+        config.hooks.codex.inject_prompt_context = true;
+        config.hooks.claude.inject_prompt_context = false;
+        // Codex policy on, Claude policy off: a Claude Code runtime gets nothing.
+        assert!(
+            hook_prompt_output(&config, &prompt_payload("anything"), "claude-code", None).is_none()
+        );
+        // And vice versa: Claude policy on, Codex runtime off.
+        let mut config = ReinConfig::default();
+        config.hooks.claude.inject_prompt_context = true;
+        config.hooks.claude.prompt_context_source = PromptContextSource::Recall;
+        assert!(hook_prompt_output(&config, &prompt_payload("anything"), "codex", None).is_none());
+        // Wrong event name never produces output.
+        let payload = prompt_payload("x").replace("UserPromptSubmit", "SessionStart");
+        assert!(hook_prompt_output(&config, &payload, "claude-code", None).is_none());
+    }
+
+    #[test]
+    fn hook_prompt_recall_source_emits_recall_complete_with_request_id() {
+        let (store, id) = seeded_store();
+        let config = recall_config();
+        assert_eq!(recall_complete_count(&store), 0);
+
+        let output = hook_prompt_output(
+            &config,
+            // The in-memory store has no Tantivy index, so FTS5's implicit AND applies:
+            // every prompt token must occur in the memory. Real databases use Tantivy
+            // BM25 for natural-language prompts.
+            &prompt_payload("zebra protocol handshake nonce"),
+            "claude-code",
+            Some(&store),
+        )
+        .expect("context for a matching memory");
+
+        let context = output["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            output["hookSpecificOutput"]["hookEventName"],
+            "UserPromptSubmit"
+        );
+        assert!(context.contains("zebra protocol handshake"), "{context}");
+        assert!(context.contains(&format!("memory_ids={id}")), "{context}");
+        let request_id = context
+            .lines()
+            .last()
+            .unwrap()
+            .split("request_id=")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string();
+        assert_eq!(request_id.len(), 26, "ULID request id");
+        assert_eq!(recall_complete_count(&store), 1);
+        let stored: String = store
+            .conn()
+            .query_row(
+                "SELECT request_id FROM feedback_events WHERE event_type = 'recall_complete'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, request_id);
+        assert!(context.chars().count() <= 1200);
+    }
+
+    #[test]
+    fn hook_prompt_recall_source_without_store_or_matches_is_silent() {
+        let (store, _id) = seeded_store();
+        let config = recall_config();
+        assert!(
+            hook_prompt_output(&config, &prompt_payload("zebra"), "claude-code", None).is_none()
+        );
+        assert!(hook_prompt_output(
+            &config,
+            &prompt_payload("completely unrelated quantum gardening"),
+            "claude-code",
+            Some(&store)
+        )
+        .is_none());
+        assert!(
+            hook_prompt_output(&config, &prompt_payload("   "), "claude-code", Some(&store))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn hook_prompt_working_set_source_emits_no_recall_event() {
+        let (store, _id) = seeded_store();
+        let mut config = ReinConfig::default();
+        config.hooks.claude.inject_prompt_context = true;
+        config.hooks.claude.prompt_context_source = PromptContextSource::WorkingSet;
+        let _ = hook_prompt_output(
+            &config,
+            &prompt_payload("zebra"),
+            "claude-code",
+            Some(&store),
+        );
+        assert_eq!(recall_complete_count(&store), 0);
     }
 }

@@ -738,6 +738,14 @@ Add the following to your Claude Code `settings.json` to enable automatic memory
           { "type": "command", "command": "rein hook stop", "timeout": 30 }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          { "type": "command", "command": "rein hook prompt", "timeout": 10 }
+        ]
+      }
     ]
   }
 }
@@ -748,6 +756,21 @@ Add the following to your Claude Code `settings.json` to enable automatic memory
 - `PostToolUse` -- local pattern extraction (crash safety net) + buffers for session-end batch processing
 - `PreCompact` -- records compact context for the async memory pipeline
 - `Stop` -- queues full knowledge extraction: memories + concepts + links + episode summary via async worker
+- `UserPromptSubmit` -- optional prompt-time context. Off by default; enable it in `~/.rein/config.toml`:
+
+```toml
+[hooks.claude]
+inject_prompt_context = true
+# "working_set" (hook buffers, no database recall) or "recall"
+# (local fast recall over the memory database: FTS / KG / cached vectors,
+# no LLM calls). "recall" emits a RecallComplete event and ends the injected
+# context with a `rein_feedback: request_id=... memory_ids=...` line so the
+# agent can report which memories it actually used.
+prompt_context_source = "recall"
+max_additional_context_chars = 1200
+```
+
+`rein doctor` reports which of these hooks are installed (`claude_hooks`).
 
 ### Hook Setup for Codex CLI
 

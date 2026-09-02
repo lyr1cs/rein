@@ -54,7 +54,12 @@ impl Provider {
 /// - 3 — post-v1.2: explicit `[ars.llm_judge.structural_anchors]` mode and
 ///   interval. Older binaries reject this nested table, so downgrade must fail
 ///   before typed decode rather than silently discarding the spend policy.
-pub const CURRENT_CONFIG_VERSION: u32 = 3;
+/// - 4 — v1.4: `[hooks.claude]` table and `[hooks.codex].prompt_context_source`
+///   (prompt-time context may come from the recall pipeline instead of the
+///   working set). Older binaries reject both keys under
+///   `deny_unknown_fields`, so a config adopting them must be recognizable as
+///   newer on downgrade.
+pub const CURRENT_CONFIG_VERSION: u32 = 4;
 
 fn default_config_version() -> u32 {
     CURRENT_CONFIG_VERSION
@@ -1233,6 +1238,9 @@ pub struct HooksConfig {
     /// guardrails).
     #[serde(default)]
     pub codex: CodexHooksConfig,
+    /// `[hooks.claude]` — Claude Code prompt-time context injection.
+    #[serde(default)]
+    pub claude: ClaudeHooksConfig,
     /// Keywords that mark transcript lines as memory-worthy signals. Defaults
     /// to a built-in EN/CJK list (see `default_signal_keywords`).
     #[serde(default = "default_signal_keywords")]
@@ -1249,6 +1257,21 @@ pub struct HooksConfig {
     /// 0 = never trigger mid-session extraction (only at session end).
     #[serde(default = "default_buffer_flush_threshold")]
     pub buffer_flush_threshold: usize,
+}
+
+/// Where `rein hook prompt` takes its context from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptContextSource {
+    /// Project working set kept by the hook buffers. No database recall, no
+    /// `RecallComplete` event.
+    #[default]
+    WorkingSet,
+    /// `search::recall::recall_fast` over the memory database: local FTS /
+    /// KG / cached-vector channels, no expansion, no LLM reranker, no
+    /// Supermemory, no remote embedding. Emits a `RecallComplete` event with
+    /// a request id so the agent can attribute what it used.
+    Recall,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1268,6 +1291,39 @@ pub struct CodexHooksConfig {
     /// Hard cap for injected additionalContext text.
     #[serde(default = "default_codex_max_additional_context_chars")]
     pub max_additional_context_chars: usize,
+    /// Context source for UserPromptSubmit. Default `working_set` so existing
+    /// Codex installs keep their behavior.
+    #[serde(default)]
+    pub prompt_context_source: PromptContextSource,
+}
+
+/// `[hooks.claude]` — Claude Code hook behavior. Claude Code sends the same
+/// `hook_event_name` + `prompt` payload and accepts the same
+/// `hookSpecificOutput.additionalContext` reply as Codex, so the hook binary
+/// is shared; only the policy table differs.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaudeHooksConfig {
+    /// Add bounded Rein memory context to Claude Code UserPromptSubmit.
+    /// Default false because it changes model context.
+    #[serde(default)]
+    pub inject_prompt_context: bool,
+    /// Hard cap for injected additionalContext text.
+    #[serde(default = "default_codex_max_additional_context_chars")]
+    pub max_additional_context_chars: usize,
+    /// Context source for UserPromptSubmit. Default `working_set`.
+    #[serde(default)]
+    pub prompt_context_source: PromptContextSource,
+}
+
+impl Default for ClaudeHooksConfig {
+    fn default() -> Self {
+        Self {
+            inject_prompt_context: false,
+            max_additional_context_chars: default_codex_max_additional_context_chars(),
+            prompt_context_source: PromptContextSource::default(),
+        }
+    }
 }
 
 fn default_buffer_dir() -> String {
@@ -1657,6 +1713,7 @@ impl Default for HooksConfig {
             context_after: 1,
             max_items_per_session: 10,
             codex: CodexHooksConfig::default(),
+            claude: ClaudeHooksConfig::default(),
             signal_keywords: default_signal_keywords(),
             buffer_dir: default_buffer_dir(),
             buffer_flush_threshold: default_buffer_flush_threshold(),
@@ -1671,6 +1728,7 @@ impl Default for CodexHooksConfig {
             inject_session_context: false,
             guardrails_enabled: default_codex_guardrails_enabled(),
             max_additional_context_chars: default_codex_max_additional_context_chars(),
+            prompt_context_source: PromptContextSource::default(),
         }
     }
 }
@@ -3734,6 +3792,64 @@ shadow_only = false
             cfg.ars.llm_judge.structural_anchors.mode,
             JudgeStructuralAnchorMode::Off
         );
+    }
+
+    #[test]
+    fn hooks_claude_defaults_are_off_and_working_set() {
+        let cfg = ReinConfig::default();
+        assert!(!cfg.hooks.claude.inject_prompt_context);
+        assert_eq!(cfg.hooks.claude.max_additional_context_chars, 1200);
+        assert_eq!(
+            cfg.hooks.claude.prompt_context_source,
+            PromptContextSource::WorkingSet
+        );
+        assert_eq!(
+            cfg.hooks.codex.prompt_context_source,
+            PromptContextSource::WorkingSet
+        );
+        // The embedded default.toml must agree with the Rust defaults.
+        let embedded = ReinConfig::load_from_str("").unwrap();
+        assert!(!embedded.hooks.claude.inject_prompt_context);
+        assert_eq!(
+            embedded.hooks.claude.prompt_context_source,
+            PromptContextSource::WorkingSet
+        );
+        assert_eq!(
+            embedded.hooks.codex.prompt_context_source,
+            PromptContextSource::WorkingSet
+        );
+    }
+
+    #[test]
+    fn prompt_context_source_parses_recall_for_both_runtimes() {
+        let cfg = ReinConfig::load_from_str(
+            "[hooks.codex]\nprompt_context_source = \"recall\"\n\n[hooks.claude]\ninject_prompt_context = true\nprompt_context_source = \"recall\"\nmax_additional_context_chars = 800\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.hooks.codex.prompt_context_source,
+            PromptContextSource::Recall
+        );
+        assert!(cfg.hooks.claude.inject_prompt_context);
+        assert_eq!(
+            cfg.hooks.claude.prompt_context_source,
+            PromptContextSource::Recall
+        );
+        assert_eq!(cfg.hooks.claude.max_additional_context_chars, 800);
+        assert!(
+            ReinConfig::load_from_str("[hooks.claude]\nprompt_context_source = \"llm\"\n").is_err()
+        );
+    }
+
+    #[test]
+    fn config_version_4_matches_embedded_default_toml() {
+        assert_eq!(CURRENT_CONFIG_VERSION, 4);
+        let embedded = ReinConfig::load_from_str("").unwrap();
+        assert_eq!(embedded.config_version, CURRENT_CONFIG_VERSION);
+        // A v3 file without the new tables keeps the defaults.
+        let v3 = ReinConfig::load_from_str("config_version = 3\n").unwrap();
+        assert_eq!(v3.config_version, 3);
+        assert_eq!(v3.hooks.claude, ClaudeHooksConfig::default());
     }
 
     #[test]

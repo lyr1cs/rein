@@ -198,6 +198,30 @@ When enabled, `SessionStart` emits bounded project context and
 to stderr; stdout is kept empty unless Rein emits an official Codex hook JSON
 object.
 
+### Claude Code prompt-time context
+
+Claude Code sends the same `hook_event_name` + `prompt` payload to
+`UserPromptSubmit` hooks and accepts the same `hookSpecificOutput.additionalContext`
+reply, so the hook binary is shared; only the policy table differs:
+
+```toml
+[hooks.claude]
+inject_prompt_context = true
+prompt_context_source = "recall"   # or "working_set"
+max_additional_context_chars = 1200
+```
+
+`prompt_context_source = "recall"` runs `recall_fast` over the memory database
+(local FTS / KG / cached-vector channels; no query expansion, no LLM reranker,
+no Supermemory, no remote embedding) and emits a `RecallComplete` event. The
+injected context ends with `rein_feedback: request_id=<id> memory_ids=<ids>`
+so the agent can call `rein_feedback` with what it actually used; without
+that feedback the recall is traffic, not a training sample. Register the hook
+in `~/.claude/settings.json` (see the README "Hook Setup for Claude Code"
+section, `timeout` 10 recommended; Claude Code discards the output and lets
+the prompt through if the hook exceeds its timeout). `rein doctor` lists the
+installed Claude Code hooks under `claude_hooks`.
+
 ## GUI Service Management
 
 The GUI requires a binary installed with `--features gui` and an HTTP token
