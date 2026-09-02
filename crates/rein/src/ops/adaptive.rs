@@ -1122,7 +1122,7 @@ fn process_is_alive(pid: u32) -> bool {
             return true;
         }
         let err = std::io::Error::last_os_error();
-        return err.raw_os_error() == Some(libc::EPERM);
+        err.raw_os_error() == Some(libc::EPERM)
     }
     #[cfg(not(unix))]
     {
