@@ -3,7 +3,7 @@
 //! dedup shadow suggestions.
 
 use crate::config::ReinConfig;
-use crate::ops::pipeline_run::{PipelineRunOutcome, PipelineRunRecorder};
+use crate::ops::pipeline_run::{PipelineRunOutcome, PipelineRunRecord, PipelineRunRecorder};
 use crate::store::SqliteStore;
 use crate::types::traits::MemoryStore;
 use crate::types::{ReinError, ReinResult};
@@ -47,11 +47,16 @@ enum A12CalibrationRefreshOutcome {
     Unchanged,
     PendingCasMiss,
     CompleteSaved,
-    /// Published as `Complete`, but the live input epoch or local recall
-    /// snapshot moved while the calibration ran. The generation stays
-    /// readable for diagnostics; activation rejects it through the epoch
-    /// check and the next pipeline pass recalibrates.
+    /// Published as `Complete`, but the live input epoch advanced while the
+    /// calibration ran. The generation stays readable for diagnostics;
+    /// activation rejects it through the epoch check and the next pipeline
+    /// pass recalibrates.
     CompleteSavedStale,
+    /// The local recall snapshot moved without an epoch bump (a write outside
+    /// the epoch triggers, e.g. a direct FTS shadow-table rebuild). The
+    /// resolvers could not detect that generation as stale, so it is not
+    /// published; the pending barrier stays active and fail-closed.
+    FinalSnapshotMismatch,
     FinalCasMiss,
 }
 
@@ -511,18 +516,28 @@ where
         let locked_epoch = crate::store::a12_calibration::load_a12_input_epoch(store.conn())?;
         let locked_snapshot =
             crate::ops::a12_autocalibration::a12_source_snapshot_fingerprint_in_transaction(store)?;
-        let stale = locked_epoch != run.source_input_epoch
-            || locked_snapshot != run.source_snapshot_fingerprint;
-        if stale {
+        let epoch_moved = locked_epoch != run.source_input_epoch;
+        let snapshot_moved = locked_snapshot != run.source_snapshot_fingerprint;
+        if snapshot_moved && !epoch_moved {
+            // Nothing downstream compares the snapshot hash, only the epoch.
+            // Publishing here would let the resolvers activate a generation
+            // we already know is stale, so keep the pending barrier.
+            tracing::warn!(
+                run_epoch = run.source_input_epoch,
+                "A12 local recall snapshot moved without an epoch bump; refusing to publish (fail closed)"
+            );
+            return Ok(A12CalibrationRefreshOutcome::FinalSnapshotMismatch);
+        }
+        if epoch_moved {
             tracing::warn!(
                 run_epoch = run.source_input_epoch,
                 live_epoch = locked_epoch,
-                snapshot_moved = locked_snapshot != run.source_snapshot_fingerprint,
+                snapshot_moved,
                 "A12 source moved during calibration; publishing the generation as stale"
             );
         }
         if compare_and_swap_a12_calibration(store.conn(), &final_state, pending.revision)? {
-            Ok(if stale {
+            Ok(if epoch_moved {
                 A12CalibrationRefreshOutcome::CompleteSavedStale
             } else {
                 A12CalibrationRefreshOutcome::CompleteSaved
@@ -674,6 +689,9 @@ fn run_post_snapshot_refreshes(
         ),
         Ok(A12CalibrationRefreshOutcome::CompleteSavedStale) => tracing::warn!(
             "A12 calibration published, but the source moved during the run; the generation is readable for diagnostics and stays inactive until the next pipeline pass recalibrates"
+        ),
+        Ok(A12CalibrationRefreshOutcome::FinalSnapshotMismatch) => tracing::warn!(
+            "A12 local recall snapshot moved without an epoch bump during the run; generation not published, pending barrier stays fail-closed"
         ),
         Ok(A12CalibrationRefreshOutcome::PendingCasMiss) => {
             tracing::warn!("A12 pending calibration CAS missed; peer revision remains active")
@@ -989,17 +1007,23 @@ fn useful_rate_weights_from_signal_hint_priors(
 /// Order: M4 (HDBSCAN) → M3 (Survival) → M5 (Tiering) → M2 (Alpha) → persist.
 /// Each step is gated by readiness checks; failures skip subsequent steps.
 pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
-    run_adaptive_pipeline_with_trigger(store, config, "other");
+    let _ = run_adaptive_pipeline_with_trigger(store, config, "other");
 }
 
 /// Run the pipeline and record it under `trigger` (`gc`, `consolidate`,
 /// `dedup`, `other`) in the `adaptive_pipeline_last_run` metadata row. See
-/// [`crate::ops::pipeline_run`].
-pub fn run_adaptive_pipeline_with_trigger(store: &SqliteStore, config: &ReinConfig, trigger: &str) {
+/// [`crate::ops::pipeline_run`]. Returns the record of the pass this call
+/// executed, or `None` when it skipped (single-flight loser, lock error, or
+/// adaptive disabled) so callers never report a peer's run as their own.
+pub fn run_adaptive_pipeline_with_trigger(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    trigger: &str,
+) -> Option<PipelineRunRecord> {
     if !config.adaptive.enabled {
         let recorder = PipelineRunRecorder::start(store, trigger);
         recorder.finish(PipelineRunOutcome::SkippedDisabled, None);
-        return;
+        return None;
     }
 
     // codex remediation R10 P2 (root cause of audit F12): SINGLE-FLIGHT the
@@ -1032,7 +1056,7 @@ pub fn run_adaptive_pipeline_with_trigger(store: &SqliteStore, config: &ReinConf
                 tracing::warn!(
                     "adaptive pipeline: cannot open single-flight lock ({e}); skipping pass"
                 );
-                return;
+                return None;
             }
         };
         #[cfg(unix)]
@@ -1043,7 +1067,7 @@ pub fn run_adaptive_pipeline_with_trigger(store: &SqliteStore, config: &ReinConf
                 tracing::info!(
                     "adaptive pipeline: another pass is running (single-flight); skipping"
                 );
-                return;
+                return None;
             }
         }
         Some(file)
@@ -1505,7 +1529,7 @@ pub fn run_adaptive_pipeline_with_trigger(store: &SqliteStore, config: &ReinConf
     }
 
     if snapshot_saved {
-        recorder.finish(PipelineRunOutcome::Completed, None);
+        recorder.finish_from_stages();
     } else {
         recorder.finish(
             PipelineRunOutcome::Failed,
@@ -1561,6 +1585,8 @@ pub fn run_adaptive_pipeline_with_trigger(store: &SqliteStore, config: &ReinConf
     if cleaned > 0 {
         tracing::debug!("cleaned {cleaned} expired events");
     }
+
+    Some(recorder.record())
 }
 
 /// v0.28.7 — public wrapper used by `doctor::apply_local_fixes` to force a
@@ -5518,7 +5544,7 @@ mod tests {
         // between calibration and publication must not discard the result:
         // the generation is published `Complete`, reported stale, and never
         // activates.
-        for surface in ["memories", "vec", "metadata"] {
+        for surface in ["memories", "vec", "metadata", "fts"] {
             let store = SqliteStore::in_memory().unwrap();
             store
                 .store(test_memory("a12-race", "source memory", 0))
@@ -5560,12 +5586,47 @@ mod tests {
                                 [],
                             )?;
                         }
+                        "fts" => {
+                            // Direct shadow-table write: changes the recall
+                            // snapshot hash but bumps no epoch trigger.
+                            store.conn().execute(
+                                "INSERT INTO memories_fts(id, topic, summary, content, keywords) \
+                                 VALUES ('a12-fts-race', 'race', 'race', 'race', 'race')",
+                                [],
+                            )?;
+                        }
                         _ => unreachable!(),
                     }
                     Ok(())
                 },
             )
             .unwrap();
+
+            if surface == "fts" {
+                // Snapshot-only drift is invisible to the epoch-based resolvers,
+                // so publication must stay fail-closed exactly as before.
+                assert_eq!(
+                    outcome,
+                    A12CalibrationRefreshOutcome::FinalSnapshotMismatch,
+                    "surface={surface}"
+                );
+                let active = crate::store::a12_calibration::load_a12_calibration(store.conn());
+                assert!(active.state.is_pending(), "surface={surface}");
+                assert!(active.state.scopes.is_empty(), "surface={surface}");
+                assert_eq!(
+                    crate::store::a12_calibration::load_a12_input_epoch(store.conn()).unwrap(),
+                    epoch_before,
+                    "surface={surface}: no epoch bump by construction"
+                );
+                assert_eq!(
+                    crate::store::a12_calibration::list_a12_calibration_history(store.conn())
+                        .unwrap()
+                        .len(),
+                    1,
+                    "surface={surface}: final revision must not remain as an orphan"
+                );
+                continue;
+            }
 
             assert_eq!(
                 outcome,

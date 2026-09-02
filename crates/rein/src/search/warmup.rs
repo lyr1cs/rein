@@ -135,13 +135,44 @@ pub async fn backfill_missing_vec_rows(
     let dims = config.embedding.dimensions;
     let mut report = WarmupReport::default();
 
-    let indexed = match crate::store::vec::list_embedding_ids(store.conn()) {
+    // Vector rows carry no per-row model tag. Remember which model the last
+    // complete warmup wrote rows with; a different model (even with the same
+    // dimensions) means every existing row is stale and must be re-embedded,
+    // otherwise new-model query vectors would be compared with old-model
+    // document vectors.
+    let provenance = format!("{model}:{dims}");
+    let stored_provenance = read_metadata(store, VEC_ROWS_PROVENANCE_KEY);
+    let reembed_all = stored_provenance
+        .as_deref()
+        .is_some_and(|stored| stored != provenance);
+    if reembed_all {
+        tracing::warn!(
+            stored = stored_provenance.as_deref().unwrap_or(""),
+            current = %provenance,
+            "warmup: embedding model changed since the last warmup; re-embedding every live memory"
+        );
+    }
+
+    let existing = match crate::store::vec::list_embedding_ids(store.conn()) {
         Ok(ids) => ids,
         Err(e) => {
             tracing::warn!("warmup: failed to list vector rows: {e}");
             report.errors += 1;
             return report;
         }
+    };
+    let indexed = if reembed_all {
+        std::collections::HashSet::new()
+    } else {
+        existing.clone()
+    };
+    // sqlite-vec rejects a second row for an existing primary key, so a
+    // re-embed must drop the stale row before inserting the new vector.
+    let write_row = |id: &str, embedding: &[f32]| -> crate::types::ReinResult<()> {
+        if existing.contains(id) {
+            crate::store::vec::delete_embedding(store.conn(), id)?;
+        }
+        crate::store::vec::insert_embedding(store.conn(), id, embedding)
     };
 
     // Collect only the missing subset so memory stays bounded by the gap,
@@ -172,6 +203,7 @@ pub async fn backfill_missing_vec_rows(
             live_total,
             "warmup: every live memory already has a vector row"
         );
+        write_metadata(store, VEC_ROWS_PROVENANCE_KEY, &provenance);
         return report;
     }
     tracing::info!(
@@ -183,20 +215,21 @@ pub async fn backfill_missing_vec_rows(
     let mut to_embed: Vec<(String, String)> = Vec::new();
     for (id, text) in missing {
         match EmbedCache::get(store.conn(), &text, &model) {
-            Ok(Some(embedding)) if embedding.len() == dims => {
-                match crate::store::vec::insert_embedding(store.conn(), &id, &embedding) {
-                    Ok(()) => report.backfilled_from_cache += 1,
-                    Err(e) => {
-                        tracing::warn!(id, "warmup: failed to restore vector row from cache: {e}");
-                        report.errors += 1;
-                    }
+            Ok(Some(embedding)) if embedding.len() == dims => match write_row(&id, &embedding) {
+                Ok(()) => report.backfilled_from_cache += 1,
+                Err(e) => {
+                    tracing::warn!(id, "warmup: failed to restore vector row from cache: {e}");
+                    report.errors += 1;
                 }
-            }
+            },
             _ => to_embed.push((id, text)),
         }
     }
 
     if to_embed.is_empty() {
+        if report.errors == 0 {
+            write_metadata(store, VEC_ROWS_PROVENANCE_KEY, &provenance);
+        }
         return report;
     }
     let Some(embedder) = embedder else {
@@ -222,7 +255,7 @@ pub async fn backfill_missing_vec_rows(
                     if let Err(e) = EmbedCache::put(store.conn(), text, &model, embedding) {
                         tracing::warn!(id, "warmup: failed to cache embedding: {e}");
                     }
-                    match crate::store::vec::insert_embedding(store.conn(), id, embedding) {
+                    match write_row(id, embedding) {
                         Ok(()) => report.embedded += 1,
                         Err(e) => {
                             tracing::warn!(id, "warmup: failed to insert vector row: {e}");
@@ -241,7 +274,37 @@ pub async fn backfill_missing_vec_rows(
         }
     }
 
+    if report.errors == 0 {
+        write_metadata(store, VEC_ROWS_PROVENANCE_KEY, &provenance);
+    }
     report
+}
+
+/// Metadata key recording `"<model>:<dims>"` of the last complete warmup.
+pub const VEC_ROWS_PROVENANCE_KEY: &str = "vec_rows_provenance";
+
+fn read_metadata(store: &SqliteStore, key: &str) -> Option<String> {
+    use rusqlite::OptionalExtension;
+    store
+        .conn()
+        .query_row(
+            "SELECT value FROM metadata WHERE key = ?1",
+            rusqlite::params![key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+}
+
+fn write_metadata(store: &SqliteStore, key: &str, value: &str) {
+    if let Err(e) = store.conn().execute(
+        "INSERT INTO metadata(key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![key, value],
+    ) {
+        tracing::warn!(key, "warmup: failed to persist metadata: {e}");
+    }
 }
 
 /// Populate (or rebuild) the HNSW index from all cached embeddings in SQLite.
@@ -2088,6 +2151,48 @@ mod tests {
         assert!(crate::store::vec::get_embedding(store.conn(), &id)
             .unwrap()
             .is_none());
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn warmup_reembeds_every_row_after_model_change() {
+        use crate::types::MemoryStore;
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+        let dims = config.embedding.dimensions;
+        let mut memory = live_memory("model-change", "row written by the previous model");
+        memory.embedding = Some(vec![0.9; dims]);
+        let id = store.store(memory).unwrap();
+        // store() also caches the supplied embedding under the current model
+        // key; drop it so the only way to a current-model vector is the
+        // provider (a real model change would miss the cache the same way).
+        store.conn().execute("DELETE FROM embed_cache", []).unwrap();
+        write_metadata(
+            &store,
+            VEC_ROWS_PROVENANCE_KEY,
+            &format!("old-model:{dims}"),
+        );
+        let embedder = crate::embed::EmbedderKind::Mock(
+            crate::embed::MockEmbedder::with_fixed_vector(dims, vec![0.25; dims]),
+        );
+
+        let report = backfill_missing_vec_rows(&store, &config, Some(&embedder)).await;
+
+        assert_eq!(
+            report.embedded, 1,
+            "existing row re-embedded under the new model"
+        );
+        let stored = crate::store::vec::get_embedding(store.conn(), &id)
+            .unwrap()
+            .unwrap();
+        assert!((stored[0] - 0.25).abs() < 1e-6);
+        assert_eq!(
+            read_metadata(&store, VEC_ROWS_PROVENANCE_KEY).as_deref(),
+            Some(format!("{}:{dims}", config.embedding_model()).as_str())
+        );
+        // Same model again: nothing to do.
+        let again = backfill_missing_vec_rows(&store, &config, Some(&embedder)).await;
+        assert_eq!(again, WarmupReport::default());
     }
 
     #[cfg(feature = "test-support")]

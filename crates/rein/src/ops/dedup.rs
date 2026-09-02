@@ -1265,7 +1265,7 @@ pub fn run_dedup_scoped(
                 "merge_variants": merge_variants,
             }),
         );
-        run_adaptive_pipeline_with_trigger(store, config, "dedup");
+        let _ = run_adaptive_pipeline_with_trigger(store, config, "dedup");
     }
     Ok((dups_found, dups_merged))
 }

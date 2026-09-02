@@ -353,28 +353,93 @@ fn recall_prompt_context(
     if results.is_empty() {
         return None;
     }
-    let memory_ids: Vec<String> = results
-        .iter()
-        .take(max_items)
-        .map(|result| result.memory.id.clone())
+    let items: Vec<(String, WorkingSetItem)> = results
+        .into_iter()
+        .map(|result| {
+            (
+                result.memory.id.clone(),
+                WorkingSetItem {
+                    kind: "memory".to_string(),
+                    topic: result.memory.topic.clone(),
+                    summary: result.memory.summary.clone(),
+                    detail: result.memory.content.clone(),
+                    agent_label: String::new(),
+                    is_subagent: false,
+                    score: result.score,
+                    updated_at: result.memory.updated_at,
+                },
+            )
+        })
         .collect();
-    let trailer = format!(
+    // Budget the body against the longest possible trailer (every id) so the
+    // final text never exceeds `max_chars`, then list only the ids whose
+    // lines were actually emitted: feedback must not label memories the
+    // agent never saw.
+    let all_ids: Vec<&str> = items.iter().map(|(id, _)| id.as_str()).collect();
+    let longest_trailer = recall_feedback_trailer(&request_id, &all_ids);
+    let body_budget = max_chars.saturating_sub(longest_trailer.chars().count() + 1);
+    let (body, emitted_ids) =
+        format_context_with_ids("Rein memory", items, body_budget, max_items)?;
+    let emitted: Vec<&str> = emitted_ids.iter().map(String::as_str).collect();
+    let trailer = recall_feedback_trailer(&request_id, &emitted);
+    Some(format!("{body}\n{trailer}"))
+}
+
+fn recall_feedback_trailer(request_id: &str, memory_ids: &[&str]) -> String {
+    format!(
         "rein_feedback: request_id={request_id} memory_ids={}",
         memory_ids.join(",")
-    );
-    let items = results.into_iter().map(|result| WorkingSetItem {
-        kind: "memory".to_string(),
-        topic: result.memory.topic.clone(),
-        summary: result.memory.summary.clone(),
-        detail: result.memory.content.clone(),
-        agent_label: String::new(),
-        is_subagent: false,
-        score: result.score,
-        updated_at: result.memory.updated_at,
-    });
-    let body_budget = max_chars.saturating_sub(trailer.chars().count() + 1);
-    let body = format_codex_context("Rein memory", items, body_budget, max_items)?;
-    Some(format!("{body}\n{trailer}"))
+    )
+}
+
+/// Like [`format_codex_context`] but never cuts an item in half: lines are
+/// added while the running text fits in `max_chars`, and the ids of the
+/// items that made it in are returned alongside the text.
+fn format_context_with_ids(
+    title: &str,
+    items: Vec<(String, WorkingSetItem)>,
+    max_chars: usize,
+    max_items: usize,
+) -> Option<(String, Vec<String>)> {
+    if max_chars == 0 || max_items == 0 {
+        return None;
+    }
+    let header = format!("{title} (background; user/repo instructions win):");
+    if header.chars().count() > max_chars {
+        return None;
+    }
+    let mut text = header;
+    let mut used = text.chars().count();
+    let mut emitted = Vec::new();
+    for (id, item) in items.into_iter().take(max_items) {
+        let topic = cap_chars(&clean_codex_context_field(&item.topic), 48);
+        let summary = cap_chars(&clean_codex_context_field(&item.summary), 96);
+        let detail = cap_chars(&clean_codex_context_field(&item.detail), 160);
+        if summary.is_empty() && detail.is_empty() {
+            continue;
+        }
+        let label = if topic.is_empty() { "memory" } else { &topic };
+        let body = if summary.is_empty() || context_detail_is_redundant(&summary, &detail) {
+            detail
+        } else if detail.is_empty() {
+            summary
+        } else {
+            format!("{summary}; {detail}")
+        };
+        let line = format!("- {label}: {body}");
+        let line_len = line.chars().count() + 1;
+        if used + line_len > max_chars {
+            break;
+        }
+        text.push('\n');
+        text.push_str(&line);
+        used += line_len;
+        emitted.push(id);
+    }
+    if emitted.is_empty() {
+        return None;
+    }
+    Some((text, emitted))
 }
 
 /// Layer 3: Stop — full knowledge extraction on session end.
@@ -1124,6 +1189,65 @@ mod tests {
             .unwrap();
         assert_eq!(stored, request_id);
         assert!(context.chars().count() <= 1200);
+    }
+
+    #[test]
+    fn hook_prompt_recall_trailer_lists_only_emitted_items() {
+        use crate::types::MemoryStore;
+        let (store, first_id) = seeded_store();
+        // Two more memories that match the same prompt with long bodies.
+        let mut ids = vec![first_id];
+        for n in 0..2 {
+            let mut memory = store.get(&ids[0]).unwrap();
+            memory.id = ulid::Ulid::new().to_string();
+            memory.topic = format!("zebra-protocol-{n}");
+            memory.content = format!(
+                "The zebra protocol handshake uses a nonce variant {n} {}",
+                "padding words ".repeat(20)
+            );
+            memory.summary = memory.content.clone();
+            ids.push(store.store(memory).unwrap());
+        }
+        let mut config = recall_config();
+        // Room for the header, one item line and the longest trailer only.
+        config.hooks.claude.max_additional_context_chars = 330;
+
+        let output = hook_prompt_output(
+            &config,
+            &prompt_payload("zebra protocol handshake nonce"),
+            "claude-code",
+            Some(&store),
+        )
+        .expect("at least one item fits");
+        let context = output["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(
+            context.chars().count() <= 330,
+            "{}",
+            context.chars().count()
+        );
+        let trailer = context.lines().last().unwrap();
+        let listed: Vec<&str> = trailer
+            .split("memory_ids=")
+            .nth(1)
+            .unwrap()
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .collect();
+        let body_lines = context.lines().filter(|l| l.starts_with("- ")).count();
+        assert_eq!(
+            listed.len(),
+            body_lines,
+            "one id per emitted line: {context}"
+        );
+        assert!(
+            listed.len() < ids.len(),
+            "cap must have dropped at least one item: {context}"
+        );
+        for id in &listed {
+            assert!(ids.iter().any(|known| known == id));
+        }
     }
 
     #[test]

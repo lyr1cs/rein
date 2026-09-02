@@ -319,23 +319,16 @@ impl OpsRuntime {
         let config = self.config.clone();
 
         self.with_store(|store| {
-            let (decayed, pruned, concepts) =
-                crate::ops::run_gc_adaptive(store, &config, threshold, dry_run)?;
-            let pipeline = if dry_run {
-                None
-            } else {
-                // Only report a record written by this process: a peer holding
-                // the single-flight lock leaves its own (older) row in place.
-                crate::ops::pipeline_run::load_last_run(store.conn())
-                    .filter(|record| record.pid == std::process::id())
-            };
+            let outcome = crate::ops::run_gc_adaptive(store, &config, threshold, dry_run)?;
             Ok(GcOutput {
-                decayed,
-                pruned,
-                concepts,
+                decayed: outcome.decayed,
+                pruned: outcome.pruned,
+                concepts: outcome.concepts,
                 dry_run,
                 threshold,
-                pipeline,
+                // The record of the pass this call ran; absent when the pass
+                // was skipped (peer held the single-flight lock) or dry-run.
+                pipeline: outcome.pipeline,
             })
         })
     }

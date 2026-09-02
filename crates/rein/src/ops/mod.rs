@@ -1844,18 +1844,35 @@ pub fn run_gc(store: &SqliteStore, threshold: f64, dry_run: bool) -> ReinResult<
     }
 }
 
+/// Outcome of [`run_gc_adaptive`]: the GC counters plus the record of the
+/// adaptive pipeline pass this call executed (`None` for dry runs and when
+/// the pass was skipped, e.g. a peer held the single-flight lock).
+pub struct GcAdaptiveOutcome {
+    pub decayed: u64,
+    pub pruned: u64,
+    pub concepts: u64,
+    pub pipeline: Option<crate::ops::pipeline_run::PipelineRunRecord>,
+}
+
 /// Run GC with adaptive engine pipeline. Combines standard GC + adaptive learning.
 pub fn run_gc_adaptive(
     store: &SqliteStore,
     config: &ReinConfig,
     threshold: f64,
     dry_run: bool,
-) -> ReinResult<(u64, u64, u64)> {
-    let result = run_gc(store, threshold, dry_run)?;
-    if !dry_run {
-        crate::ops::adaptive::run_adaptive_pipeline_with_trigger(store, config, "gc");
-    }
-    Ok(result)
+) -> ReinResult<GcAdaptiveOutcome> {
+    let (decayed, pruned, concepts) = run_gc(store, threshold, dry_run)?;
+    let pipeline = if dry_run {
+        None
+    } else {
+        crate::ops::adaptive::run_adaptive_pipeline_with_trigger(store, config, "gc")
+    };
+    Ok(GcAdaptiveOutcome {
+        decayed,
+        pruned,
+        concepts,
+        pipeline,
+    })
 }
 
 /// Return adaptive engine status as a JSON value for inspection.

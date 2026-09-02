@@ -246,6 +246,32 @@ impl<'a> PipelineRunRecorder<'a> {
         self.record.borrow().clone()
     }
 
+    /// Names of stages recorded as `failed`, in order.
+    pub fn failed_stage_names(&self) -> Vec<String> {
+        self.record
+            .borrow()
+            .stages
+            .iter()
+            .filter(|stage| stage.outcome == PipelineStageOutcome::Failed)
+            .map(|stage| stage.name.clone())
+            .collect()
+    }
+
+    /// Finish as `Failed` when any recorded stage failed (naming them),
+    /// otherwise as `Completed`. A run whose calibration stage errored must
+    /// not read as healthy just because the snapshot saved.
+    pub fn finish_from_stages(&self) {
+        let failed = self.failed_stage_names();
+        if failed.is_empty() {
+            self.finish(PipelineRunOutcome::Completed, None);
+        } else {
+            self.finish(
+                PipelineRunOutcome::Failed,
+                Some(format!("failed stages: {}", failed.join(", "))),
+            );
+        }
+    }
+
     fn push_stage(
         &self,
         name: &str,
@@ -341,6 +367,26 @@ mod tests {
         let summary = loaded.summary_line(now_unix_ms());
         assert!(summary.starts_with("adaptive pipeline: completed in "));
         assert!(summary.contains("slowest:"));
+    }
+
+    #[test]
+    fn finish_from_stages_marks_failed_when_any_stage_failed() {
+        let store = SqliteStore::in_memory().unwrap();
+        let recorder = PipelineRunRecorder::start(&store, "gc");
+        recorder.stage("m4_cluster", || ());
+        let _: Result<(), String> = recorder.stage_result("a12_refresh", || Err("boom".into()));
+        recorder.finish_from_stages();
+        let loaded = load_last_run(store.conn()).unwrap();
+        assert_eq!(loaded.outcome, PipelineRunOutcome::Failed);
+        assert_eq!(loaded.error.as_deref(), Some("failed stages: a12_refresh"));
+
+        let clean = PipelineRunRecorder::start(&store, "gc");
+        clean.stage("m4_cluster", || ());
+        clean.finish_from_stages();
+        assert_eq!(
+            load_last_run(store.conn()).unwrap().outcome,
+            PipelineRunOutcome::Completed
+        );
     }
 
     #[test]
