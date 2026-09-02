@@ -41,6 +41,37 @@ pub fn embedding_write_seq(conn: &Connection) -> u64 {
 /// commits, recluster over the OLD vector, and stamp the new seq as
 /// covered. A savepoint nests harmlessly inside caller transactions and
 /// forms its own transaction otherwise.
+/// [`insert_embedding`] guarded by vector provenance: when the store is
+/// stamped for a model (`vec_rows_provenance`, written by warmup / reindex)
+/// and the writer's `"<model>:<dims>"` differs, the write is refused so a
+/// process still running an older configuration cannot slip an old-model
+/// vector into a table attested as the new model.
+pub fn insert_embedding_checked(
+    conn: &Connection,
+    id: &str,
+    embedding: &[f32],
+    writer_provenance: &str,
+) -> ReinResult<()> {
+    use rusqlite::OptionalExtension;
+    let stamped: Option<String> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = ?1",
+            rusqlite::params![crate::store::schema::VEC_ROWS_PROVENANCE_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(stamped) = stamped {
+        if stamped != writer_provenance {
+            return Err(crate::types::ReinError::Config(format!(
+                "vector store is stamped for embedding model {stamped} but this writer uses \
+                 {writer_provenance}; restart with the current configuration or run \
+                 `rein migrate --reindex`"
+            )));
+        }
+    }
+    insert_embedding(conn, id, embedding)
+}
+
 pub fn insert_embedding(conn: &Connection, id: &str, embedding: &[f32]) -> ReinResult<()> {
     let bytes = embedding_to_bytes(embedding);
     conn.execute_batch("SAVEPOINT vec_embed_write")?;
@@ -310,6 +341,27 @@ mod tests {
         // Place the dead rows at the closest cosine distance and the live ones
         // farther out, so a faulty filter would let the dead ones win.
         insert_embedding(store.conn(), &deprecated, &one_hot(0, 1.0)).unwrap();
+        // Provenance guard: a foreign writer is refused once the table is stamped.
+        store
+            .conn()
+            .execute(
+                "INSERT INTO metadata(key, value) VALUES (?1, 'model-a:1')",
+                rusqlite::params![crate::store::schema::VEC_ROWS_PROVENANCE_KEY],
+            )
+            .unwrap();
+        assert!(
+            insert_embedding_checked(store.conn(), "guarded", &one_hot(0, 0.2), "model-b:1")
+                .is_err()
+        );
+        insert_embedding_checked(store.conn(), "guarded", &one_hot(0, 0.2), "model-a:1").unwrap();
+        store
+            .conn()
+            .execute(
+                "DELETE FROM metadata WHERE key = ?1",
+                rusqlite::params![crate::store::schema::VEC_ROWS_PROVENANCE_KEY],
+            )
+            .unwrap();
+        delete_embedding(store.conn(), "guarded").unwrap();
         insert_embedding(store.conn(), &superseded, &one_hot(0, 0.99)).unwrap();
         insert_embedding(store.conn(), &updated, &one_hot(0, 0.5)).unwrap();
         insert_embedding(store.conn(), &live, &one_hot(0, 0.4)).unwrap();

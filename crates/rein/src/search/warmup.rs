@@ -177,13 +177,14 @@ pub(crate) fn replace_embedding_row(
     id: &str,
     embedding: &[f32],
     existed: bool,
+    provenance: &str,
 ) -> crate::types::ReinResult<()> {
     if !existed {
-        return crate::store::vec::insert_embedding(conn, id, embedding);
+        return crate::store::vec::insert_embedding_checked(conn, id, embedding, provenance);
     }
     conn.execute_batch("SAVEPOINT vec_replace")?;
     let result = crate::store::vec::delete_embedding(conn, id)
-        .and_then(|_| crate::store::vec::insert_embedding(conn, id, embedding));
+        .and_then(|_| crate::store::vec::insert_embedding_checked(conn, id, embedding, provenance));
     match result {
         Ok(()) => {
             if let Err(e) = conn.execute_batch("RELEASE vec_replace") {
@@ -337,7 +338,14 @@ pub async fn backfill_missing_vec_rows(
     for (id, text) in pending {
         match EmbedCache::get(store.conn(), &text, &model) {
             Ok(Some(embedding)) if embedding.len() == dims => {
-                match write_validated_row(store, &id, &text, &embedding, existing.contains(&id)) {
+                match write_validated_row(
+                    store,
+                    &id,
+                    &text,
+                    &embedding,
+                    existing.contains(&id),
+                    &provenance,
+                ) {
                     Ok(true) => report.backfilled_from_cache += 1,
                     Ok(false) => report.revalidation_skipped += 1,
                     Err(e) => {
@@ -379,7 +387,14 @@ pub async fn backfill_missing_vec_rows(
                     if let Err(e) = EmbedCache::put(store.conn(), text, &model, embedding) {
                         tracing::warn!(id, "warmup: failed to cache embedding: {e}");
                     }
-                    match write_validated_row(store, id, text, embedding, existing.contains(id)) {
+                    match write_validated_row(
+                        store,
+                        id,
+                        text,
+                        embedding,
+                        existing.contains(id),
+                        &provenance,
+                    ) {
                         Ok(true) => report.embedded += 1,
                         Ok(false) => report.revalidation_skipped += 1,
                         Err(e) => {
@@ -451,6 +466,7 @@ fn write_validated_row(
     text: &str,
     embedding: &[f32],
     existed: bool,
+    provenance: &str,
 ) -> crate::types::ReinResult<bool> {
     let conn = store.conn();
     conn.execute_batch("SAVEPOINT vec_validated_write")?;
@@ -458,7 +474,7 @@ fn write_validated_row(
         if !memory_still_matches(conn, id, text)? {
             return Ok(false);
         }
-        replace_embedding_row(conn, id, embedding, existed)?;
+        replace_embedding_row(conn, id, embedding, existed, provenance)?;
         Ok(true)
     })();
     match result {
@@ -2497,7 +2513,7 @@ mod tests {
 
         // write_validated_row refuses to write for a changed memory.
         let dims = ReinConfig::default().embedding.dimensions;
-        assert!(!write_validated_row(&store, &id, &text, &vec![0.1; dims], false).unwrap());
+        assert!(!write_validated_row(&store, &id, &text, &vec![0.1; dims], false, "m:1").unwrap());
         assert!(crate::store::vec::get_embedding(store.conn(), &id)
             .unwrap()
             .is_none());
@@ -2514,13 +2530,13 @@ mod tests {
 
         // Wrong dimension: sqlite-vec rejects the insert after the delete ran.
         let wrong = vec![0.1; dims + 1];
-        assert!(replace_embedding_row(store.conn(), &id, &wrong, true).is_err());
+        assert!(replace_embedding_row(store.conn(), &id, &wrong, true, "m:1").is_err());
         let kept = crate::store::vec::get_embedding(store.conn(), &id)
             .unwrap()
             .expect("previous vector survives a failed replacement");
         assert!((kept[0] - 0.9).abs() < 1e-6);
 
-        replace_embedding_row(store.conn(), &id, &vec![0.3; dims], true).unwrap();
+        replace_embedding_row(store.conn(), &id, &vec![0.3; dims], true, "m:1").unwrap();
         let replaced = crate::store::vec::get_embedding(store.conn(), &id)
             .unwrap()
             .unwrap();

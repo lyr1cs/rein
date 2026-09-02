@@ -3278,14 +3278,16 @@ fn check_adaptive_pipeline_last_run_at(
         load_last_run, PipelineRunOutcome, PIPELINE_RUN_STALE_RUNNING_MS,
     };
 
+    if !adaptive_enabled {
+        // Historical records are irrelevant while the pipeline is off; a
+        // warning here would recommend a command that cannot run.
+        return ok_in(
+            DoctorCategory::Storage,
+            "adaptive_pipeline_last_run",
+            "adaptive pipeline is disabled ([adaptive].enabled = false); no run expected",
+        );
+    }
     let Some(record) = load_last_run(store.conn()) else {
-        if !adaptive_enabled {
-            return ok_in(
-                DoctorCategory::Storage,
-                "adaptive_pipeline_last_run",
-                "adaptive pipeline is disabled ([adaptive].enabled = false); no run expected",
-            );
-        }
         let mut check = warn_in(
             DoctorCategory::Storage,
             "adaptive_pipeline_last_run",
@@ -5321,6 +5323,12 @@ provider = "inherit"
         let check = check_adaptive_pipeline_last_run(&store, &config);
         assert_eq!(check.status, CheckStatus::Ok);
         assert!(check.message.contains("disabled"));
+        // An old failed record does not warn either while disabled.
+        use crate::ops::pipeline_run::{PipelineRunOutcome, PipelineRunRecorder};
+        let recorder = PipelineRunRecorder::start(&store, "gc");
+        recorder.finish(PipelineRunOutcome::Failed, Some("old".into()));
+        let check = check_adaptive_pipeline_last_run(&store, &config);
+        assert_eq!(check.status, CheckStatus::Ok);
     }
 
     #[test]

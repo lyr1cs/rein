@@ -39,6 +39,9 @@ pub struct SqliteStore {
     pub(crate) conn: Connection,
     db_path: PathBuf,
     pub(crate) dims: usize,
+    /// Embedding model this handle writes vectors with; checked against the
+    /// store's `vec_rows_provenance` stamp on every vector write.
+    embedding_model: String,
     /// Cached Tantivy index — avoids reopening + allocating 15MB IndexWriter per operation.
     tantivy_cache: std::cell::RefCell<Option<super::tantivy_fts::TantivyFts>>,
     /// v0.22 P1 optional pool reference. When set, recall's background
@@ -77,6 +80,12 @@ fn dedup_threshold_changed(left: f32, right: f32) -> bool {
 }
 
 impl SqliteStore {
+    /// `"<model>:<dims>"` of this handle, compared with `vec_rows_provenance`
+    /// on every vector write.
+    pub(crate) fn vector_provenance(&self) -> String {
+        format!("{}:{}", self.embedding_model, self.dims)
+    }
+
     fn cached_embedding_for_memory(&self, memory: &Memory) -> Option<Vec<f32>> {
         let config = crate::config::ReinConfig::load().ok()?;
         let model = config.embedding_model();
@@ -364,6 +373,7 @@ impl SqliteStore {
             conn,
             db_path: path.to_path_buf(),
             dims,
+            embedding_model: model.to_string(),
             tantivy_cache: std::cell::RefCell::new(None),
             pool: None,
             pending_index_scrub: std::cell::RefCell::new(Vec::new()),
@@ -383,6 +393,7 @@ impl SqliteStore {
             conn,
             db_path: PathBuf::from(":memory:"),
             dims: 3072,
+            embedding_model: crate::config::ReinConfig::default().embedding_model(),
             tantivy_cache: std::cell::RefCell::new(None),
             pool: None,
             pending_index_scrub: std::cell::RefCell::new(Vec::new()),
@@ -408,6 +419,7 @@ impl SqliteStore {
             conn,
             db_path,
             dims,
+            embedding_model: crate::config::ReinConfig::default().embedding_model(),
             tantivy_cache: std::cell::RefCell::new(None),
             pool: None,
             pending_index_scrub: std::cell::RefCell::new(Vec::new()),
@@ -458,6 +470,7 @@ impl SqliteStore {
             conn,
             db_path,
             dims,
+            embedding_model: model.to_string(),
             tantivy_cache: std::cell::RefCell::new(None),
             pool: None,
             pending_index_scrub: std::cell::RefCell::new(Vec::new()),
@@ -1160,7 +1173,7 @@ impl MemoryStore for SqliteStore {
         )?;
 
         if let Some(ref emb) = memory.embedding {
-            vec::insert_embedding(&self.conn, &id, emb)?;
+            vec::insert_embedding_checked(&self.conn, &id, emb, &self.vector_provenance())?;
         }
 
         // Update side indexes (reuse keywords_json from above)
@@ -1323,11 +1336,21 @@ impl MemoryStore for SqliteStore {
         }
 
         let refreshed_embedding = if let Some(embedding) = memory.embedding.clone() {
-            vec::insert_embedding(&self.conn, &memory.id, &embedding)?;
+            vec::insert_embedding_checked(
+                &self.conn,
+                &memory.id,
+                &embedding,
+                &self.vector_provenance(),
+            )?;
             Some(embedding)
         } else if semantic_changed {
             if let Some(cached) = self.cached_embedding_for_memory(memory) {
-                vec::insert_embedding(&self.conn, &memory.id, &cached)?;
+                vec::insert_embedding_checked(
+                    &self.conn,
+                    &memory.id,
+                    &cached,
+                    &self.vector_provenance(),
+                )?;
                 Some(cached)
             } else {
                 // Never leave a stale vector row behind when the semantic fields changed.

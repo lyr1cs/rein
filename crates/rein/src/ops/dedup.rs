@@ -476,6 +476,7 @@ fn bucket_embeddings(
 ) -> std::collections::HashMap<usize, Vec<f32>> {
     let conn = store.conn();
     let model = config.embedding_model();
+    let vector_provenance = format!("{model}:{}", config.embedding.dimensions);
     let mut embeddings = std::collections::HashMap::new();
     let mut uncached: Vec<(usize, String)> = Vec::new();
 
@@ -494,7 +495,12 @@ fn bucket_embeddings(
             &mems[idx].content,
         );
         if let Ok(Some(emb)) = crate::embed::EmbedCache::get(conn, &enriched, &model) {
-            let _ = crate::store::vec::insert_embedding(conn, &mems[idx].id, &emb);
+            let _ = crate::store::vec::insert_embedding_checked(
+                conn,
+                &mems[idx].id,
+                &emb,
+                &vector_provenance,
+            );
             embeddings.insert(idx, emb);
             continue;
         }
@@ -519,7 +525,12 @@ fn bucket_embeddings(
         }
         for ((idx, enriched), emb) in chunk.iter().zip(batch) {
             let _ = crate::embed::EmbedCache::put(conn, enriched, &model, &emb);
-            let _ = crate::store::vec::insert_embedding(conn, &mems[*idx].id, &emb);
+            let _ = crate::store::vec::insert_embedding_checked(
+                conn,
+                &mems[*idx].id,
+                &emb,
+                &vector_provenance,
+            );
             embeddings.insert(*idx, emb);
         }
     }
@@ -650,6 +661,7 @@ fn run_vec_dedup_inner(
     };
 
     let model_name = config.embedding_model();
+    let vector_provenance = format!("{model_name}:{}", config.embedding.dimensions);
     let mut merged = 0u32;
     let mut llm_verdicts_used = 0usize;
     let mut embeddings_by_id: std::collections::HashMap<String, Vec<f32>> =
@@ -660,7 +672,12 @@ fn run_vec_dedup_inner(
         let enriched = crate::embed::prepend_metadata(topic, summary, content);
         match crate::embed::EmbedCache::get(conn, &enriched, &model_name) {
             Ok(Some(cached)) => {
-                let _ = crate::store::vec::insert_embedding(conn, id, &cached);
+                let _ = crate::store::vec::insert_embedding_checked(
+                    conn,
+                    id,
+                    &cached,
+                    &vector_provenance,
+                );
                 embeddings_by_id.insert(id.clone(), cached);
             }
             _ => pending_embeddings.push((id.clone(), enriched)),
@@ -688,7 +705,7 @@ fn run_vec_dedup_inner(
 
         for ((id, enriched), emb) in chunk.iter().zip(batch_embeddings) {
             let _ = crate::embed::EmbedCache::put(conn, enriched, &model_name, &emb);
-            let _ = crate::store::vec::insert_embedding(conn, id, &emb);
+            let _ = crate::store::vec::insert_embedding_checked(conn, id, &emb, &vector_provenance);
             embeddings_by_id.insert(id.clone(), emb);
         }
     }

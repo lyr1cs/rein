@@ -1059,11 +1059,19 @@ impl SentinelLock {
                 let stale_after = std::time::Duration::from_millis(
                     crate::ops::pipeline_run::PIPELINE_RUN_STALE_RUNNING_MS as u64,
                 );
-                let abandoned = std::fs::metadata(path)
+                let old = std::fs::metadata(path)
                     .and_then(|meta| meta.modified())
                     .ok()
                     .and_then(|modified| now.duration_since(modified).ok())
                     .is_some_and(|age| age > stale_after);
+                // A long but live holder heartbeats the sentinel (`touch`);
+                // an old sentinel whose recorded process is still alive is
+                // never taken over.
+                let holder_alive = std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|raw| raw.trim().parse::<u32>().ok())
+                    .is_some_and(process_is_alive);
+                let abandoned = old && !holder_alive;
                 if !abandoned {
                     return Ok(None);
                 }
@@ -1092,6 +1100,34 @@ impl SentinelLock {
         Ok(Self {
             path: path.to_path_buf(),
         })
+    }
+
+    /// Heartbeat: refresh the sentinel's modification time so a legitimately
+    /// long holder (a multi-hour reindex) is never mistaken for abandoned.
+    pub(crate) fn touch(&self) {
+        if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&self.path) {
+            let _ = file.set_modified(std::time::SystemTime::now());
+        }
+    }
+}
+
+/// Whether `pid` is a running process. Unix uses `kill(pid, 0)` (EPERM
+/// still means alive); elsewhere the answer is unknown and treated as dead,
+/// so the heartbeat is the only protection for long holders there.
+fn process_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        if rc == 0 {
+            return true;
+        }
+        let err = std::io::Error::last_os_error();
+        return err.raw_os_error() == Some(libc::EPERM);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
     }
 }
 
@@ -5756,9 +5792,9 @@ mod tests {
         assert!(again.is_some());
         drop(again);
 
-        // A sentinel left behind by a crashed pass is taken over once it is
-        // older than the stale-running threshold.
-        std::fs::write(&path, b"12345").unwrap();
+        // A sentinel left behind by a crashed pass (dead pid) is taken over
+        // once it is older than the stale-running threshold.
+        std::fs::write(&path, b"999999999").unwrap();
         let far_future = now
             + std::time::Duration::from_millis(
                 crate::ops::pipeline_run::PIPELINE_RUN_STALE_RUNNING_MS as u64 + 60_000,
@@ -5769,6 +5805,22 @@ mod tests {
             .expect("stale sentinel taken over");
         drop(taken);
         assert!(!path.exists());
+
+        // An old sentinel whose holder is still alive (our own pid) is never
+        // taken over, and a heartbeat makes it young again.
+        let live = SentinelLock::try_acquire(&path, now).unwrap().unwrap();
+        assert!(
+            SentinelLock::try_acquire(&path, far_future)
+                .unwrap()
+                .is_none(),
+            "live holder keeps the lock regardless of age"
+        );
+        live.touch();
+        let refreshed = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(
+            now.duration_since(refreshed).unwrap_or_default() < std::time::Duration::from_secs(60)
+        );
+        drop(live);
     }
 
     #[test]

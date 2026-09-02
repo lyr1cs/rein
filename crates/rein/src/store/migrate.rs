@@ -270,7 +270,7 @@ pub async fn reindex_with_embedder(
     }
 
     let (total, embedded, errors) =
-        stage_reindex_embeddings(store, config, embedder, scope).await?;
+        stage_reindex_embeddings(store, config, embedder, scope, _reindex_lock.as_ref()).await?;
     if total == 0 {
         return Ok(ReindexReport {
             total: 0,
@@ -420,6 +420,7 @@ pub(crate) async fn stage_reindex_embeddings(
     config: &ReinConfig,
     embedder: &crate::embed::EmbedderKind,
     scope: ReindexScope,
+    heartbeat: Option<&crate::ops::adaptive::SentinelLock>,
 ) -> anyhow::Result<(usize, usize, usize)> {
     use crate::store::schema;
     use crate::types::Embedder as _;
@@ -513,6 +514,9 @@ pub(crate) async fn stage_reindex_embeddings(
         }
 
         eprintln!("[{}/{}] Reindexing...", embedded + errors, total);
+        if let Some(lock) = heartbeat {
+            lock.touch();
+        }
     }
 
     Ok((total, embedded, errors))
@@ -571,15 +575,25 @@ mod tests {
             crate::embed::MockEmbedder::with_fixed_vector(dims, vec![0.25; dims]),
         );
 
-        let (total, _, _) =
-            super::stage_reindex_embeddings(&store, &config, &embedder, super::ReindexScope::Live)
-                .await
-                .unwrap();
+        let (total, _, _) = super::stage_reindex_embeddings(
+            &store,
+            &config,
+            &embedder,
+            super::ReindexScope::Live,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(total, 1, "deprecated rows are not embedded in Live scope");
-        let (all, _, _) =
-            super::stage_reindex_embeddings(&store, &config, &embedder, super::ReindexScope::All)
-                .await
-                .unwrap();
+        let (all, _, _) = super::stage_reindex_embeddings(
+            &store,
+            &config,
+            &embedder,
+            super::ReindexScope::All,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(all, 2);
 
         // A concurrent reindex holding the sentinel makes this one bail out
@@ -655,10 +669,15 @@ mod tests {
             crate::embed::MockEmbedder::with_fixed_vector(dims, vec![0.25; dims]),
         );
 
-        let (total, embedded, errors) =
-            super::stage_reindex_embeddings(&store, &config, &embedder, super::ReindexScope::All)
-                .await
-                .unwrap();
+        let (total, embedded, errors) = super::stage_reindex_embeddings(
+            &store,
+            &config,
+            &embedder,
+            super::ReindexScope::All,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!((total, embedded, errors), (2, 2, 0));
 
         // A write lands between staging and the swap.
