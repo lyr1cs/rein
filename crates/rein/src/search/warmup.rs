@@ -278,11 +278,10 @@ pub async fn backfill_missing_vec_rows(
             live_total,
             "warmup: re-embedding every live memory under the configured model"
         );
-        match stage_migration(store, embedder, &model, dims, pending, &mut report).await {
-            Some(staged) => {
-                publish_migration(store, &model, &provenance, &existing, staged, &mut report)
-            }
-            None => {}
+        if let Some(staged) =
+            stage_migration(store, embedder, &model, dims, pending, &mut report).await
+        {
+            publish_migration(store, &model, &provenance, &existing, staged, &mut report);
         }
         return report;
     }
