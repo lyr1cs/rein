@@ -239,22 +239,22 @@ pub async fn hook_permission_request(config: &ReinConfig) -> anyhow::Result<()> 
 /// Codex UserPromptSubmit — optionally add bounded, relevant Rein memory context.
 pub async fn hook_prompt(config: &ReinConfig) -> anyhow::Result<()> {
     let input = std::io::read_to_string(std::io::stdin())?;
-    let runtime = crate::extract::hooks::parsing::runtime_agent_label();
-    let policy = prompt_context_policy(config, &runtime);
+    let is_codex = crate::extract::hooks::parsing::hook_runtime_is_codex();
+    let policy = prompt_context_policy(config, is_codex);
     let store = if policy.enabled && policy.source == PromptContextSource::Recall {
         Some(config.open_store()?)
     } else {
         None
     };
-    if let Some(output) = hook_prompt_output(config, &input, &runtime, store.as_ref()) {
+    if let Some(output) = hook_prompt_output(config, &input, is_codex, store.as_ref()) {
         print_codex_json_output(&output)?;
     }
     Ok(())
 }
 
-/// Effective UserPromptSubmit policy for the calling runtime: Codex uses
-/// `[hooks.codex]`, everything else (Claude Code and its subagents) uses
-/// `[hooks.claude]`.
+/// Effective UserPromptSubmit policy for the calling runtime: Codex (see
+/// `parsing::hook_runtime_is_codex`) uses `[hooks.codex]`, everything else
+/// (Claude Code and its subagents) uses `[hooks.claude]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PromptContextPolicy {
     enabled: bool,
@@ -262,8 +262,8 @@ struct PromptContextPolicy {
     source: PromptContextSource,
 }
 
-fn prompt_context_policy(config: &ReinConfig, runtime: &str) -> PromptContextPolicy {
-    if runtime == "codex" {
+fn prompt_context_policy(config: &ReinConfig, is_codex: bool) -> PromptContextPolicy {
+    if is_codex {
         PromptContextPolicy {
             enabled: config.hooks.codex.inject_prompt_context,
             max_chars: config.hooks.codex.max_additional_context_chars,
@@ -284,11 +284,11 @@ fn prompt_context_policy(config: &ReinConfig, runtime: &str) -> PromptContextPol
 fn hook_prompt_output(
     config: &ReinConfig,
     input: &str,
-    runtime: &str,
+    is_codex: bool,
     store: Option<&crate::store::SqliteStore>,
 ) -> Option<serde_json::Value> {
     let json = parse_codex_event_payload(input, "UserPromptSubmit")?;
-    let policy = prompt_context_policy(config, runtime);
+    let policy = prompt_context_policy(config, is_codex);
     if !policy.enabled {
         return None;
     }
@@ -1127,17 +1127,15 @@ mod tests {
         config.hooks.codex.inject_prompt_context = true;
         config.hooks.claude.inject_prompt_context = false;
         // Codex policy on, Claude policy off: a Claude Code runtime gets nothing.
-        assert!(
-            hook_prompt_output(&config, &prompt_payload("anything"), "claude-code", None).is_none()
-        );
+        assert!(hook_prompt_output(&config, &prompt_payload("anything"), false, None).is_none());
         // And vice versa: Claude policy on, Codex runtime off.
         let mut config = ReinConfig::default();
         config.hooks.claude.inject_prompt_context = true;
         config.hooks.claude.prompt_context_source = PromptContextSource::Recall;
-        assert!(hook_prompt_output(&config, &prompt_payload("anything"), "codex", None).is_none());
+        assert!(hook_prompt_output(&config, &prompt_payload("anything"), true, None).is_none());
         // Wrong event name never produces output.
         let payload = prompt_payload("x").replace("UserPromptSubmit", "SessionStart");
-        assert!(hook_prompt_output(&config, &payload, "claude-code", None).is_none());
+        assert!(hook_prompt_output(&config, &payload, false, None).is_none());
     }
 
     #[test]
@@ -1152,7 +1150,7 @@ mod tests {
             // every prompt token must occur in the memory. Real databases use Tantivy
             // BM25 for natural-language prompts.
             &prompt_payload("zebra protocol handshake nonce"),
-            "claude-code",
+            false,
             Some(&store),
         )
         .expect("context for a matching memory");
@@ -1215,7 +1213,7 @@ mod tests {
         let output = hook_prompt_output(
             &config,
             &prompt_payload("zebra protocol handshake nonce"),
-            "claude-code",
+            false,
             Some(&store),
         )
         .expect("at least one item fits");
@@ -1254,20 +1252,15 @@ mod tests {
     fn hook_prompt_recall_source_without_store_or_matches_is_silent() {
         let (store, _id) = seeded_store();
         let config = recall_config();
-        assert!(
-            hook_prompt_output(&config, &prompt_payload("zebra"), "claude-code", None).is_none()
-        );
+        assert!(hook_prompt_output(&config, &prompt_payload("zebra"), false, None).is_none());
         assert!(hook_prompt_output(
             &config,
             &prompt_payload("completely unrelated quantum gardening"),
-            "claude-code",
+            false,
             Some(&store)
         )
         .is_none());
-        assert!(
-            hook_prompt_output(&config, &prompt_payload("   "), "claude-code", Some(&store))
-                .is_none()
-        );
+        assert!(hook_prompt_output(&config, &prompt_payload("   "), false, Some(&store)).is_none());
     }
 
     #[test]
@@ -1276,12 +1269,7 @@ mod tests {
         let mut config = ReinConfig::default();
         config.hooks.claude.inject_prompt_context = true;
         config.hooks.claude.prompt_context_source = PromptContextSource::WorkingSet;
-        let _ = hook_prompt_output(
-            &config,
-            &prompt_payload("zebra"),
-            "claude-code",
-            Some(&store),
-        );
+        let _ = hook_prompt_output(&config, &prompt_payload("zebra"), false, Some(&store));
         assert_eq!(recall_complete_count(&store), 0);
     }
 }

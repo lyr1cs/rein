@@ -126,6 +126,29 @@ pub fn is_subagent_hook(input: &str) -> bool {
 
 /// Best-effort runtime client/agent label.
 /// Prefer explicit override, then detect common agent environments.
+/// Whether the calling hook runtime is Codex. Independent of the free-form
+/// `REIN_AGENT_LABEL` display label: a label of `codex`, `codex-main`,
+/// `codex:ci` etc. counts, and so do Codex's own environment variables.
+pub fn hook_runtime_is_codex() -> bool {
+    if std::env::var("CODEX_THREAD_ID").is_ok() || std::env::var("CODEX_CI").is_ok() {
+        return true;
+    }
+    std::env::var("REIN_AGENT_LABEL")
+        .ok()
+        .is_some_and(|label| runtime_label_is_codex(&label))
+}
+
+/// `codex` exactly, or `codex` followed by a separator (`codex-main`,
+/// `codex:ci`, `codex_2`). `codexplorer` is not Codex.
+pub fn runtime_label_is_codex(label: &str) -> bool {
+    let lower = label.trim().to_ascii_lowercase();
+    match lower.strip_prefix("codex") {
+        Some("") => true,
+        Some(rest) => rest.chars().next().is_some_and(|c| !c.is_alphanumeric()),
+        None => false,
+    }
+}
+
 pub fn runtime_agent_label() -> String {
     if let Ok(label) = std::env::var("REIN_AGENT_LABEL") {
         let trimmed = label.trim();
@@ -784,5 +807,28 @@ mod tests {
             extract_hook_text_for_llm(&payload),
             "Implemented the requested hook diagnostics."
         );
+    }
+
+    #[test]
+    fn runtime_label_codex_detection() {
+        for yes in [
+            "codex",
+            "Codex",
+            " codex ",
+            "codex-main",
+            "codex:ci",
+            "codex_2",
+        ] {
+            assert!(super::runtime_label_is_codex(yes), "{yes}");
+        }
+        for no in [
+            "claude-code",
+            "codexplorer",
+            "",
+            "my-codex",
+            "unknown-agent",
+        ] {
+            assert!(!super::runtime_label_is_codex(no), "{no}");
+        }
     }
 }

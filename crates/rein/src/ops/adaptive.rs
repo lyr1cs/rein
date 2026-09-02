@@ -652,6 +652,11 @@ fn run_post_snapshot_refreshes(
 ) {
     let Some(durable_state) = crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
     else {
+        // Every post-snapshot refresh depends on this state; record the miss
+        // so the run finishes as Failed instead of reading as healthy.
+        let _: Result<(), String> = recorder.stage_result("post_snapshot_restore", || {
+            Err("durable AdaptiveState could not be restored after save".to_string())
+        });
         tracing::warn!(
             "post-snapshot calibration skipped because durable AdaptiveState could not be restored"
         );
@@ -5533,6 +5538,26 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|entry| entry.generation == 1)
+        );
+    }
+
+    #[test]
+    fn post_snapshot_refreshes_record_failed_stage_when_state_cannot_be_restored() {
+        let store = SqliteStore::in_memory().unwrap();
+        let config = a12_enabled_config();
+        // No adaptive_state row was ever saved, so restore_snapshot is None.
+        let recorder = PipelineRunRecorder::start(&store, "test");
+        run_post_snapshot_refreshes(&store, &config, &recorder);
+        assert_eq!(
+            recorder.failed_stage_names(),
+            vec!["post_snapshot_restore".to_string()]
+        );
+        recorder.finish_from_stages();
+        assert_eq!(
+            crate::ops::pipeline_run::load_last_run(store.conn())
+                .unwrap()
+                .outcome,
+            PipelineRunOutcome::Failed
         );
     }
 

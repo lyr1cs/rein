@@ -39,6 +39,9 @@ pub struct WarmupReport {
     pub errors: usize,
     /// Cache misses left unembedded because no embedding provider is configured.
     pub skipped_no_provider: usize,
+    /// The embedding model differed from the last complete pass, so every live
+    /// row was scheduled for re-embedding.
+    pub model_changed: bool,
 }
 
 impl WarmupReport {
@@ -57,6 +60,16 @@ impl WarmupReport {
 /// the HNSW rebuild read. Earlier versions only refilled the cache, which is
 /// why coverage never converged on long-lived databases.
 pub async fn warmup(store: &SqliteStore, config: &ReinConfig) -> WarmupReport {
+    let embedder = create_embedder(config);
+    warmup_with_embedder(store, config, embedder.as_ref()).await
+}
+
+/// [`warmup`] with an explicit provider (tests inject a mock).
+pub async fn warmup_with_embedder(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    embedder: Option<&crate::embed::EmbedderKind>,
+) -> WarmupReport {
     // v0.30.2 B3 / B6: orphan-stage cleanup BEFORE any rebuild decision so a
     // crash mid-swap from a previous run can't leave the search subsystem
     // staring at a half-built `.new` dir.
@@ -99,13 +112,12 @@ pub async fn warmup(store: &SqliteStore, config: &ReinConfig) -> WarmupReport {
         tracing::debug!("warmup: skipping cold-start hnsw rebuild (gate satisfied)");
     }
 
-    let embedder = create_embedder(config);
     if embedder.is_none() {
         tracing::info!(
             "no embedding provider configured; warmup restores vector rows from cache only"
         );
     }
-    let report = backfill_missing_vec_rows(store, config, embedder.as_ref()).await;
+    let report = backfill_missing_vec_rows(store, config, embedder).await;
     tracing::info!(
         embedded = report.embedded,
         backfilled_from_cache = report.backfilled_from_cache,
@@ -114,12 +126,58 @@ pub async fn warmup(store: &SqliteStore, config: &ReinConfig) -> WarmupReport {
         "warmup complete"
     );
 
-    if report.rows_added() > 0 {
+    if report.model_changed && report.errors > 0 {
+        // A partial model migration would leave old- and new-model vectors
+        // side by side. Publishing that index would compare query vectors
+        // against incompatible document vectors, so keep HNSW flagged dirty
+        // and let the next successful warmup rebuild it.
+        tracing::warn!(
+            errors = report.errors,
+            "warmup: model migration incomplete; HNSW stays dirty until a clean pass"
+        );
+        let db_path = store.db_path();
+        if db_path.to_str() != Some(":memory:") {
+            crate::store::hnsw::HnswIndex::mark_dirty(&db_path.with_extension(""));
+        }
+    } else if report.rows_added() > 0 {
         // Rebuild side indexes so the new rows are searchable.
         populate_hnsw(store, config);
     }
 
     report
+}
+
+/// Write `embedding` as the vector row for `id`. When a row already exists
+/// the delete + insert pair runs inside a savepoint so a failed insert (for
+/// example a dimension mismatch) leaves the previous vector in place instead
+/// of silently lowering coverage.
+pub(crate) fn replace_embedding_row(
+    conn: &rusqlite::Connection,
+    id: &str,
+    embedding: &[f32],
+    existed: bool,
+) -> crate::types::ReinResult<()> {
+    if !existed {
+        return crate::store::vec::insert_embedding(conn, id, embedding);
+    }
+    conn.execute_batch("SAVEPOINT vec_replace")?;
+    let result = crate::store::vec::delete_embedding(conn, id)
+        .and_then(|_| crate::store::vec::insert_embedding(conn, id, embedding));
+    match result {
+        Ok(()) => {
+            if let Err(e) = conn.execute_batch("RELEASE vec_replace") {
+                let _ = conn.execute_batch("ROLLBACK TO vec_replace");
+                let _ = conn.execute_batch("RELEASE vec_replace");
+                return Err(e.into());
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO vec_replace");
+            let _ = conn.execute_batch("RELEASE vec_replace");
+            Err(e)
+        }
+    }
 }
 
 /// Insert a `vec_memories` row for every live memory that lacks one, using
@@ -146,6 +204,7 @@ pub async fn backfill_missing_vec_rows(
         .as_deref()
         .is_some_and(|stored| stored != provenance);
     if reembed_all {
+        report.model_changed = true;
         tracing::warn!(
             stored = stored_provenance.as_deref().unwrap_or(""),
             current = %provenance,
@@ -169,10 +228,7 @@ pub async fn backfill_missing_vec_rows(
     // sqlite-vec rejects a second row for an existing primary key, so a
     // re-embed must drop the stale row before inserting the new vector.
     let write_row = |id: &str, embedding: &[f32]| -> crate::types::ReinResult<()> {
-        if existing.contains(id) {
-            crate::store::vec::delete_embedding(store.conn(), id)?;
-        }
-        crate::store::vec::insert_embedding(store.conn(), id, embedding)
+        replace_embedding_row(store.conn(), id, embedding, existing.contains(id))
     };
 
     // Collect only the missing subset so memory stays bounded by the gap,
@@ -2151,6 +2207,67 @@ mod tests {
         assert!(crate::store::vec::get_embedding(store.conn(), &id)
             .unwrap()
             .is_none());
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn warmup_keeps_hnsw_dirty_after_partial_model_migration() {
+        use crate::types::MemoryStore;
+        let (_dir, store) = test_store();
+        let config = ReinConfig::default();
+        let dims = config.embedding.dimensions;
+        let mut memory = live_memory("partial", "row from the previous model");
+        memory.embedding = Some(vec![0.9; dims]);
+        store.store(memory).unwrap();
+        store.conn().execute("DELETE FROM embed_cache", []).unwrap();
+        write_metadata(
+            &store,
+            VEC_ROWS_PROVENANCE_KEY,
+            &format!("old-model:{dims}"),
+        );
+        let failing = crate::embed::EmbedderKind::Mock(
+            crate::embed::MockEmbedder::with_persistent_error(dims, "provider down"),
+        );
+
+        let report = warmup_with_embedder(&store, &config, Some(&failing)).await;
+
+        assert!(report.model_changed);
+        assert!(report.errors > 0);
+        assert_eq!(report.rows_added(), 0);
+        let hnsw_path = store.db_path().with_extension("");
+        assert!(
+            crate::store::hnsw::HnswIndex::is_dirty(&hnsw_path),
+            "a failed model migration must leave HNSW flagged for rebuild"
+        );
+        assert_eq!(
+            read_metadata(&store, VEC_ROWS_PROVENANCE_KEY).as_deref(),
+            Some(format!("old-model:{dims}").as_str()),
+            "provenance is not advanced by an incomplete migration"
+        );
+    }
+
+    #[test]
+    fn replace_embedding_row_keeps_old_vector_when_insert_fails() {
+        use crate::types::MemoryStore;
+        let store = SqliteStore::in_memory().unwrap();
+        let dims = ReinConfig::default().embedding.dimensions;
+        let mut memory = live_memory("atomic", "row with a vector");
+        memory.embedding = Some(vec![0.9; dims]);
+        let id = store.store(memory).unwrap();
+
+        // Wrong dimension: sqlite-vec rejects the insert after the delete ran.
+        let wrong = vec![0.1; dims + 1];
+        assert!(replace_embedding_row(store.conn(), &id, &wrong, true).is_err());
+        let kept = crate::store::vec::get_embedding(store.conn(), &id)
+            .unwrap()
+            .expect("previous vector survives a failed replacement");
+        assert!((kept[0] - 0.9).abs() < 1e-6);
+
+        replace_embedding_row(store.conn(), &id, &vec![0.3; dims], true).unwrap();
+        let replaced = crate::store::vec::get_embedding(store.conn(), &id)
+            .unwrap()
+            .unwrap();
+        assert!((replaced[0] - 0.3).abs() < 1e-6);
     }
 
     #[cfg(feature = "test-support")]
