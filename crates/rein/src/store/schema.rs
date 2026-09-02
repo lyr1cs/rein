@@ -2238,7 +2238,8 @@ pub fn create_embed_staging(conn: &Connection) -> ReinResult<()> {
         "DROP TABLE IF EXISTS embed_staging;
          CREATE TABLE embed_staging (
             id TEXT PRIMARY KEY,
-            embedding BLOB NOT NULL
+            embedding BLOB NOT NULL,
+            text_hash TEXT NOT NULL DEFAULT ''
          );",
     )?;
     Ok(())
@@ -2250,6 +2251,18 @@ pub fn create_embed_staging(conn: &Connection) -> ReinResult<()> {
 /// staging table; on failure the old index is preserved by rollback and the
 /// staging table remains (caller can retry or clean up).
 pub fn replace_vector_index_from_staging(conn: &Connection, dims: usize) -> ReinResult<()> {
+    replace_vector_index_from_staging_validated(conn, dims).map(|_| ())
+}
+
+/// [`replace_vector_index_from_staging`] that also revalidates every staged
+/// row against the current `memories` text: a row whose `text_hash` no longer
+/// matches (edited, rewritten, or deleted while embeddings were computed) is
+/// skipped instead of published under a stale vector. Rows staged without a
+/// hash (legacy callers) are published as before. Returns the skipped count.
+pub fn replace_vector_index_from_staging_validated(
+    conn: &Connection,
+    dims: usize,
+) -> ReinResult<usize> {
     let row_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM embed_staging", [], |r| r.get(0))
         .unwrap_or(0);
@@ -2262,19 +2275,41 @@ pub fn replace_vector_index_from_staging(conn: &Connection, dims: usize) -> Rein
             embedding float[{dims}] distance_metric=cosine
         );"
     );
+    let mut skipped = 0_usize;
     let result = (|| -> ReinResult<()> {
         conn.execute_batch("SAVEPOINT replace_vector_index_staged")?;
         conn.execute_batch("DROP TABLE IF EXISTS vec_memories;")?;
         conn.execute_batch("DELETE FROM embed_cache;")?;
         conn.execute_batch(&vec_sql)?;
         {
-            let mut read = conn.prepare("SELECT id, embedding FROM embed_staging")?;
+            let mut read = conn.prepare("SELECT id, embedding, text_hash FROM embed_staging")?;
             let mut write =
                 conn.prepare("INSERT OR REPLACE INTO vec_memories(id, embedding) VALUES (?1, ?2)")?;
+            let mut current =
+                conn.prepare("SELECT topic, summary, content FROM memories WHERE id = ?1")?;
             let mut rows = read.query([])?;
             while let Some(row) = rows.next()? {
                 let id: String = row.get(0)?;
                 let bytes: Vec<u8> = row.get(1)?;
+                let staged_hash: String = row.get(2)?;
+                if !staged_hash.is_empty() {
+                    use rusqlite::OptionalExtension;
+                    let live_hash = current
+                        .query_row(rusqlite::params![id], |r| {
+                            Ok(crate::store::migrate::enriched_text_hash(
+                                &crate::embed::prepend_metadata(
+                                    &r.get::<_, String>(0)?,
+                                    &r.get::<_, String>(1)?,
+                                    &r.get::<_, String>(2)?,
+                                ),
+                            ))
+                        })
+                        .optional()?;
+                    if live_hash.as_deref() != Some(staged_hash.as_str()) {
+                        skipped += 1;
+                        continue;
+                    }
+                }
                 write.execute(rusqlite::params![id, bytes])?;
             }
         }
@@ -2294,7 +2329,13 @@ pub fn replace_vector_index_from_staging(conn: &Connection, dims: usize) -> Rein
         let _ = conn.execute_batch("ROLLBACK TO replace_vector_index_staged");
         let _ = conn.execute_batch("RELEASE replace_vector_index_staged");
     }
-    result
+    if skipped > 0 {
+        tracing::warn!(
+            skipped,
+            "vector index swap skipped rows whose memory changed after staging; the next warmup fills them"
+        );
+    }
+    result.map(|_| skipped)
 }
 
 #[cfg(test)]

@@ -170,16 +170,26 @@ pub struct ReindexReport {
     pub total: usize,
     pub embedded: usize,
     pub errors: usize,
+    /// Staged rows not published because the memory changed (or vanished)
+    /// between embedding and the index swap; the next warmup fills them.
+    pub skipped_changed: usize,
 }
 
 impl std::fmt::Display for ReindexReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Reindex complete: {}/{} memories embedded, {} errors",
-            self.embedded, self.total, self.errors
+            "Reindex complete: {}/{} memories embedded, {} errors, {} skipped (changed during reindex)",
+            self.embedded, self.total, self.errors, self.skipped_changed
         )
     }
+}
+
+/// SHA-256 of the enriched text that was embedded; stored beside each staged
+/// row so the swap can prove the memory is unchanged.
+pub(crate) fn enriched_text_hash(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
 /// Re-embed all existing memories with the current embedding model.
@@ -188,15 +198,22 @@ impl std::fmt::Display for ReindexReport {
 /// 2. Fetches all memories and batch-embeds them
 /// 3. Clears the embed_cache (old model's cache)
 pub async fn reindex(store: &SqliteStore, config: &ReinConfig) -> anyhow::Result<ReindexReport> {
-    use crate::store::schema;
-    use crate::types::Embedder as _;
-
-    // 1. Validate embedder is available BEFORE touching the vector index
     let embedder = crate::embed::create_embedder(config).ok_or_else(|| {
         anyhow::anyhow!("no embedding provider configured (set provider and API key)")
     })?;
+    reindex_with_embedder(store, config, &embedder).await
+}
 
-    // 2. Health check: test embed one string to verify the API works
+/// [`reindex`] with an explicit provider (warmup's model migration and tests
+/// inject theirs).
+pub async fn reindex_with_embedder(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    embedder: &crate::embed::EmbedderKind,
+) -> anyhow::Result<ReindexReport> {
+    use crate::store::schema;
+    use crate::types::Embedder as _;
+
     let test_result = embedder.embed("health check").await;
     if let Err(e) = test_result {
         return Err(anyhow::anyhow!(
@@ -204,108 +221,26 @@ pub async fn reindex(store: &SqliteStore, config: &ReinConfig) -> anyhow::Result
         ));
     }
 
-    // 3. Get all memories.  Do not touch the existing vector index until every
-    // replacement embedding has been computed successfully.
-    let mut stmt = store
-        .conn()
-        .prepare("SELECT id, topic, summary, content FROM memories")?;
-    let rows: Vec<(String, String, String, String)> = stmt
-        .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    let total = rows.len();
+    let (total, embedded, errors) = stage_reindex_embeddings(store, config, embedder).await?;
     if total == 0 {
         return Ok(ReindexReport {
             total: 0,
             embedded: 0,
             errors: 0,
+            skipped_changed: 0,
         });
     }
-
-    // 4. Batch embed and STREAM each batch to a staging table so memory usage
-    // stays O(batch) rather than O(total). At 3072-dim floats, 100k memories
-    // would otherwise buffer >1GB before the swap — the staging table keeps
-    // it on disk and lets us drop batches as they're persisted.
-    schema::create_embed_staging(store.conn())?;
-    let mut embedded = 0usize;
-    let mut errors = 0usize;
-
-    for chunk in rows.chunks(50) {
-        let texts: Vec<String> = chunk
-            .iter()
-            .map(|(_, topic, summary, content)| {
-                crate::embed::prepend_metadata(topic, summary, content)
-            })
-            .collect();
-        let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-
-        match embedder.embed_batch(&text_refs).await {
-            Ok(embs) => {
-                if embs.len() != chunk.len() {
-                    tracing::warn!(
-                        "batch returned {} embeddings for {} inputs, skipping batch",
-                        embs.len(),
-                        chunk.len()
-                    );
-                    errors += chunk.len();
-                    continue;
-                }
-                // Persist this batch into the staging table inside its own short
-                // transaction — fast sequential appends, no buffered state across batches.
-                let tx_result: ReinResult<()> = (|| {
-                    store.conn().execute_batch("BEGIN")?;
-                    {
-                        let mut stmt = store.conn().prepare(
-                            "INSERT OR REPLACE INTO embed_staging(id, embedding) VALUES (?1, ?2)",
-                        )?;
-                        for (i, emb) in embs.iter().enumerate() {
-                            let id = &chunk[i].0;
-                            if emb.len() != config.embedding.dimensions {
-                                tracing::warn!(
-                                    "embedding for {id} has {} dims, expected {}",
-                                    emb.len(),
-                                    config.embedding.dimensions
-                                );
-                                errors += 1;
-                                continue;
-                            }
-                            let bytes: Vec<u8> = emb.iter().flat_map(|f| f.to_le_bytes()).collect();
-                            stmt.execute(rusqlite::params![id, bytes])?;
-                            embedded += 1;
-                        }
-                    }
-                    store.conn().execute_batch("COMMIT")?;
-                    Ok(())
-                })();
-                if let Err(e) = tx_result {
-                    let _ = store.conn().execute_batch("ROLLBACK");
-                    tracing::warn!("staging batch failed: {e}");
-                    errors += chunk.len();
-                }
-            }
-            Err(e) => {
-                tracing::warn!("batch embed failed: {e}");
-                errors += chunk.len();
-            }
-        }
-
-        eprintln!("[{}/{}] Reindexing...", embedded + errors, total);
-    }
-
     if errors > 0 {
-        // Clean up staging so a subsequent run starts fresh.
         let _ = store
             .conn()
             .execute_batch("DROP TABLE IF EXISTS embed_staging;");
         anyhow::bail!("embedding failed for {errors}/{total} memories; vector index NOT modified");
     }
 
-    // 5. Atomically replace vec_memories + embed_cache from the staging table.
-    // A failure here rolls back to the old index (staging is preserved for retry).
-    schema::replace_vector_index_from_staging(store.conn(), config.embedding.dimensions)?;
+    let skipped_changed = schema::replace_vector_index_from_staging_validated(
+        store.conn(),
+        config.embedding.dimensions,
+    )?;
 
     // 6. The embedding space just changed wholesale while the row COUNT
     // stayed identical, so the #17 count-delta recluster cadence gate
@@ -412,11 +347,196 @@ pub async fn reindex(store: &SqliteStore, config: &ReinConfig) -> anyhow::Result
         total,
         embedded,
         errors,
+        skipped_changed,
     })
+}
+
+/// Phase 1 of a reindex: embed every memory in batches into the on-disk
+/// `embed_staging` table (memory stays O(batch)), recording the hash of the
+/// exact text that was embedded. Returns `(total, embedded, errors)`.
+pub(crate) async fn stage_reindex_embeddings(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    embedder: &crate::embed::EmbedderKind,
+) -> anyhow::Result<(usize, usize, usize)> {
+    use crate::store::schema;
+    use crate::types::Embedder as _;
+
+    let mut stmt = store
+        .conn()
+        .prepare("SELECT id, topic, summary, content FROM memories")?;
+    let rows: Vec<(String, String, String, String)> = stmt
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let total = rows.len();
+    if total == 0 {
+        return Ok((0, 0, 0));
+    }
+
+    // 4. Batch embed and STREAM each batch to a staging table so memory usage
+    // stays O(batch) rather than O(total). At 3072-dim floats, 100k memories
+    // would otherwise buffer >1GB before the swap — the staging table keeps
+    // it on disk and lets us drop batches as they're persisted.
+    schema::create_embed_staging(store.conn())?;
+    let mut embedded = 0usize;
+    let mut errors = 0usize;
+
+    for chunk in rows.chunks(50) {
+        let texts: Vec<String> = chunk
+            .iter()
+            .map(|(_, topic, summary, content)| {
+                crate::embed::prepend_metadata(topic, summary, content)
+            })
+            .collect();
+        let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+
+        match embedder.embed_batch(&text_refs).await {
+            Ok(embs) => {
+                if embs.len() != chunk.len() {
+                    tracing::warn!(
+                        "batch returned {} embeddings for {} inputs, skipping batch",
+                        embs.len(),
+                        chunk.len()
+                    );
+                    errors += chunk.len();
+                    continue;
+                }
+                // Persist this batch into the staging table inside its own short
+                // transaction — fast sequential appends, no buffered state across batches.
+                let tx_result: ReinResult<()> = (|| {
+                    store.conn().execute_batch("BEGIN")?;
+                    {
+                        let mut stmt = store.conn().prepare(
+                            "INSERT OR REPLACE INTO embed_staging(id, embedding, text_hash) \
+                             VALUES (?1, ?2, ?3)",
+                        )?;
+                        for (i, emb) in embs.iter().enumerate() {
+                            let id = &chunk[i].0;
+                            if emb.len() != config.embedding.dimensions {
+                                tracing::warn!(
+                                    "embedding for {id} has {} dims, expected {}",
+                                    emb.len(),
+                                    config.embedding.dimensions
+                                );
+                                errors += 1;
+                                continue;
+                            }
+                            let bytes: Vec<u8> = emb.iter().flat_map(|f| f.to_le_bytes()).collect();
+                            stmt.execute(rusqlite::params![
+                                id,
+                                bytes,
+                                enriched_text_hash(&texts[i])
+                            ])?;
+                            embedded += 1;
+                        }
+                    }
+                    store.conn().execute_batch("COMMIT")?;
+                    Ok(())
+                })();
+                if let Err(e) = tx_result {
+                    let _ = store.conn().execute_batch("ROLLBACK");
+                    tracing::warn!("staging batch failed: {e}");
+                    errors += chunk.len();
+                }
+            }
+            Err(e) => {
+                tracing::warn!("batch embed failed: {e}");
+                errors += chunk.len();
+            }
+        }
+
+        eprintln!("[{}/{}] Reindexing...", embedded + errors, total);
+    }
+
+    Ok((total, embedded, errors))
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn reindex_swap_skips_rows_changed_after_staging() {
+        use crate::types::{
+            Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, MemoryTier, Source,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::ReinConfig::default();
+        let dims = config.embedding.dimensions;
+        let store = crate::store::SqliteStore::new(
+            &dir.path().join("memories.db"),
+            &config.embedding_model(),
+            dims,
+        )
+        .unwrap();
+        let now = chrono::Utc::now();
+        let make = |topic: &str| Memory {
+            id: ulid::Ulid::new().to_string(),
+            layer: MemoryLayer::LTM,
+            topic: topic.to_string(),
+            summary: format!("{topic} summary"),
+            content: format!("{topic} content before reindex"),
+            keywords: vec![],
+            importance: Importance::Medium,
+            source: Source::Manual,
+            strength: 1.0,
+            decay_lambda: 0.06,
+            access_count: 0,
+            superseded_by: None,
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: 1.0,
+            source_diversity: 1.0,
+            contradiction_score: 0.0,
+            related_ids: vec![],
+            concept_ids: vec![],
+            status: MemoryStatus::Active,
+            embedding: Some(vec![0.9; dims]),
+            tier: MemoryTier::Warm,
+            cluster_id: None,
+            archival_summary: None,
+            archival_summary_at: None,
+            archival_summary_version: None,
+            created_at: now,
+            updated_at: now,
+            last_accessed: now,
+        };
+        let edited_id = store.store(make("edited")).unwrap();
+        let stable_id = store.store(make("stable")).unwrap();
+        let embedder = crate::embed::EmbedderKind::Mock(
+            crate::embed::MockEmbedder::with_fixed_vector(dims, vec![0.25; dims]),
+        );
+
+        let (total, embedded, errors) = super::stage_reindex_embeddings(&store, &config, &embedder)
+            .await
+            .unwrap();
+        assert_eq!((total, embedded, errors), (2, 2, 0));
+
+        // A write lands between staging and the swap.
+        let mut edited = store.get(&edited_id).unwrap();
+        edited.content = "edited after staging".into();
+        store.update(&edited).unwrap();
+
+        let skipped =
+            crate::store::schema::replace_vector_index_from_staging_validated(store.conn(), dims)
+                .unwrap();
+        assert_eq!(skipped, 1);
+        let stable = crate::store::vec::get_embedding(store.conn(), &stable_id)
+            .unwrap()
+            .expect("unchanged row published");
+        assert!((stable[0] - 0.25).abs() < 1e-6);
+        assert!(
+            crate::store::vec::get_embedding(store.conn(), &edited_id)
+                .unwrap()
+                .is_none(),
+            "the stale embedding of the edited row is never published"
+        );
+    }
+
     use super::*;
     use tempfile::NamedTempFile;
 
