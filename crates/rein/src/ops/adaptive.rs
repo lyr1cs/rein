@@ -1015,13 +1015,85 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     let _ = run_adaptive_pipeline_with_trigger(store, config, "other");
 }
 
-/// Single-flight lock file next to the database. The suffix is appended to
-/// the full file name (not swapped for the extension) so `vault.db` and
-/// `vault.sqlite` never share a lock.
+/// Single-flight lock file next to the database. Derived from the physical
+/// database path (symlinks and relative spellings resolve to one lock; an
+/// absolute fallback covers a database that does not exist yet), with the
+/// suffix appended to the full file name so `vault.db` and `vault.sqlite`
+/// never share a lock.
 pub(crate) fn adaptive_pipeline_lock_path(db_path: &std::path::Path) -> std::path::PathBuf {
-    let mut name = db_path.as_os_str().to_os_string();
+    let physical = std::fs::canonicalize(db_path).unwrap_or_else(|_| {
+        if db_path.is_absolute() {
+            db_path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(db_path))
+                .unwrap_or_else(|_| db_path.to_path_buf())
+        }
+    });
+    let mut name = physical.as_os_str().to_os_string();
     name.push(".adaptive_pipeline.lock");
     std::path::PathBuf::from(name)
+}
+
+/// Portable single-flight guard for platforms without `flock`: an
+/// exclusively created sentinel file, removed on drop. A sentinel older than
+/// [`crate::ops::pipeline_run::PIPELINE_RUN_STALE_RUNNING_MS`] is treated as
+/// left behind by a crashed pass and taken over.
+pub(crate) struct SentinelLock {
+    path: std::path::PathBuf,
+}
+
+impl SentinelLock {
+    pub(crate) fn try_acquire(
+        path: &std::path::Path,
+        now: std::time::SystemTime,
+    ) -> std::io::Result<Option<Self>> {
+        match Self::create(path) {
+            Ok(lock) => Ok(Some(lock)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale_after = std::time::Duration::from_millis(
+                    crate::ops::pipeline_run::PIPELINE_RUN_STALE_RUNNING_MS as u64,
+                );
+                let abandoned = std::fs::metadata(path)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|modified| now.duration_since(modified).ok())
+                    .is_some_and(|age| age > stale_after);
+                if !abandoned {
+                    return Ok(None);
+                }
+                tracing::warn!(
+                    path = %path.display(),
+                    "adaptive pipeline: taking over an abandoned single-flight sentinel"
+                );
+                std::fs::remove_file(path)?;
+                match Self::create(path) {
+                    Ok(lock) => Ok(Some(lock)),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn create(path: &std::path::Path) -> std::io::Result<Self> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        let _ = write!(file, "{}", std::process::id());
+        Ok(Self {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+impl Drop for SentinelLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Run the pipeline and record it under `trigger` (`gc`, `consolidate`,
@@ -1087,18 +1159,33 @@ pub fn run_adaptive_pipeline_with_trigger(
                 return None;
             }
         }
-        #[cfg(not(unix))]
-        {
-            // Opening the file alone gives no mutual exclusion here; see the
-            // backlog entry for a cross-platform lock.
-            tracing::warn!(
-                "adaptive pipeline: single-flight lock is not enforced on this platform; overlapping passes are not prevented"
-            );
-        }
         Some(file)
     };
     // Held until it drops at the end of this function.
     let _pipeline_lock = pipeline_lock;
+    // Without `flock`, mutual exclusion comes from an exclusively created
+    // sentinel next to the lock file (stale sentinels are taken over).
+    #[cfg(not(unix))]
+    let _sentinel_lock: Option<SentinelLock> = if is_memory_db {
+        None
+    } else {
+        let sentinel_path = pipeline_lock_path.with_extension("sentinel");
+        match SentinelLock::try_acquire(&sentinel_path, std::time::SystemTime::now()) {
+            Ok(Some(lock)) => Some(lock),
+            Ok(None) => {
+                tracing::info!(
+                    "adaptive pipeline: another pass is running (single-flight sentinel); skipping"
+                );
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "adaptive pipeline: cannot create single-flight sentinel ({e}); skipping pass"
+                );
+                return None;
+            }
+        }
+    };
 
     let _span = tracing::info_span!("adaptive_pipeline").entered();
     // Single-flight losers above return before this point on purpose: only
@@ -5629,6 +5716,54 @@ mod tests {
             std::path::PathBuf::from("/tmp/vault.db.adaptive_pipeline.lock")
         );
         assert_ne!(db, sqlite);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pipeline_lock_path_resolves_symlinks_and_relative_spellings() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("vault.db");
+        std::fs::write(&real, b"").unwrap();
+        let link = dir.path().join("link.db");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let via_real = adaptive_pipeline_lock_path(&real);
+        let via_link = adaptive_pipeline_lock_path(&link);
+        assert_eq!(via_real, via_link, "one physical database, one lock");
+        let dotted = dir.path().join(".").join("vault.db");
+        assert_eq!(adaptive_pipeline_lock_path(&dotted), via_real);
+    }
+
+    #[test]
+    fn sentinel_lock_is_exclusive_released_on_drop_and_takes_over_stale_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipeline.sentinel");
+        let now = std::time::SystemTime::now();
+        let first = SentinelLock::try_acquire(&path, now)
+            .unwrap()
+            .expect("first acquire succeeds");
+        assert!(
+            SentinelLock::try_acquire(&path, now).unwrap().is_none(),
+            "second acquire is refused while the first is held"
+        );
+        drop(first);
+        assert!(!path.exists(), "sentinel removed on drop");
+        let again = SentinelLock::try_acquire(&path, now).unwrap();
+        assert!(again.is_some());
+        drop(again);
+
+        // A sentinel left behind by a crashed pass is taken over once it is
+        // older than the stale-running threshold.
+        std::fs::write(&path, b"12345").unwrap();
+        let far_future = now
+            + std::time::Duration::from_millis(
+                crate::ops::pipeline_run::PIPELINE_RUN_STALE_RUNNING_MS as u64 + 60_000,
+            );
+        assert!(SentinelLock::try_acquire(&path, now).unwrap().is_none());
+        let taken = SentinelLock::try_acquire(&path, far_future)
+            .unwrap()
+            .expect("stale sentinel taken over");
+        drop(taken);
+        assert!(!path.exists());
     }
 
     #[test]

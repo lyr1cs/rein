@@ -285,7 +285,7 @@ pub async fn backfill_missing_vec_rows(
         if let Some(staged) =
             stage_migration(store, embedder, &model, dims, pending, &mut report).await
         {
-            publish_migration(store, &model, &provenance, &existing, staged, &mut report);
+            publish_migration(store, &model, &provenance, staged, &mut report);
         }
         return report;
     }
@@ -557,7 +557,6 @@ pub(crate) fn publish_migration(
     store: &SqliteStore,
     model: &str,
     provenance: &str,
-    existing: &std::collections::HashSet<String>,
     staged: Vec<StagedRow>,
     report: &mut WarmupReport,
 ) {
@@ -568,6 +567,11 @@ pub(crate) fn publish_migration(
     let mut publish = || -> crate::types::ReinResult<()> {
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> crate::types::ReinResult<()> {
+            // Enumerate the table under the write lock, not from the
+            // pre-migration snapshot: a row inserted while embeddings were
+            // being computed is of unknown model and must not survive the
+            // provenance stamp.
+            let live_ids = crate::store::vec::list_embedding_ids(conn)?;
             let mut published_ids: std::collections::HashSet<&str> =
                 std::collections::HashSet::with_capacity(staged.len());
             for row in &staged {
@@ -575,10 +579,10 @@ pub(crate) fn publish_migration(
                     skipped += 1;
                     continue;
                 }
-                replace_embedding_row(conn, &row.id, &row.embedding, existing.contains(&row.id))?;
+                replace_embedding_row(conn, &row.id, &row.embedding, live_ids.contains(&row.id))?;
                 published_ids.insert(row.id.as_str());
             }
-            for stale in existing
+            for stale in live_ids
                 .iter()
                 .filter(|id| !published_ids.contains(id.as_str()))
             {
@@ -2630,7 +2634,6 @@ mod tests {
             ids.push(store.store(memory).unwrap());
         }
         store.conn().execute("DELETE FROM embed_cache", []).unwrap();
-        let existing = crate::store::vec::list_embedding_ids(store.conn()).unwrap();
         let mut pending = Vec::new();
         store
             .for_each_for_warmup(|row| {
@@ -2660,9 +2663,20 @@ mod tests {
         deprecated.status = MemoryStatus::Deprecated;
         store.update(&deprecated).unwrap();
 
-        let provenance = format!("{model}:{dims}");
-        publish_migration(&store, &model, &provenance, &existing, staged, &mut report);
+        // A vector inserted by another writer while embeddings were being
+        // computed is of unknown model: it must not survive the stamp.
+        crate::store::vec::insert_embedding(store.conn(), "concurrent-unknown", &vec![0.7; dims])
+            .unwrap();
 
+        let provenance = format!("{model}:{dims}");
+        publish_migration(&store, &model, &provenance, staged, &mut report);
+
+        assert!(
+            crate::store::vec::get_embedding(store.conn(), "concurrent-unknown")
+                .unwrap()
+                .is_none(),
+            "rows of unknown model are dropped before provenance is stamped"
+        );
         assert_eq!(report.revalidation_skipped, 2, "{report:?}");
         assert_eq!(report.rows_added(), 1);
         let untouched = crate::store::vec::get_embedding(store.conn(), &ids[2])
