@@ -157,6 +157,7 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
                             checks.push(check_dedup_threshold_observability(&store, config));
                             checks.push(check_recall_fusion_calibration(&store, config));
                             checks.push(check_a12_input_epoch(&store));
+                            checks.push(check_adaptive_pipeline_last_run(&store));
                             // v0.27.x judge checks
                             checks.push(check_judge_calibration(&store, config));
                             checks.push(check_judge_call_ledger(&store, config));
@@ -3153,6 +3154,83 @@ fn check_recall_fusion_calibration(
 /// --fix` re-baselines a malformed row only together with invalidating the
 /// active A12 calibration so no sealed run can serve against an untrusted
 /// counter.
+/// Surface the last `run_adaptive_pipeline` pass recorded by
+/// [`crate::ops::pipeline_run`]: outcome, age, total time and the slowest
+/// stages. Warns when the pipeline never ran, failed, or has reported
+/// `running` for longer than six hours (a killed pass).
+fn check_adaptive_pipeline_last_run(store: &crate::store::SqliteStore) -> DoctorCheck {
+    check_adaptive_pipeline_last_run_at(store, chrono::Utc::now().timestamp_millis())
+}
+
+fn check_adaptive_pipeline_last_run_at(
+    store: &crate::store::SqliteStore,
+    now_unix_ms: i64,
+) -> DoctorCheck {
+    use crate::ops::pipeline_run::{
+        load_last_run, PipelineRunOutcome, PIPELINE_RUN_STALE_RUNNING_MS,
+    };
+
+    let Some(record) = load_last_run(store.conn()) else {
+        let mut check = warn_in(
+            DoctorCategory::Storage,
+            "adaptive_pipeline_last_run",
+            "adaptive pipeline has never completed a recorded pass on this database",
+        );
+        check.repair_hint = Some(
+            "Run `rein gc --threshold 0` (or any consolidate/dedup pass) to run the adaptive pipeline without pruning memories."
+                .to_string(),
+        );
+        return check;
+    };
+    let age_secs = now_unix_ms.saturating_sub(record.started_at_unix_ms).max(0) / 1000;
+    let summary = format!(
+        "{} trigger={} started {}s ago",
+        record.summary_line(now_unix_ms),
+        record.trigger,
+        age_secs
+    );
+    match record.outcome {
+        PipelineRunOutcome::Completed | PipelineRunOutcome::SkippedDisabled => ok_in(
+            DoctorCategory::Storage,
+            "adaptive_pipeline_last_run",
+            summary,
+        ),
+        PipelineRunOutcome::Failed => {
+            let mut check = warn_in(
+                DoctorCategory::Storage,
+                "adaptive_pipeline_last_run",
+                summary,
+            );
+            check.repair_hint = Some(
+                "Inspect the failed stage detail above, fix the cause, and re-run `rein gc --threshold 0`."
+                    .to_string(),
+            );
+            check
+        }
+        PipelineRunOutcome::Running => {
+            if now_unix_ms.saturating_sub(record.started_at_unix_ms) > PIPELINE_RUN_STALE_RUNNING_MS
+            {
+                let mut check = warn_in(
+                    DoctorCategory::Storage,
+                    "adaptive_pipeline_last_run",
+                    format!("{summary}; still `running` after more than six hours, the process was probably killed"),
+                );
+                check.repair_hint = Some(
+                    "Confirm no `rein gc` process is alive, then re-run `rein gc --threshold 0`; the single-flight lock releases with the process."
+                        .to_string(),
+                );
+                check
+            } else {
+                ok_in(
+                    DoctorCategory::Storage,
+                    "adaptive_pipeline_last_run",
+                    summary,
+                )
+            }
+        }
+    }
+}
+
 fn check_a12_input_epoch(store: &crate::store::SqliteStore) -> DoctorCheck {
     use rusqlite::OptionalExtension;
 
@@ -5105,6 +5183,68 @@ provider = "inherit"
             .as_deref()
             .unwrap_or_default()
             .contains("--fix"));
+    }
+
+    #[test]
+    fn adaptive_pipeline_last_run_never_run_warns() {
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+        let check = check_adaptive_pipeline_last_run(&store);
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.message.contains("never completed"));
+        assert!(check
+            .repair_hint
+            .as_deref()
+            .unwrap_or_default()
+            .contains("rein gc --threshold 0"));
+    }
+
+    #[test]
+    fn adaptive_pipeline_last_run_completed_is_ok() {
+        use crate::ops::pipeline_run::{PipelineRunOutcome, PipelineRunRecorder};
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+        let recorder = PipelineRunRecorder::start(&store, "gc");
+        recorder.stage("m4_cluster", || ());
+        recorder.finish(PipelineRunOutcome::Completed, None);
+        let check = check_adaptive_pipeline_last_run(&store);
+        assert_eq!(check.status, CheckStatus::Ok);
+        assert!(check.message.contains("completed"));
+        assert!(check.message.contains("trigger=gc"));
+        assert!(check.message.contains("m4_cluster"));
+    }
+
+    #[test]
+    fn adaptive_pipeline_last_run_stale_running_warns() {
+        use crate::ops::pipeline_run::{PipelineRunRecorder, PIPELINE_RUN_STALE_RUNNING_MS};
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+        let recorder = PipelineRunRecorder::start(&store, "gc");
+        recorder.stage("m4_cluster", || ());
+        let started = recorder.record().started_at_unix_ms;
+        let fresh = check_adaptive_pipeline_last_run_at(&store, started + 1_000);
+        assert_eq!(
+            fresh.status,
+            CheckStatus::Ok,
+            "a young running pass is fine"
+        );
+        let stale = check_adaptive_pipeline_last_run_at(
+            &store,
+            started + PIPELINE_RUN_STALE_RUNNING_MS + 1,
+        );
+        assert_eq!(stale.status, CheckStatus::Warn);
+        assert!(stale.message.contains("probably killed"));
+    }
+
+    #[test]
+    fn adaptive_pipeline_last_run_failed_warns_with_error() {
+        use crate::ops::pipeline_run::{PipelineRunOutcome, PipelineRunRecorder};
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+        let recorder = PipelineRunRecorder::start(&store, "dedup");
+        recorder.finish(
+            PipelineRunOutcome::Failed,
+            Some("snapshot save failed".into()),
+        );
+        let check = check_adaptive_pipeline_last_run(&store);
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.message.contains("error=snapshot save failed"));
     }
 
     #[test]

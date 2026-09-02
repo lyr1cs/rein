@@ -2094,6 +2094,8 @@ pub fn adaptive_status_with_config(store: &SqliteStore, config: &ReinConfig) -> 
         "ars_acceleration": ars_acceleration,
         "recall_fusion_calibration": recall_fusion_calibration,
         "judge_calibration": judge_calibration,
+        "pipeline_last_run": crate::ops::pipeline_run::load_last_run(conn)
+            .map(|record| serde_json::to_value(record).unwrap_or(serde_json::Value::Null)),
     })
 }
 

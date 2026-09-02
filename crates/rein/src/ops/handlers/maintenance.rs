@@ -219,6 +219,18 @@ pub struct GcOutput {
     pub concepts: u64,
     pub dry_run: bool,
     pub threshold: f64,
+    /// The adaptive pipeline pass this gc triggered (absent for dry runs and
+    /// when the pipeline skipped because another pass held the lock).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<crate::ops::pipeline_run::PipelineRunRecord>,
+}
+
+impl GcOutput {
+    fn pipeline_summary(&self) -> Option<String> {
+        self.pipeline
+            .as_ref()
+            .map(|record| record.summary_line(chrono::Utc::now().timestamp_millis()))
+    }
 }
 
 impl IntoJson for GcOutput {
@@ -248,6 +260,10 @@ impl IntoMarkdown for GcOutput {
             if self.concepts > 0 {
                 s.push_str(&format!(", {} low-quality concepts", self.concepts));
             }
+            if let Some(summary) = self.pipeline_summary() {
+                s.push_str("\n");
+                s.push_str(&summary);
+            }
             s
         }
     }
@@ -273,6 +289,10 @@ impl IntoCliText for GcOutput {
             );
             if self.concepts > 0 {
                 s.push_str(&format!(", {} low-quality concepts", self.concepts));
+            }
+            if let Some(summary) = self.pipeline_summary() {
+                s.push_str("\n");
+                s.push_str(&summary);
             }
             s
         }
@@ -301,12 +321,21 @@ impl OpsRuntime {
         self.with_store(|store| {
             let (decayed, pruned, concepts) =
                 crate::ops::run_gc_adaptive(store, &config, threshold, dry_run)?;
+            let pipeline = if dry_run {
+                None
+            } else {
+                // Only report a record written by this process: a peer holding
+                // the single-flight lock leaves its own (older) row in place.
+                crate::ops::pipeline_run::load_last_run(store.conn())
+                    .filter(|record| record.pid == std::process::id())
+            };
             Ok(GcOutput {
                 decayed,
                 pruned,
                 concepts,
                 dry_run,
                 threshold,
+                pipeline,
             })
         })
     }
