@@ -374,7 +374,7 @@ async fn migrate_live_rows(
             let texts: Vec<&str> = chunk.iter().map(|(_, text)| text.as_str()).collect();
             match embedder.embed_batch(&texts).await {
                 Ok(embeddings) if embeddings.len() == chunk.len() => {
-                    for ((id, text), embedding) in chunk.iter().zip(embeddings.into_iter()) {
+                    for ((id, text), embedding) in chunk.iter().zip(embeddings) {
                         if embedding.len() != dims {
                             report.errors += 1;
                             continue;
