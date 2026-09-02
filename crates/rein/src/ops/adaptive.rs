@@ -1021,6 +1021,11 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
 /// suffix appended to the full file name so `vault.db` and `vault.sqlite`
 /// never share a lock.
 pub(crate) fn adaptive_pipeline_lock_path(db_path: &std::path::Path) -> std::path::PathBuf {
+    database_lock_path(db_path, ".adaptive_pipeline.lock")
+}
+
+/// `<physical database path><suffix>` — shared by every database-scoped lock.
+pub(crate) fn database_lock_path(db_path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
     let physical = std::fs::canonicalize(db_path).unwrap_or_else(|_| {
         if db_path.is_absolute() {
             db_path.to_path_buf()
@@ -1031,7 +1036,7 @@ pub(crate) fn adaptive_pipeline_lock_path(db_path: &std::path::Path) -> std::pat
         }
     });
     let mut name = physical.as_os_str().to_os_string();
-    name.push(".adaptive_pipeline.lock");
+    name.push(suffix);
     std::path::PathBuf::from(name)
 }
 
@@ -1039,13 +1044,10 @@ pub(crate) fn adaptive_pipeline_lock_path(db_path: &std::path::Path) -> std::pat
 /// exclusively created sentinel file, removed on drop. A sentinel older than
 /// [`crate::ops::pipeline_run::PIPELINE_RUN_STALE_RUNNING_MS`] is treated as
 /// left behind by a crashed pass and taken over.
-// Only the non-unix single-flight path constructs it; unix uses flock.
-#[cfg_attr(unix, allow(dead_code))]
 pub(crate) struct SentinelLock {
     path: std::path::PathBuf,
 }
 
-#[cfg_attr(unix, allow(dead_code))]
 impl SentinelLock {
     pub(crate) fn try_acquire(
         path: &std::path::Path,

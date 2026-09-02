@@ -166,6 +166,7 @@ pub async fn migrate_from_qmd<E: crate::types::Embedder>(
 }
 
 /// Report summarizing a reindex run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReindexReport {
     pub total: usize,
     pub embedded: usize,
@@ -197,22 +198,69 @@ pub(crate) fn enriched_text_hash(text: &str) -> String {
 /// 1. Rebuilds the vector index (drops old vec_memories, creates new with current dims)
 /// 2. Fetches all memories and batch-embeds them
 /// 3. Clears the embed_cache (old model's cache)
+/// Which memories a reindex re-embeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReindexScope {
+    /// Every row, as `rein migrate --reindex` always did.
+    All,
+    /// `status IN ('active', 'updated')` only: what warmup's automatic model
+    /// migration covers. Deprecated rows get no vector (they are filtered out
+    /// of vector recall anyway and must not crowd HNSW candidates).
+    Live,
+}
+
+impl ReindexScope {
+    fn sql_filter(self) -> &'static str {
+        match self {
+            Self::All => "",
+            Self::Live => " WHERE status IN ('active', 'updated')",
+        }
+    }
+}
+
 pub async fn reindex(store: &SqliteStore, config: &ReinConfig) -> anyhow::Result<ReindexReport> {
     let embedder = crate::embed::create_embedder(config).ok_or_else(|| {
         anyhow::anyhow!("no embedding provider configured (set provider and API key)")
     })?;
-    reindex_with_embedder(store, config, &embedder).await
+    reindex_with_embedder(store, config, &embedder, ReindexScope::All).await
+}
+
+/// Lock file serializing reindex runs against one physical database across
+/// processes (warmup migrations and `migrate --reindex` alike).
+fn reindex_lock_path(db_path: &std::path::Path) -> std::path::PathBuf {
+    crate::ops::adaptive::database_lock_path(db_path, ".reindex.lock")
 }
 
 /// [`reindex`] with an explicit provider (warmup's model migration and tests
-/// inject theirs).
+/// inject theirs) and scope.
 pub async fn reindex_with_embedder(
     store: &SqliteStore,
     config: &ReinConfig,
     embedder: &crate::embed::EmbedderKind,
+    scope: ReindexScope,
 ) -> anyhow::Result<ReindexReport> {
     use crate::store::schema;
     use crate::types::Embedder as _;
+
+    // One reindex per database at a time: two processes racing through the
+    // shared `embed_staging` table could interleave batches from different
+    // models and stamp the mixture as one model.
+    let _reindex_lock = if store.db_path().to_str() == Some(":memory:") {
+        None
+    } else {
+        match crate::ops::adaptive::SentinelLock::try_acquire(
+            &reindex_lock_path(store.db_path()),
+            std::time::SystemTime::now(),
+        ) {
+            Ok(Some(lock)) => Some(lock),
+            Ok(None) => anyhow::bail!(
+                "another reindex is in progress for this database; vector index NOT modified"
+            ),
+            Err(e) => {
+                anyhow::bail!("cannot acquire the reindex lock: {e}; vector index NOT modified")
+            }
+        }
+    };
 
     let test_result = embedder.embed("health check").await;
     if let Err(e) = test_result {
@@ -221,7 +269,8 @@ pub async fn reindex_with_embedder(
         ));
     }
 
-    let (total, embedded, errors) = stage_reindex_embeddings(store, config, embedder).await?;
+    let (total, embedded, errors) =
+        stage_reindex_embeddings(store, config, embedder, scope).await?;
     if total == 0 {
         return Ok(ReindexReport {
             total: 0,
@@ -237,10 +286,22 @@ pub async fn reindex_with_embedder(
         anyhow::bail!("embedding failed for {errors}/{total} memories; vector index NOT modified");
     }
 
+    let provenance = format!(
+        "{}:{}",
+        config.embedding_model(),
+        config.embedding.dimensions
+    );
     let skipped_changed = schema::replace_vector_index_from_staging_validated(
         store.conn(),
         config.embedding.dimensions,
+        Some(&provenance),
     )?;
+    // The vector table just changed; until the rebuild at the end succeeds
+    // the on-disk HNSW is stale. Flag it now so an interruption in the
+    // cluster reset below still leaves the index marked for rebuild.
+    if store.db_path().to_str() != Some(":memory:") {
+        crate::store::hnsw::HnswIndex::mark_dirty(&store.db_path().with_extension(""));
+    }
 
     // 6. The embedding space just changed wholesale while the row COUNT
     // stayed identical, so the #17 count-delta recluster cadence gate
@@ -358,13 +419,15 @@ pub(crate) async fn stage_reindex_embeddings(
     store: &SqliteStore,
     config: &ReinConfig,
     embedder: &crate::embed::EmbedderKind,
+    scope: ReindexScope,
 ) -> anyhow::Result<(usize, usize, usize)> {
     use crate::store::schema;
     use crate::types::Embedder as _;
 
-    let mut stmt = store
-        .conn()
-        .prepare("SELECT id, topic, summary, content FROM memories")?;
+    let mut stmt = store.conn().prepare(&format!(
+        "SELECT id, topic, summary, content FROM memories{}",
+        scope.sql_filter()
+    ))?;
     let rows: Vec<(String, String, String, String)> = stmt
         .query_map([], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
@@ -459,6 +522,87 @@ pub(crate) async fn stage_reindex_embeddings(
 mod tests {
     #[cfg(feature = "test-support")]
     #[tokio::test]
+    async fn live_scope_reindex_skips_deprecated_rows_and_is_serialized() {
+        use crate::types::{
+            Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, MemoryTier, Source,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::ReinConfig::default();
+        let dims = config.embedding.dimensions;
+        let db_path = dir.path().join("memories.db");
+        let store =
+            crate::store::SqliteStore::new(&db_path, &config.embedding_model(), dims).unwrap();
+        let now = chrono::Utc::now();
+        let make = |topic: &str, status: MemoryStatus| Memory {
+            id: ulid::Ulid::new().to_string(),
+            layer: MemoryLayer::LTM,
+            topic: topic.to_string(),
+            summary: format!("{topic} summary"),
+            content: format!("{topic} content"),
+            keywords: vec![],
+            importance: Importance::Medium,
+            source: Source::Manual,
+            strength: 1.0,
+            decay_lambda: 0.06,
+            access_count: 0,
+            superseded_by: None,
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: 1.0,
+            source_diversity: 1.0,
+            contradiction_score: 0.0,
+            related_ids: vec![],
+            concept_ids: vec![],
+            status,
+            embedding: None,
+            tier: MemoryTier::Warm,
+            cluster_id: None,
+            archival_summary: None,
+            archival_summary_at: None,
+            archival_summary_version: None,
+            created_at: now,
+            updated_at: now,
+            last_accessed: now,
+        };
+        store.store(make("live", MemoryStatus::Active)).unwrap();
+        store.store(make("gone", MemoryStatus::Deprecated)).unwrap();
+        let embedder = crate::embed::EmbedderKind::Mock(
+            crate::embed::MockEmbedder::with_fixed_vector(dims, vec![0.25; dims]),
+        );
+
+        let (total, _, _) =
+            super::stage_reindex_embeddings(&store, &config, &embedder, super::ReindexScope::Live)
+                .await
+                .unwrap();
+        assert_eq!(total, 1, "deprecated rows are not embedded in Live scope");
+        let (all, _, _) =
+            super::stage_reindex_embeddings(&store, &config, &embedder, super::ReindexScope::All)
+                .await
+                .unwrap();
+        assert_eq!(all, 2);
+
+        // A concurrent reindex holding the sentinel makes this one bail out
+        // before touching anything.
+        let held = crate::ops::adaptive::SentinelLock::try_acquire(
+            &super::reindex_lock_path(&db_path),
+            std::time::SystemTime::now(),
+        )
+        .unwrap()
+        .expect("lock acquired");
+        let err =
+            super::reindex_with_embedder(&store, &config, &embedder, super::ReindexScope::Live)
+                .await
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("another reindex is in progress"),
+            "{err}"
+        );
+        drop(held);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
     async fn reindex_swap_skips_rows_changed_after_staging() {
         use crate::types::{
             Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, MemoryTier, Source,
@@ -511,9 +655,10 @@ mod tests {
             crate::embed::MockEmbedder::with_fixed_vector(dims, vec![0.25; dims]),
         );
 
-        let (total, embedded, errors) = super::stage_reindex_embeddings(&store, &config, &embedder)
-            .await
-            .unwrap();
+        let (total, embedded, errors) =
+            super::stage_reindex_embeddings(&store, &config, &embedder, super::ReindexScope::All)
+                .await
+                .unwrap();
         assert_eq!((total, embedded, errors), (2, 2, 0));
 
         // A write lands between staging and the swap.
@@ -521,10 +666,25 @@ mod tests {
         edited.content = "edited after staging".into();
         store.update(&edited).unwrap();
 
-        let skipped =
-            crate::store::schema::replace_vector_index_from_staging_validated(store.conn(), dims)
-                .unwrap();
+        let skipped = crate::store::schema::replace_vector_index_from_staging_validated(
+            store.conn(),
+            dims,
+            Some("test-model:3072"),
+        )
+        .unwrap();
         assert_eq!(skipped, 1);
+        let stamped: String = store
+            .conn()
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?1",
+                rusqlite::params![crate::store::schema::VEC_ROWS_PROVENANCE_KEY],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stamped, "test-model:3072",
+            "provenance stamped inside the swap"
+        );
         let stable = crate::store::vec::get_embedding(store.conn(), &stable_id)
             .unwrap()
             .expect("unchanged row published");

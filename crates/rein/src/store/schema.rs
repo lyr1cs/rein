@@ -2251,8 +2251,13 @@ pub fn create_embed_staging(conn: &Connection) -> ReinResult<()> {
 /// staging table; on failure the old index is preserved by rollback and the
 /// staging table remains (caller can retry or clean up).
 pub fn replace_vector_index_from_staging(conn: &Connection, dims: usize) -> ReinResult<()> {
-    replace_vector_index_from_staging_validated(conn, dims).map(|_| ())
+    replace_vector_index_from_staging_validated(conn, dims, None).map(|_| ())
 }
+
+/// Metadata key recording `"<model>:<dims>"` of the vector rows (see
+/// `search::warmup`). Written inside the swap savepoint so the table and its
+/// provenance can never disagree.
+pub const VEC_ROWS_PROVENANCE_KEY: &str = "vec_rows_provenance";
 
 /// [`replace_vector_index_from_staging`] that also revalidates every staged
 /// row against the current `memories` text: a row whose `text_hash` no longer
@@ -2262,6 +2267,7 @@ pub fn replace_vector_index_from_staging(conn: &Connection, dims: usize) -> Rein
 pub fn replace_vector_index_from_staging_validated(
     conn: &Connection,
     dims: usize,
+    provenance: Option<&str>,
 ) -> ReinResult<usize> {
     let row_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM embed_staging", [], |r| r.get(0))
@@ -2321,6 +2327,13 @@ pub fn replace_vector_index_from_staging_validated(
              ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + ?2 AS TEXT)",
             rusqlite::params![crate::store::vec::EMBEDDING_WRITE_SEQ_KEY, row_count],
         )?;
+        if let Some(provenance) = provenance {
+            conn.execute(
+                "INSERT INTO metadata(key, value) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![VEC_ROWS_PROVENANCE_KEY, provenance],
+            )?;
+        }
         conn.execute_batch("DROP TABLE embed_staging;")?;
         conn.execute_batch("RELEASE replace_vector_index_staged")?;
         Ok(())

@@ -294,12 +294,19 @@ pub async fn backfill_missing_vec_rows(
             );
             return report;
         };
-        match crate::store::migrate::reindex_with_embedder(store, config, embedder).await {
+        match crate::store::migrate::reindex_with_embedder(
+            store,
+            config,
+            embedder,
+            crate::store::migrate::ReindexScope::Live,
+        )
+        .await
+        {
             Ok(reindex) => {
+                // Provenance was stamped inside the swap savepoint.
                 report.embedded = reindex.embedded.saturating_sub(reindex.skipped_changed);
                 report.revalidation_skipped = reindex.skipped_changed;
                 report.vector_table_replaced = true;
-                write_metadata(store, VEC_ROWS_PROVENANCE_KEY, &provenance);
             }
             Err(e) => {
                 tracing::warn!("warmup: model migration failed, vector rows left untouched: {e}");
@@ -483,8 +490,8 @@ pub fn stamp_vec_rows_provenance(store: &SqliteStore, config: &ReinConfig) {
     write_metadata(store, VEC_ROWS_PROVENANCE_KEY, &provenance);
 }
 
-/// Metadata key recording `"<model>:<dims>"` of the last complete warmup.
-pub const VEC_ROWS_PROVENANCE_KEY: &str = "vec_rows_provenance";
+/// Metadata key recording `"<model>:<dims>"` of the vector rows.
+pub use crate::store::schema::VEC_ROWS_PROVENANCE_KEY;
 
 fn read_metadata(store: &SqliteStore, key: &str) -> Option<String> {
     use rusqlite::OptionalExtension;
