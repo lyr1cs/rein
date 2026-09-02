@@ -3,6 +3,7 @@
 //! dedup shadow suggestions.
 
 use crate::config::ReinConfig;
+use crate::ops::pipeline_run::{PipelineRunOutcome, PipelineRunRecorder};
 use crate::store::SqliteStore;
 use crate::types::traits::MemoryStore;
 use crate::types::{ReinError, ReinResult};
@@ -560,6 +561,7 @@ fn refresh_a12_calibration(
     config: &ReinConfig,
     durable_state: &crate::store::adaptive::AdaptiveState,
     calibrated_at: chrono::DateTime<chrono::Utc>,
+    recorder: Option<&PipelineRunRecorder<'_>>,
 ) -> ReinResult<A12CalibrationRefreshOutcome> {
     refresh_a12_calibration_with(
         store,
@@ -567,10 +569,31 @@ fn refresh_a12_calibration(
         durable_state,
         calibrated_at,
         |inputs, calibrated_at| {
-            let corpus = crate::ops::a12_autocalibration::build_a12_loo_corpus(
-                store,
-                inputs.hard_dedup_bound(),
-            )?;
+            let build = || {
+                crate::ops::a12_autocalibration::build_a12_loo_corpus(
+                    store,
+                    inputs.hard_dedup_bound(),
+                )
+            };
+            let corpus = match recorder {
+                Some(recorder) => recorder.stage_result("a12_corpus_build", build)?,
+                None => build()?,
+            };
+            if let Some(recorder) = recorder {
+                recorder.annotate(
+                    "a12_corpus_build",
+                    format!(
+                        "families={} cases={} abstentions={}",
+                        corpus.observations.len(),
+                        corpus
+                            .observations
+                            .iter()
+                            .map(|observation| observation.cases.len())
+                            .sum::<usize>(),
+                        corpus.abstentions.len()
+                    ),
+                );
+            }
             if corpus.source_snapshot_fingerprint != inputs.source_snapshot_fingerprint {
                 return Err(ReinError::Config(format!(
                     "A12 corpus snapshot mismatch: pending={} corpus={}",
@@ -579,14 +602,23 @@ fn refresh_a12_calibration(
             }
             let corpus_fingerprint =
                 crate::ops::a12_autocalibration::a12_corpus_fingerprint(&corpus)?;
-            let scopes = crate::ops::a12_autocalibration::train_and_evaluate_a12_corpus(
-                store,
-                config,
-                &corpus,
-                inputs.trace_limit,
-                inputs.min_samples_alpha,
-                calibrated_at,
-            )?;
+            let train = || {
+                crate::ops::a12_autocalibration::train_and_evaluate_a12_corpus(
+                    store,
+                    config,
+                    &corpus,
+                    inputs.trace_limit,
+                    inputs.min_samples_alpha,
+                    calibrated_at,
+                )
+            };
+            let scopes = match recorder {
+                Some(recorder) => recorder.stage_result("a12_train_and_evaluate", train)?,
+                None => train()?,
+            };
+            if let Some(recorder) = recorder {
+                recorder.annotate("a12_train_and_evaluate", format!("scopes={}", scopes.len()));
+            }
             Ok(A12CalibrationBatch {
                 corpus_fingerprint,
                 scopes,
@@ -599,7 +631,11 @@ fn refresh_a12_calibration(
 /// Restore the durable post-CAS AdaptiveState and run every policy-producing
 /// refresh from that exact state. `save_snapshot` may merge with a concurrent
 /// writer, so the caller's in-memory value is not authoritative after success.
-fn run_post_snapshot_refreshes(store: &SqliteStore, config: &ReinConfig) {
+fn run_post_snapshot_refreshes(
+    store: &SqliteStore,
+    config: &ReinConfig,
+    recorder: &PipelineRunRecorder<'_>,
+) {
     let Some(durable_state) = crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn())
     else {
         tracing::warn!(
@@ -616,17 +652,21 @@ fn run_post_snapshot_refreshes(store: &SqliteStore, config: &ReinConfig) {
         .saturating_mul(2)
         .saturating_mul(24 * 60 * 60)
         .min(i64::MAX as u64) as i64;
-    if let Err(error) = crate::eval::gates::dedup::refresh_dedup_calibration_policy(
-        store,
-        config.search.dedup_similarity as f32,
-        durable_state.get_dedup_shadow_threshold(None),
-        now.timestamp(),
-        validity_secs,
-    ) {
+    if let Err(error) = recorder.stage_result("dedup_calibration_refresh", || {
+        crate::eval::gates::dedup::refresh_dedup_calibration_policy(
+            store,
+            config.search.dedup_similarity as f32,
+            durable_state.get_dedup_shadow_threshold(None),
+            now.timestamp(),
+            validity_secs,
+        )
+    }) {
         tracing::warn!(%error, "dedup calibration bundle refresh skipped");
     }
 
-    match refresh_a12_calibration(store, config, &durable_state, now) {
+    match recorder.stage_result("a12_refresh", || {
+        refresh_a12_calibration(store, config, &durable_state, now, Some(recorder))
+    }) {
         Ok(A12CalibrationRefreshOutcome::CompleteSaved) => {
             tracing::debug!("A12 calibration pending barrier replaced by completed revision")
         }
@@ -651,7 +691,9 @@ fn run_post_snapshot_refreshes(store: &SqliteStore, config: &ReinConfig) {
 
     // Policy refresh is last: it can only resolve the A12 revision that won
     // the final CAS (or the active empty pending barrier after a failure).
-    refresh_ars_parameter_policy(store.conn(), config, &durable_state);
+    recorder.stage("policy_refresh", || {
+        refresh_ars_parameter_policy(store.conn(), config, &durable_state)
+    });
 }
 
 fn persist_ars_effective_scalars(
@@ -948,7 +990,16 @@ fn useful_rate_weights_from_signal_hint_priors(
 /// Order: M4 (HDBSCAN) → M3 (Survival) → M5 (Tiering) → M2 (Alpha) → persist.
 /// Each step is gated by readiness checks; failures skip subsequent steps.
 pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
+    run_adaptive_pipeline_with_trigger(store, config, "other");
+}
+
+/// Run the pipeline and record it under `trigger` (`gc`, `consolidate`,
+/// `dedup`, `other`) in the `adaptive_pipeline_last_run` metadata row. See
+/// [`crate::ops::pipeline_run`].
+pub fn run_adaptive_pipeline_with_trigger(store: &SqliteStore, config: &ReinConfig, trigger: &str) {
     if !config.adaptive.enabled {
+        let recorder = PipelineRunRecorder::start(store, trigger);
+        recorder.finish(PipelineRunOutcome::SkippedDisabled, None);
         return;
     }
 
@@ -1002,6 +1053,9 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     let _pipeline_lock = pipeline_lock;
 
     let _span = tracing::info_span!("adaptive_pipeline").entered();
+    // Single-flight losers above return before this point on purpose: only
+    // the process holding the lock may overwrite the last-run record.
+    let recorder = PipelineRunRecorder::start(store, trigger);
 
     // Restore or create AdaptiveState
     let mut state =
@@ -1028,30 +1082,50 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // vectors HDBSCAN never saw would be recorded as covered (codex R5).
     let embedding_write_seq = crate::store::vec::embedding_write_seq(store.conn());
     if embeddings_count >= 50 && should_recluster(&state, embeddings_count, embedding_write_seq) {
-        run_hdbscan_clustering(
-            store,
-            &mut state,
-            embeddings_count as usize,
-            embedding_write_seq,
+        recorder.stage("m4_cluster", || {
+            run_hdbscan_clustering(
+                store,
+                &mut state,
+                embeddings_count as usize,
+                embedding_write_seq,
+            )
+        });
+        recorder.annotate(
+            "m4_cluster",
+            format!(
+                "embeddings={embeddings_count} clusters={}",
+                state.memory_clusters.len()
+            ),
+        );
+    } else {
+        recorder.skip(
+            "m4_cluster",
+            &format!("recluster gate not met (embeddings={embeddings_count})"),
         );
     }
 
     // Step 1b: A1 — Compute non-destructive per-cluster dedup suggestions
     if !state.memory_clusters.is_empty() {
-        compute_per_cluster_dedup_thresholds(store, &mut state);
+        recorder.stage("a1_dedup_suggestions", || {
+            compute_per_cluster_dedup_thresholds(store, &mut state)
+        });
+    } else {
+        recorder.skip("a1_dedup_suggestions", "no clusters");
     }
 
     // Step 1c: v0.23 — per-cluster + global canonical length percentiles.
     // Drives adaptive `target_bytes` for resummerize compression. Cheap DB
     // scan; runs even without clusters so the global fallback accumulates
     // from day one.
-    match crate::store::adaptive::recompute_canonical_length_stats(store.conn()) {
-        Ok((per_cluster, global)) => {
-            state.canonical_length_stats = per_cluster;
-            state.global_canonical_length = global;
+    recorder.stage("canonical_length_stats", || {
+        match crate::store::adaptive::recompute_canonical_length_stats(store.conn()) {
+            Ok((per_cluster, global)) => {
+                state.canonical_length_stats = per_cluster;
+                state.global_canonical_length = global;
+            }
+            Err(e) => tracing::warn!("failed to recompute canonical_length_stats: {e}"),
         }
-        Err(e) => tracing::warn!("failed to recompute canonical_length_stats: {e}"),
-    }
+    });
 
     // v0.24 peek+commit: collect (consumer, max_event_id) batches from
     // any event-sourced helper that mutates `state`. Each batch is
@@ -1072,18 +1146,20 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // `CONCEPT_REFRESH_MIN_SAMPLES` samples accumulate, the trigger
     // threshold helpers fall back to bootstrap constants — see
     // `AdaptiveState::concept_refresh_revision_threshold`.
-    match crate::store::adaptive::recompute_concept_refresh_stats(
-        store.conn(),
-        state.concept_refresh_stats.clone(),
-    ) {
-        Ok((stats, max_id)) => {
-            state.concept_refresh_stats = Some(stats);
-            if let Some(id) = max_id {
-                pending_offset_batches.push(vec![("concept_refresh_stats", id)]);
+    recorder.stage("concept_refresh_stats", || {
+        match crate::store::adaptive::recompute_concept_refresh_stats(
+            store.conn(),
+            state.concept_refresh_stats.clone(),
+        ) {
+            Ok((stats, max_id)) => {
+                state.concept_refresh_stats = Some(stats);
+                if let Some(id) = max_id {
+                    pending_offset_batches.push(vec![("concept_refresh_stats", id)]);
+                }
             }
+            Err(e) => tracing::warn!("failed to recompute concept_refresh_stats: {e}"),
         }
-        Err(e) => tracing::warn!("failed to recompute concept_refresh_stats: {e}"),
-    }
+    });
 
     // Step 1e: v0.26 D direction — synthesis interaction feedback. Drains any
     // new `SynthesisInteraction` events into per-cluster ClusterSynthesisStats
@@ -1185,24 +1261,26 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
         crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE,
         effective_judge_weight_decay_rate,
     );
-    match crate::store::adaptive::recompute_synthesis_feedback_stats_with_judge_and_weights(
-        store.conn(),
-        state.synthesis_feedback_stats.clone(),
-        state.pending_kappa_half_pairs.clone(),
-        state.judge_calibration_state.clone().unwrap_or_default(),
-        effective_judge_weight_decay_rate,
-        synthesis_useful_rate_weights,
-    ) {
-        Ok((stats, pairs, calibration, max_id)) => {
-            state.synthesis_feedback_stats = Some(stats);
-            state.pending_kappa_half_pairs = pairs;
-            state.judge_calibration_state = Some(calibration);
-            if let Some(id) = max_id {
-                pending_offset_batches.push(vec![("synthesis_feedback", id)]);
+    recorder.stage("synthesis_feedback", || {
+        match crate::store::adaptive::recompute_synthesis_feedback_stats_with_judge_and_weights(
+            store.conn(),
+            state.synthesis_feedback_stats.clone(),
+            state.pending_kappa_half_pairs.clone(),
+            state.judge_calibration_state.clone().unwrap_or_default(),
+            effective_judge_weight_decay_rate,
+            synthesis_useful_rate_weights,
+        ) {
+            Ok((stats, pairs, calibration, max_id)) => {
+                state.synthesis_feedback_stats = Some(stats);
+                state.pending_kappa_half_pairs = pairs;
+                state.judge_calibration_state = Some(calibration);
+                if let Some(id) = max_id {
+                    pending_offset_batches.push(vec![("synthesis_feedback", id)]);
+                }
             }
+            Err(e) => tracing::warn!("failed to recompute synthesis_feedback_stats: {e}"),
         }
-        Err(e) => tracing::warn!("failed to recompute synthesis_feedback_stats: {e}"),
-    }
+    });
 
     // Step 1f: v0.27 Cap A mirror — concept-summary interaction feedback.
     // Mirrors Step 1e for the Cap A surface; same peek+commit + CAS-merge
@@ -1226,24 +1304,26 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
         crate::store::adaptive::ARS_SCALAR_JUDGE_WEIGHT_DECAY_RATE,
         effective_judge_weight_decay_rate,
     );
-    match crate::store::adaptive::recompute_concept_summary_feedback_stats_with_judge_and_weights(
-        store.conn(),
-        state.concept_summary_feedback_stats.clone(),
-        state.pending_kappa_half_pairs.clone(),
-        state.judge_calibration_state.clone().unwrap_or_default(),
-        effective_judge_weight_decay_rate,
-        concept_summary_useful_rate_weights,
-    ) {
-        Ok((stats, pairs, calibration, max_id)) => {
-            state.concept_summary_feedback_stats = Some(stats);
-            state.pending_kappa_half_pairs = pairs;
-            state.judge_calibration_state = Some(calibration);
-            if let Some(id) = max_id {
-                pending_offset_batches.push(vec![("concept_summary_feedback", id)]);
+    recorder.stage("concept_summary_feedback", || {
+        match crate::store::adaptive::recompute_concept_summary_feedback_stats_with_judge_and_weights(
+            store.conn(),
+            state.concept_summary_feedback_stats.clone(),
+            state.pending_kappa_half_pairs.clone(),
+            state.judge_calibration_state.clone().unwrap_or_default(),
+            effective_judge_weight_decay_rate,
+            concept_summary_useful_rate_weights,
+        ) {
+            Ok((stats, pairs, calibration, max_id)) => {
+                state.concept_summary_feedback_stats = Some(stats);
+                state.pending_kappa_half_pairs = pairs;
+                state.judge_calibration_state = Some(calibration);
+                if let Some(id) = max_id {
+                    pending_offset_batches.push(vec![("concept_summary_feedback", id)]);
+                }
             }
+            Err(e) => tracing::warn!("failed to recompute concept_summary_feedback_stats: {e}"),
         }
-        Err(e) => tracing::warn!("failed to recompute concept_summary_feedback_stats: {e}"),
-    }
+    });
 
     // Step 1f-bis: v0.27.1 E direction — drain the judge worker queue
     // (Codex R1 P1 fix). Auto-sampled + manual MCP enqueues land in
@@ -1253,7 +1333,16 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // reached `feedback_events`, making the entire judge feedback loop
     // dead code in production. When `[ars.llm_judge].enabled = false`,
     // no queue file is written, so the drain is a fast no-op.
-    let drain_stats = crate::ops::llm_judge_worker::drain_queue(store, config);
+    let drain_stats = recorder.stage("judge_drain", || {
+        crate::ops::llm_judge_worker::drain_queue(store, config)
+    });
+    recorder.annotate(
+        "judge_drain",
+        format!(
+            "emitted={} dropped={} errors={} malformed={}",
+            drain_stats.emitted, drain_stats.dropped, drain_stats.errors, drain_stats.malformed
+        ),
+    );
     if drain_stats.emitted > 0
         || drain_stats.dropped > 0
         || drain_stats.errors > 0
@@ -1282,7 +1371,7 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // κ falls below `JUDGE_DRIFT_THRESHOLD`. Codex R7 P2: without this wiring
     // the consumer's offset never advances and `runtime_vs_offline_kappa`
     // stays stale forever.
-    {
+    recorder.stage("judge_calibration", || {
         let drift_log_path =
             crate::extract::hooks::buffer::resolve_buffer_dir(config).join("judge_drift.log");
         if let Some(batch) = crate::ops::judge_calibration::run_judge_calibration_consumer(
@@ -1292,16 +1381,23 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
         ) {
             pending_offset_batches.push(batch);
         }
-    }
+    });
 
     // Step 2: M3 — Build per-cluster survival curves from access data
     if !state.memory_clusters.is_empty() {
-        build_survival_curves(store, &state);
+        recorder.stage("m3_survival", || build_survival_curves(store, &state));
+    } else {
+        recorder.skip("m3_survival", "no clusters");
     }
 
     // Step 3: M5 — Tier boundaries + cold_archive migration
     if mem_count >= config.adaptive.tier_cold_start as u64 {
-        run_tiering(store, &mut state, config);
+        recorder.stage("m5_tiers", || run_tiering(store, &mut state, config));
+    } else {
+        recorder.skip(
+            "m5_tiers",
+            &format!("below tier_cold_start (memories={mem_count})"),
+        );
     }
 
     // Step 3a: v0.26 Cap C — bulk cold-tier archival summary worker. Walks
@@ -1317,7 +1413,7 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // always sees the original content even when strip ran first
     // (v0.26.0 patch: Option C — defended inside the worker rather than
     // by reordering pipeline steps).
-    {
+    recorder.stage("cold_archive_worker", || {
         let cold_config =
             crate::ops::cold_archive_summary::ColdArchiveConfig::from_ars(&config.ars);
         match crate::ops::cold_archive_summary::run_cold_archive_summary(
@@ -1340,10 +1436,12 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
             }
             Err(e) => tracing::warn!("Cap C: cold-archive worker failed: {e}"),
         }
-    }
+    });
 
     // Step 4: M2 — Counterfactual alpha optimization (peek events, learn alphas)
-    if let Some(batch) = run_alpha_learning(store, &mut state, config) {
+    if let Some(batch) =
+        recorder.stage("m2_alpha", || run_alpha_learning(store, &mut state, config))
+    {
         pending_offset_batches.push(batch);
     }
 
@@ -1351,31 +1449,35 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // peek+commit (writes to `weights` table, not `adaptive_state`), so it
     // commits its own offsets in-function and does NOT contribute to the
     // post-save batch list.
-    run_reranker_weight_learning(store);
+    recorder.stage("reranker_weights", || run_reranker_weight_learning(store));
 
     // Step 4b: M6 — Consume shadow probes + co-recall signal → update
     // non-destructive dedup suggestions
-    if let Some(batch) = run_m6_threshold_learning(store, &mut state) {
+    if let Some(batch) = recorder.stage("m6_thresholds", || {
+        run_m6_threshold_learning(store, &mut state)
+    }) {
         pending_offset_batches.push(batch);
     }
 
     // Step 5: Embedding-based dedup for memories marked needs_vec_dedup
-    run_vec_dedup(store, config);
+    recorder.stage("vec_dedup", || run_vec_dedup(store, config));
 
     // Step 6: Persist snapshot + emit param_update event
     state.version += 1;
-    let snapshot_saved = match state.save_snapshot(store.conn()) {
-        Ok(()) => {
-            tracing::debug!("adaptive state v{} saved", state.version);
-            true
+    let snapshot_saved = recorder.stage("save_snapshot", || {
+        match state.save_snapshot(store.conn()) {
+            Ok(()) => {
+                tracing::debug!("adaptive state v{} saved", state.version);
+                true
+            }
+            Err(e) => {
+                tracing::warn!("failed to save adaptive state: {e}");
+                false
+            }
         }
-        Err(e) => {
-            tracing::warn!("failed to save adaptive state: {e}");
-            false
-        }
-    };
+    });
     if snapshot_saved {
-        run_post_snapshot_refreshes(store, config);
+        run_post_snapshot_refreshes(store, config, &recorder);
     }
 
     // Step 6b: Post-save offset commits. Honor the module invariant —
@@ -1383,21 +1485,32 @@ pub fn run_adaptive_pipeline(store: &SqliteStore, config: &ReinConfig) {
     // is durable. If save_snapshot failed, all pending batches are
     // discarded; the next pipeline pass will re-peek and replay.
     if snapshot_saved {
-        for batch in &pending_offset_batches {
-            let pairs: Vec<(&str, i64)> = batch.iter().map(|(c, id)| (*c, *id)).collect();
-            if let Err(e) = crate::store::adaptive::commit_offset(store.conn(), &pairs) {
-                tracing::warn!(
-                    consumers = ?batch.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
-                    error = %e,
-                    "post-save commit_offset failed; events will be re-peeked next pass"
-                );
+        recorder.stage("offset_commits", || {
+            for batch in &pending_offset_batches {
+                let pairs: Vec<(&str, i64)> = batch.iter().map(|(c, id)| (*c, *id)).collect();
+                if let Err(e) = crate::store::adaptive::commit_offset(store.conn(), &pairs) {
+                    tracing::warn!(
+                        consumers = ?batch.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
+                        error = %e,
+                        "post-save commit_offset failed; events will be re-peeked next pass"
+                    );
+                }
             }
-        }
+        });
     } else if !pending_offset_batches.is_empty() {
         tracing::warn!(
             batches = pending_offset_batches.len(),
             "snapshot save failed; deferring {} pending offset batches for replay",
             pending_offset_batches.len()
+        );
+    }
+
+    if snapshot_saved {
+        recorder.finish(PipelineRunOutcome::Completed, None);
+    } else {
+        recorder.finish(
+            PipelineRunOutcome::Failed,
+            Some("adaptive snapshot save failed".to_string()),
         );
     }
 
@@ -5544,7 +5657,8 @@ mod tests {
             crate::store::a12_calibration::repair_corrupt_a12_calibration(store.conn()).unwrap();
         assert_eq!(repaired.deleted, 1);
 
-        run_post_snapshot_refreshes(&store, &a12_enabled_config());
+        let recorder = PipelineRunRecorder::start(&store, "test");
+        run_post_snapshot_refreshes(&store, &a12_enabled_config(), &recorder);
         let a12 = crate::store::a12_calibration::load_a12_calibration(store.conn());
         assert_eq!(
             a12.status,
@@ -5564,7 +5678,8 @@ mod tests {
         };
         durable.save_snapshot(store.conn()).unwrap();
 
-        run_post_snapshot_refreshes(&store, &a12_enabled_config());
+        let recorder = PipelineRunRecorder::start(&store, "test");
+        run_post_snapshot_refreshes(&store, &a12_enabled_config(), &recorder);
 
         let a12 = crate::store::a12_calibration::load_a12_calibration(store.conn());
         assert_eq!(
@@ -5589,7 +5704,8 @@ mod tests {
             )
             .unwrap();
 
-        run_post_snapshot_refreshes(&store, &a12_enabled_config());
+        let recorder = PipelineRunRecorder::start(&store, "test");
+        run_post_snapshot_refreshes(&store, &a12_enabled_config(), &recorder);
 
         assert_eq!(
             crate::store::a12_calibration::load_a12_calibration(store.conn()).status,

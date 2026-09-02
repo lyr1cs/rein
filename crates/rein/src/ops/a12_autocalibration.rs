@@ -435,6 +435,17 @@ where
         let next_kg_boundary = a12_next_kg_validity_boundary_exclusive(store, evaluation_at)?;
 
         let mut case_index = 0_usize;
+        let trace_clock = std::time::Instant::now();
+        let total_cases: usize = corpus
+            .observations
+            .iter()
+            .map(|observation| observation.cases.len())
+            .sum();
+        tracing::info!(
+            families = corpus.observations.len(),
+            cases = total_cases,
+            "A12 recall trace started"
+        );
         let mut families = Vec::with_capacity(corpus.observations.len());
         for observation in &corpus.observations {
             if observation.fold != a12_family_fold(&observation.stable_family_id)
@@ -477,12 +488,25 @@ where
                 });
                 after_case(store, case_index)?;
                 case_index = case_index.saturating_add(1);
+                if case_index % 500 == 0 {
+                    tracing::info!(
+                        cases = case_index,
+                        total_cases,
+                        elapsed_ms = trace_clock.elapsed().as_millis() as u64,
+                        "A12 recall trace progress"
+                    );
+                }
             }
             families.push(A12FamilyRecallTrace {
                 stable_family_id: observation.stable_family_id.clone(),
                 cases,
             });
         }
+        tracing::info!(
+            cases = case_index,
+            elapsed_ms = trace_clock.elapsed().as_millis() as u64,
+            "A12 recall trace finished"
+        );
         let after = a12_local_recall_snapshot_identity(store)?;
         if after != before {
             return Err(ReinError::Config(format!(
@@ -1645,6 +1669,14 @@ fn build_a12_loo_corpus_inner(
 
     let mut observations = Vec::new();
     let mut abstentions = Vec::new();
+    let build_clock = std::time::Instant::now();
+    let mut processed_views = 0_usize;
+    tracing::info!(
+        families = snapshot.families.len(),
+        raw_memories = snapshot.raw_memories.len(),
+        evidence_views = all_evidence_views.len(),
+        "A12 corpus build started"
+    );
 
     for family in &snapshot.families {
         let views = evidence_by_family
@@ -1676,6 +1708,16 @@ fn build_a12_loo_corpus_inner(
 
         let mut cases = Vec::new();
         for view in views {
+            processed_views += 1;
+            if processed_views % 500 == 0 {
+                tracing::info!(
+                    views = processed_views,
+                    families = observations.len(),
+                    abstentions = abstentions.len(),
+                    elapsed_ms = build_clock.elapsed().as_millis() as u64,
+                    "A12 corpus build progress"
+                );
+            }
             let exclusion = loo_exclusion(
                 &view,
                 family,
@@ -1781,6 +1823,13 @@ fn build_a12_loo_corpus_inner(
         }
     }
 
+    tracing::info!(
+        views = processed_views,
+        families = observations.len(),
+        abstentions = abstentions.len(),
+        elapsed_ms = build_clock.elapsed().as_millis() as u64,
+        "A12 corpus build finished"
+    );
     Ok(A12LooCorpus {
         source_snapshot_fingerprint: String::new(),
         hard_dedup_bound,

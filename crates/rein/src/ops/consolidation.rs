@@ -6,7 +6,7 @@ use crate::extract::llm::ExtractedMemory;
 use crate::store::SqliteStore;
 use crate::types::*;
 
-use super::adaptive::run_adaptive_pipeline;
+use super::adaptive::run_adaptive_pipeline_with_trigger;
 use super::dedup::{emit_cleanup_event, run_dedup_scoped};
 
 fn normalize_summary(summary: &str) -> String {
@@ -465,7 +465,7 @@ pub fn run_consolidation(
     }
 
     if changed {
-        run_adaptive_pipeline(store, config);
+        run_adaptive_pipeline_with_trigger(store, config, "consolidate");
     }
 
     Ok(report)
@@ -628,7 +628,7 @@ pub async fn run_consolidation_async(
     }
 
     if changed {
-        run_adaptive_pipeline(store, config);
+        run_adaptive_pipeline_with_trigger(store, config, "consolidate");
     }
 
     Ok(report)

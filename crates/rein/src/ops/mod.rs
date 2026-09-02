@@ -18,6 +18,7 @@ pub mod consolidation;
 pub mod dedup;
 pub mod judge_calibration;
 pub mod llm_judge_worker;
+pub mod pipeline_run;
 pub mod recall_synthesis;
 pub mod resummerize;
 pub mod system_health;
@@ -1851,7 +1852,7 @@ pub fn run_gc_adaptive(
 ) -> ReinResult<(u64, u64, u64)> {
     let result = run_gc(store, threshold, dry_run)?;
     if !dry_run {
-        run_adaptive_pipeline(store, config);
+        crate::ops::adaptive::run_adaptive_pipeline_with_trigger(store, config, "gc");
     }
     Ok(result)
 }

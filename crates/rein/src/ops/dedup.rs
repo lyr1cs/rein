@@ -5,7 +5,7 @@ use crate::config::ReinConfig;
 use crate::store::SqliteStore;
 use crate::types::*;
 
-use super::adaptive::run_adaptive_pipeline;
+use super::adaptive::run_adaptive_pipeline_with_trigger;
 use super::consolidation::{load_group_memories, TopicGroup};
 use super::stronger_tier;
 
@@ -1265,7 +1265,7 @@ pub fn run_dedup_scoped(
                 "merge_variants": merge_variants,
             }),
         );
-        run_adaptive_pipeline(store, config);
+        run_adaptive_pipeline_with_trigger(store, config, "dedup");
     }
     Ok((dups_found, dups_merged))
 }
