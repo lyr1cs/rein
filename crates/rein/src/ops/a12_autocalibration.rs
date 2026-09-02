@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::extract::dedup::similarity;
+use crate::ops::a12_exclusion_index::{A12ExclusionIndex, A12IndexedEvidence, A12IndexedMemory};
 use crate::store::SqliteStore;
 use crate::types::{ReinError, ReinResult};
 
@@ -1664,6 +1664,25 @@ fn build_a12_loo_corpus_inner(
         all_views: all_evidence_views,
     } = load_evidence_views(store, &snapshot.member_to_family)?;
     let auxiliary = load_auxiliary_family_links(store, &snapshot.member_to_family)?;
+    let exclusion_index = A12ExclusionIndex::build(
+        snapshot
+            .raw_memories
+            .iter()
+            .map(|memory| A12IndexedMemory {
+                id: &memory.id,
+                content: &memory.content,
+                stable_family_id: &memory.stable_family_id,
+                live_tip_id: memory.live_tip_id.as_deref(),
+            })
+            .collect(),
+        all_evidence_views
+            .iter()
+            .map(|view| A12IndexedEvidence {
+                id: &view.id,
+                content: &view.content,
+            })
+            .collect(),
+    );
 
     let mut observations = Vec::new();
     let mut abstentions = Vec::new();
@@ -1720,8 +1739,7 @@ fn build_a12_loo_corpus_inner(
                 &view,
                 family,
                 &family_evidence_ids,
-                &snapshot.raw_memories,
-                &all_evidence_views,
+                &exclusion_index,
                 hard_dedup_bound,
             );
             let Some(canonical_live_tip_id) = family.live_tip_id.as_deref() else {
@@ -2103,6 +2121,73 @@ fn loo_exclusion(
     view: &EvidenceView,
     family: &A12CanonicalFamily,
     family_evidence_ids: &[String],
+    index: &A12ExclusionIndex<'_>,
+    hard_dedup_bound: f32,
+) -> A12LooExclusion {
+    let mut held_out_memory_ids = family
+        .member_ids
+        .iter()
+        .filter(|memory_id| {
+            Some(memory_id.as_str()) != family.live_tip_id.as_deref()
+                || view.original_memory_id.as_deref() == Some(memory_id.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    held_out_memory_ids.sort();
+    held_out_memory_ids.dedup();
+    let mut held_out_evidence_ids = family_evidence_ids.to_vec();
+    let matches = index.query(&view.content, hard_dedup_bound);
+    let already_held_out = |memory_id: &str| {
+        held_out_memory_ids
+            .binary_search_by(|candidate| candidate.as_str().cmp(memory_id))
+            .is_ok()
+    };
+
+    let mut equal_content_memory_ids = Vec::new();
+    for &memory_index in &matches.equal_memory_indices {
+        let raw_memory = index.memory(memory_index);
+        if already_held_out(raw_memory.id) {
+            continue;
+        }
+        equal_content_memory_ids.push(raw_memory.id.to_string());
+        if raw_memory.stable_family_id != family.stable_family_id {
+            equal_content_memory_ids.extend(raw_memory.live_tip_id.map(str::to_string));
+        }
+    }
+    let mut near_duplicate_memory_ids = Vec::new();
+    for &memory_index in &matches.near_duplicate_memory_indices {
+        let raw_memory = index.memory(memory_index);
+        if already_held_out(raw_memory.id) {
+            continue;
+        }
+        near_duplicate_memory_ids.push(raw_memory.id.to_string());
+        if raw_memory.stable_family_id != family.stable_family_id {
+            near_duplicate_memory_ids.extend(raw_memory.live_tip_id.map(str::to_string));
+        }
+    }
+    held_out_evidence_ids.extend(matches.held_out_evidence_ids);
+    held_out_evidence_ids.sort();
+    held_out_evidence_ids.dedup();
+    equal_content_memory_ids.sort();
+    equal_content_memory_ids.dedup();
+    near_duplicate_memory_ids.sort();
+    near_duplicate_memory_ids.dedup();
+
+    A12LooExclusion {
+        held_out_memory_ids,
+        held_out_evidence_ids,
+        content_hash: matches.content_hash,
+        equal_content_memory_ids,
+        near_duplicate_memory_ids,
+    }
+}
+
+/// Original pairwise implementation, kept as the oracle for the index.
+#[cfg(test)]
+fn loo_exclusion_reference(
+    view: &EvidenceView,
+    family: &A12CanonicalFamily,
+    family_evidence_ids: &[String],
     raw_memories: &[RawFamilyMemory],
     all_evidence_views: &[EvidenceView],
     hard_dedup_bound: f32,
@@ -2128,7 +2213,8 @@ fn loo_exclusion(
             .binary_search_by(|candidate| candidate.as_str().cmp(&raw_memory.id))
             .is_ok();
         let equal_content = sha256_hex(&raw_memory.content) == content_hash;
-        let near_duplicate = similarity(&view.content, &raw_memory.content) >= hard_dedup_bound;
+        let near_duplicate = crate::extract::dedup::similarity(&view.content, &raw_memory.content)
+            >= hard_dedup_bound;
         if equal_content && !already_held_out {
             equal_content_memory_ids.push(raw_memory.id.clone());
             if raw_memory.stable_family_id != family.stable_family_id {
@@ -2144,7 +2230,8 @@ fn loo_exclusion(
     }
     for evidence in all_evidence_views {
         if sha256_hex(&evidence.content) == content_hash
-            || similarity(&view.content, &evidence.content) >= hard_dedup_bound
+            || crate::extract::dedup::similarity(&view.content, &evidence.content)
+                >= hard_dedup_bound
         {
             held_out_evidence_ids.push(evidence.id.clone());
         }
@@ -2429,8 +2516,8 @@ mod tests {
         let query = "Rust borrow checker prevents dangling references";
         let leaked_middle = "Rust borrow checker prevents a dangling reference";
         let independent_tip = "Postgres transactions preserve durable commits";
-        let hard_bound = similarity(query, leaked_middle);
-        assert!(hard_bound > similarity(query, independent_tip));
+        let hard_bound = crate::extract::dedup::similarity(query, leaked_middle);
+        assert!(hard_bound > crate::extract::dedup::similarity(query, independent_tip));
 
         store.store(memory(&held_root, query)).unwrap();
         store
@@ -2604,7 +2691,7 @@ mod tests {
         let held_out = "Rust borrow checker prevents dangling references";
         let live_tip = "Rust borrow checker prevents a dangling reference";
         assert_ne!(sha256_hex(held_out), sha256_hex(live_tip));
-        let exact_bound = similarity(held_out, live_tip);
+        let exact_bound = crate::extract::dedup::similarity(held_out, live_tip);
         assert!(exact_bound > 0.0 && exact_bound < 1.0);
 
         store.store(memory(root_id, held_out)).unwrap();
@@ -3572,5 +3659,383 @@ mod tests {
             boundary,
             Some((evaluation_at + chrono::Duration::days(2)).timestamp_millis())
         );
+    }
+
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() as usize) % n.max(1)
+        }
+    }
+
+    const PROPERTY_WORDS: &[&str] = &[
+        "alpha",
+        "beta",
+        "gamma",
+        "delta",
+        "index",
+        "recall",
+        "memory",
+        "rust",
+        "sqlite",
+        "vector",
+        "数据库",
+        "索引",
+        "性能",
+        "优化",
+        "记忆",
+        "召回",
+        "Alpha!",
+        "beta,",
+    ];
+
+    fn random_content(rng: &mut Lcg) -> String {
+        match rng.below(12) {
+            0 => String::new(),
+            1 => "!!! ???".to_string(),
+            _ => {
+                let words = 1 + rng.below(8);
+                (0..words)
+                    .map(|_| PROPERTY_WORDS[rng.below(PROPERTY_WORDS.len())])
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }
+        }
+    }
+
+    fn mutate_content(rng: &mut Lcg, base: &str) -> String {
+        let mut words: Vec<&str> = base.split_whitespace().collect();
+        match rng.below(4) {
+            0 => base.to_string(),
+            1 => {
+                words.push(PROPERTY_WORDS[rng.below(PROPERTY_WORDS.len())]);
+                words.join(" ")
+            }
+            2 => {
+                if !words.is_empty() {
+                    let drop = rng.below(words.len());
+                    words.remove(drop);
+                }
+                words.join(" ")
+            }
+            _ => {
+                // Containment: a strict subset of the base words.
+                let keep = rng.below(words.len() + 1);
+                words.truncate(keep);
+                words.join(" ")
+            }
+        }
+    }
+
+    fn assert_exclusions_match_reference(seed: u64) {
+        let mut rng = Lcg(seed);
+        let family_count = 2 + rng.below(3);
+        let mut families = Vec::new();
+        let mut raw_memories = Vec::new();
+        for family_index in 0..family_count {
+            let member_count = 1 + rng.below(3);
+            let member_ids: Vec<String> = (0..member_count)
+                .map(|member| format!("m{seed}-{family_index}-{member}"))
+                .collect();
+            let stable_family_id = member_ids[0].clone();
+            let live_tip_id = if rng.below(6) == 0 {
+                None
+            } else {
+                Some(member_ids[member_count - 1].clone())
+            };
+            let base = random_content(&mut rng);
+            for (member, id) in member_ids.iter().enumerate() {
+                let content = if member == 0 {
+                    base.clone()
+                } else if rng.below(3) == 0 && !raw_memories.is_empty() {
+                    // Cross-family duplicate of an earlier row.
+                    let other: &RawFamilyMemory = &raw_memories[rng.below(raw_memories.len())];
+                    other.content.clone()
+                } else {
+                    mutate_content(&mut rng, &base)
+                };
+                raw_memories.push(RawFamilyMemory {
+                    id: id.clone(),
+                    content,
+                    stable_family_id: stable_family_id.clone(),
+                    live_tip_id: live_tip_id.clone(),
+                });
+            }
+            families.push(A12CanonicalFamily {
+                stable_family_id: stable_family_id.clone(),
+                stable_created_at: Utc.timestamp_opt(1_000 + family_index as i64, 0).unwrap(),
+                split_bucket: a12_family_split_bucket(&stable_family_id),
+                fold: a12_family_fold(&stable_family_id),
+                live_tip_id,
+                member_ids,
+            });
+        }
+
+        let mut all_views = Vec::new();
+        let mut views_by_family: BTreeMap<String, Vec<EvidenceView>> = BTreeMap::new();
+        for family in &families {
+            for member_id in &family.member_ids {
+                let member = raw_memories
+                    .iter()
+                    .find(|memory| &memory.id == member_id)
+                    .unwrap();
+                let view_count = rng.below(3);
+                for view_index in 0..view_count {
+                    let content = if rng.below(2) == 0 {
+                        member.content.clone()
+                    } else {
+                        mutate_content(&mut rng, &member.content)
+                    };
+                    let view = EvidenceView {
+                        id: format!("e{seed}-{member_id}-{view_index}"),
+                        original_memory_id: Some(member_id.clone()),
+                        canonical_id: family
+                            .live_tip_id
+                            .clone()
+                            .unwrap_or_else(|| member_id.clone()),
+                        content,
+                        created_at: Utc.timestamp_opt(2_000, 0).unwrap(),
+                        imported_at: Utc.timestamp_opt(2_000, 0).unwrap(),
+                    };
+                    all_views.push(view.clone());
+                    views_by_family
+                        .entry(family.stable_family_id.clone())
+                        .or_default()
+                        .push(view);
+                }
+            }
+        }
+
+        let index = A12ExclusionIndex::build(
+            raw_memories
+                .iter()
+                .map(|memory| A12IndexedMemory {
+                    id: &memory.id,
+                    content: &memory.content,
+                    stable_family_id: &memory.stable_family_id,
+                    live_tip_id: memory.live_tip_id.as_deref(),
+                })
+                .collect(),
+            all_views
+                .iter()
+                .map(|view| A12IndexedEvidence {
+                    id: &view.id,
+                    content: &view.content,
+                })
+                .collect(),
+        );
+
+        for family in &families {
+            let Some(views) = views_by_family.get(&family.stable_family_id) else {
+                continue;
+            };
+            let mut family_evidence_ids: Vec<String> = views.iter().map(|v| v.id.clone()).collect();
+            family_evidence_ids.sort();
+            family_evidence_ids.dedup();
+            for view in views {
+                for bound in [0.0_f32, 0.35, 0.70, 1.0] {
+                    let expected = loo_exclusion_reference(
+                        view,
+                        family,
+                        &family_evidence_ids,
+                        &raw_memories,
+                        &all_views,
+                        bound,
+                    );
+                    let actual = loo_exclusion(view, family, &family_evidence_ids, &index, bound);
+                    assert_eq!(
+                        actual, expected,
+                        "seed={seed} family={} view={} bound={bound}",
+                        family.stable_family_id, view.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exclusion_index_matches_reference_on_random_corpora() {
+        for seed in 1..=200_u64 {
+            assert_exclusions_match_reference(seed);
+        }
+    }
+
+    #[test]
+    fn exclusion_index_cross_family_duplicate_adds_live_tip() {
+        let shared = "same words in both families".to_string();
+        let raw_memories = vec![
+            RawFamilyMemory {
+                id: "a-root".into(),
+                content: shared.clone(),
+                stable_family_id: "a-root".into(),
+                live_tip_id: Some("a-tip".into()),
+            },
+            RawFamilyMemory {
+                id: "a-tip".into(),
+                content: "the live tip of family a".into(),
+                stable_family_id: "a-root".into(),
+                live_tip_id: Some("a-tip".into()),
+            },
+            RawFamilyMemory {
+                id: "b-root".into(),
+                content: shared.clone(),
+                stable_family_id: "b-root".into(),
+                live_tip_id: Some("b-tip".into()),
+            },
+            RawFamilyMemory {
+                id: "b-tip".into(),
+                content: "an unrelated live tip".into(),
+                stable_family_id: "b-root".into(),
+                live_tip_id: Some("b-tip".into()),
+            },
+        ];
+        let family = A12CanonicalFamily {
+            stable_family_id: "a-root".into(),
+            stable_created_at: Utc.timestamp_opt(1_000, 0).unwrap(),
+            split_bucket: a12_family_split_bucket("a-root"),
+            fold: a12_family_fold("a-root"),
+            live_tip_id: Some("a-tip".into()),
+            member_ids: vec!["a-root".into(), "a-tip".into()],
+        };
+        let view = EvidenceView {
+            id: "e-a".into(),
+            original_memory_id: Some("a-root".into()),
+            canonical_id: "a-tip".into(),
+            content: shared,
+            created_at: Utc.timestamp_opt(2_000, 0).unwrap(),
+            imported_at: Utc.timestamp_opt(2_000, 0).unwrap(),
+        };
+        let index = A12ExclusionIndex::build(
+            raw_memories
+                .iter()
+                .map(|memory| A12IndexedMemory {
+                    id: &memory.id,
+                    content: &memory.content,
+                    stable_family_id: &memory.stable_family_id,
+                    live_tip_id: memory.live_tip_id.as_deref(),
+                })
+                .collect(),
+            vec![A12IndexedEvidence {
+                id: &view.id,
+                content: &view.content,
+            }],
+        );
+        let exclusion = loo_exclusion(&view, &family, &["e-a".to_string()], &index, 0.7);
+        assert_eq!(exclusion.held_out_memory_ids, vec!["a-root".to_string()]);
+        assert_eq!(
+            exclusion.equal_content_memory_ids,
+            vec!["b-root".to_string(), "b-tip".to_string()],
+            "cross-family duplicate excludes the row and its live tip"
+        );
+        assert_eq!(
+            exclusion.near_duplicate_memory_ids,
+            vec!["b-root".to_string(), "b-tip".to_string()]
+        );
+        assert_eq!(exclusion.held_out_evidence_ids, vec!["e-a".to_string()]);
+        assert_eq!(
+            exclusion,
+            loo_exclusion_reference(
+                &view,
+                &family,
+                &["e-a".to_string()],
+                &raw_memories,
+                &[view.clone()],
+                0.7
+            )
+        );
+    }
+
+    /// Real-database equivalence: `REIN_A12_EQUIV_DB=/path/to/copy.db cargo test
+    /// -p rein exclusion_index_matches_reference_on_env_db --lib -- --ignored
+    /// --nocapture`. Samples up to 200 evidence views deterministically and
+    /// compares the index against the pairwise reference.
+    #[test]
+    #[ignore = "needs REIN_A12_EQUIV_DB pointing at a database copy"]
+    fn exclusion_index_matches_reference_on_env_db() {
+        let Ok(path) = std::env::var("REIN_A12_EQUIV_DB") else {
+            eprintln!("REIN_A12_EQUIV_DB not set; skipping");
+            return;
+        };
+        let config = crate::config::ReinConfig::default();
+        let store = SqliteStore::new(
+            std::path::Path::new(&path),
+            &config.embedding_model(),
+            config.embedding.dimensions,
+        )
+        .unwrap();
+        let snapshot = load_family_snapshot(&store).unwrap();
+        let EvidenceSnapshot {
+            by_family,
+            all_views,
+        } = load_evidence_views(&store, &snapshot.member_to_family).unwrap();
+        let index = A12ExclusionIndex::build(
+            snapshot
+                .raw_memories
+                .iter()
+                .map(|memory| A12IndexedMemory {
+                    id: &memory.id,
+                    content: &memory.content,
+                    stable_family_id: &memory.stable_family_id,
+                    live_tip_id: memory.live_tip_id.as_deref(),
+                })
+                .collect(),
+            all_views
+                .iter()
+                .map(|view| A12IndexedEvidence {
+                    id: &view.id,
+                    content: &view.content,
+                })
+                .collect(),
+        );
+        let total_views: usize = by_family.values().map(Vec::len).sum();
+        let stride = (total_views / 200).max(1);
+        let mut compared = 0_usize;
+        let mut cursor = 0_usize;
+        let started = std::time::Instant::now();
+        for family in &snapshot.families {
+            let Some(views) = by_family.get(&family.stable_family_id) else {
+                continue;
+            };
+            let mut family_evidence_ids: Vec<String> = views.iter().map(|v| v.id.clone()).collect();
+            family_evidence_ids.sort();
+            family_evidence_ids.dedup();
+            for view in views {
+                cursor += 1;
+                if cursor % stride != 0 {
+                    continue;
+                }
+                for bound in [0.70_f32, 0.35] {
+                    let expected = loo_exclusion_reference(
+                        view,
+                        family,
+                        &family_evidence_ids,
+                        &snapshot.raw_memories,
+                        &all_views,
+                        bound,
+                    );
+                    let actual = loo_exclusion(view, family, &family_evidence_ids, &index, bound);
+                    assert_eq!(
+                        actual, expected,
+                        "family={} view={} bound={bound}",
+                        family.stable_family_id, view.id
+                    );
+                }
+                compared += 1;
+            }
+        }
+        eprintln!(
+            "compared {compared} of {total_views} views against the reference in {:?}",
+            started.elapsed()
+        );
+        assert!(compared > 0);
     }
 }

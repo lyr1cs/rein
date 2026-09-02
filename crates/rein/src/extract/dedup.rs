@@ -28,7 +28,7 @@ pub struct CandidateScore {
 }
 
 /// Normalize text for similarity comparison: lowercase + strip punctuation.
-fn normalize_tokens(text: &str) -> HashSet<String> {
+pub(crate) fn normalize_tokens(text: &str) -> HashSet<String> {
     let mut tokens: HashSet<String> = text
         .split_whitespace()
         .map(|t| {
