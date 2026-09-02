@@ -1039,10 +1039,13 @@ pub(crate) fn adaptive_pipeline_lock_path(db_path: &std::path::Path) -> std::pat
 /// exclusively created sentinel file, removed on drop. A sentinel older than
 /// [`crate::ops::pipeline_run::PIPELINE_RUN_STALE_RUNNING_MS`] is treated as
 /// left behind by a crashed pass and taken over.
+// Only the non-unix single-flight path constructs it; unix uses flock.
+#[cfg_attr(unix, allow(dead_code))]
 pub(crate) struct SentinelLock {
     path: std::path::PathBuf,
 }
 
+#[cfg_attr(unix, allow(dead_code))]
 impl SentinelLock {
     pub(crate) fn try_acquire(
         path: &std::path::Path,
