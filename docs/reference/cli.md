@@ -13,7 +13,7 @@ commands and inventory-backed operation commands.
 | `rein init` | `--dry-run`, `--proxy` | Generate MCP client config and optional proxy shell helpers. |
 | `rein export` | `--format`, `--topic`, `--output` | Export memories as JSON, Markdown, or CSV. |
 | `rein upgrade` | `--topic`, `--dry-run` | Extract knowledge-graph concepts and links from old memories. |
-| `rein warmup` | none | Precompute embeddings and rebuild side indexes. |
+| `rein warmup` | `--trust-existing-vectors`, `--reembed-all` | Make every live memory durable in the vector store: fill missing `vec_memories` rows from the embedding cache or the provider, then rebuild HNSW. Rows created before provenance stamping are untrusted until attested with `--trust-existing-vectors`; `--reembed-all` re-embeds every live row under the configured model and replaces the table atomically (each row revalidated at publish). |
 | `rein worker memory` | none | Drain the async memory queue. |
 | `rein worker dedup-queue` | none | Drain queued store-time dedup jobs. |
 | `rein worker cleanup` | topic selectors, `--all`, `--exact-topics`, `--dry-run` | Run a detached cleanup pass. |
