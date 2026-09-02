@@ -644,6 +644,9 @@ fn validate_browser_mutation_guard(
     Ok(())
 }
 
+// clippy 1.98 (`result_large_err`): the Err side is a hyper::Response used
+// directly as the HTTP reply; boxing it buys nothing on this cold path.
+#[allow(clippy::result_large_err)]
 async fn collect_mcp_request_body_capped<B>(
     body: B,
 ) -> Result<bytes::Bytes, hyper::Response<HttpBoxBody>>
@@ -669,6 +672,9 @@ where
 /// Other `/mcp` rejection paths already wrap their responses via
 /// `mcp_jsonrpc_error_response` directly (host guard, auth fail, public
 /// mutation block).
+// clippy 1.98 (`result_large_err`): the Err side is a hyper::Response used
+// directly as the HTTP reply; boxing it buys nothing on this cold path.
+#[allow(clippy::result_large_err)]
 async fn collect_mcp_body_or_jsonrpc<B>(
     body: B,
 ) -> Result<bytes::Bytes, hyper::Response<HttpBoxBody>>

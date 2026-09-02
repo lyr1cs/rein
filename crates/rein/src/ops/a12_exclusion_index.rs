@@ -131,10 +131,6 @@ impl<'a> A12ExclusionIndex<'a> {
         &self.memories[index]
     }
 
-    pub(crate) fn memory_count(&self) -> usize {
-        self.memories.len()
-    }
-
     /// Rows byte-equal to `content` and rows whose lexical similarity reaches
     /// `bound`, plus every evidence id in either category.
     pub(crate) fn query(&self, content: &str, bound: f32) -> A12ExclusionMatches {

@@ -27,6 +27,9 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 ///
 /// Returns `Err(413-response)` when the cap is exceeded and
 /// `Err(400-response)` on transport errors reading the body.
+// clippy 1.98 (`result_large_err`): the Err side is a hyper::Response used
+// directly as the HTTP reply; boxing it buys nothing on this cold path.
+#[allow(clippy::result_large_err)]
 pub async fn collect_body_capped<B>(body: B) -> Result<Bytes, BoxedResponse>
 where
     B: hyper::body::Body<Data = Bytes> + Unpin,
