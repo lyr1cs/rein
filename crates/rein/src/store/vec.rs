@@ -52,6 +52,20 @@ pub fn insert_embedding_checked(
     embedding: &[f32],
     writer_provenance: &str,
 ) -> ReinResult<()> {
+    insert_embedding_inner(conn, id, embedding, Some(writer_provenance))
+}
+
+pub fn insert_embedding(conn: &Connection, id: &str, embedding: &[f32]) -> ReinResult<()> {
+    insert_embedding_inner(conn, id, embedding, None)
+}
+
+/// Compare the store's `vec_rows_provenance` stamp with the writer's
+/// `model:dims`. Must run inside the write savepoint AFTER the write lock
+/// has been taken (see `insert_embedding_inner`): read outside the lock, a
+/// concurrent reindex swap could commit a new stamp between the read and
+/// the insert and the old-model vector would land in the new-model table,
+/// pass every later provenance check, and never be repaired by warmup.
+fn check_vector_provenance(conn: &Connection, writer_provenance: &str) -> ReinResult<()> {
     use rusqlite::OptionalExtension;
     let stamped: Option<String> = conn
         .query_row(
@@ -69,14 +83,29 @@ pub fn insert_embedding_checked(
             )));
         }
     }
-    insert_embedding(conn, id, embedding)
+    Ok(())
 }
 
-pub fn insert_embedding(conn: &Connection, id: &str, embedding: &[f32]) -> ReinResult<()> {
+fn insert_embedding_inner(
+    conn: &Connection,
+    id: &str,
+    embedding: &[f32],
+    writer_provenance: Option<&str>,
+) -> ReinResult<()> {
     let bytes = embedding_to_bytes(embedding);
     conn.execute_batch("SAVEPOINT vec_embed_write")?;
     let result = (|| -> ReinResult<()> {
+        // The bump is a write, so it takes the connection's write lock
+        // before anything below runs: a concurrent reindex swap has either
+        // already committed (and its stamp is the one compared next) or
+        // waits for this savepoint to finish. In WAL mode a write attempted
+        // on a stale read snapshot fails with SQLITE_BUSY_SNAPSHOT instead
+        // of landing, which keeps the check and the write atomic even when
+        // the caller opened its read transaction before the swap.
         bump_embedding_write_seq(conn)?;
+        if let Some(writer) = writer_provenance {
+            check_vector_provenance(conn, writer)?;
+        }
         conn.execute(
             "INSERT OR REPLACE INTO vec_memories(id, embedding) VALUES (?1, ?2)",
             rusqlite::params![id, bytes],
@@ -456,5 +485,96 @@ mod tests {
              post-filter has material; got {} rows",
             overfetched.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod checked_write_tests {
+    use super::*;
+    use crate::store::schema::VEC_ROWS_PROVENANCE_KEY;
+
+    fn stamp(conn: &Connection, value: &str) {
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES (?1, ?2)",
+            rusqlite::params![VEC_ROWS_PROVENANCE_KEY, value],
+        )
+        .unwrap();
+    }
+
+    fn vec_rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM vec_memories", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Codex round-11 P1: the stamp comparison and the vector write must be
+    /// one atomic unit. A writer that read the OLD stamp before a reindex
+    /// swap committed must not be able to land its old-model vector in the
+    /// new-model table afterwards.
+    #[test]
+    fn checked_insert_cannot_land_after_stamp_moved_under_a_stale_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memories.db");
+        let dims = 4usize;
+        let store = crate::store::SqliteStore::new(&path, "model-a", dims).unwrap();
+        let writer = store.conn();
+        writer.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        stamp(writer, "model-a:4");
+
+        // The old-model writer opens a read transaction and observes the
+        // old stamp (what the pre-fix code did outside any transaction).
+        writer.execute_batch("BEGIN").unwrap();
+        let seen: String = writer
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?1",
+                rusqlite::params![VEC_ROWS_PROVENANCE_KEY],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(seen, "model-a:4");
+
+        // A reindex on another connection swaps the stamp and commits; WAL
+        // readers do not block writers so this succeeds immediately.
+        let swapper = rusqlite::Connection::open(&path).unwrap();
+        swapper
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        stamp(&swapper, "model-b:4");
+
+        // The stale writer's checked insert must fail rather than land a
+        // model-a vector in the model-b table.
+        let err = insert_embedding_checked(writer, "m1", &[0.1; 4], "model-a:4")
+            .expect_err("write on a stale snapshot must not land");
+        assert!(!err.to_string().is_empty(), "error must carry a reason");
+        writer.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(vec_rows(writer), 0, "no mixed-model row may exist");
+
+        // Outside the stale transaction the old-model writer is refused by
+        // the stamp itself, and the new-model writer is accepted.
+        let err = insert_embedding_checked(writer, "m1", &[0.1; 4], "model-a:4").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("stamped for embedding model model-b:4"),
+            "{err}"
+        );
+        assert_eq!(vec_rows(writer), 0);
+        insert_embedding_checked(writer, "m1", &[0.1; 4], "model-b:4").unwrap();
+        assert_eq!(vec_rows(writer), 1);
+    }
+
+    /// A refused checked write leaves the write sequence untouched: the
+    /// bump runs inside the same savepoint and is rolled back with it.
+    #[test]
+    fn refused_checked_insert_rolls_back_the_write_seq_bump() {
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+        let conn = store.conn();
+        stamp(conn, "other:3072");
+        let before = embedding_write_seq(conn);
+        let dims = store.dims;
+        let err = insert_embedding_checked(conn, "m1", &vec![0.5; dims], "mine:3072").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("stamped for embedding model other:3072"));
+        assert_eq!(embedding_write_seq(conn), before);
+        assert_eq!(vec_rows(conn), 0);
     }
 }

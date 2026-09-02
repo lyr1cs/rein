@@ -495,13 +495,26 @@ fn bucket_embeddings(
             &mems[idx].content,
         );
         if let Ok(Some(emb)) = crate::embed::EmbedCache::get(conn, &enriched, &model) {
-            let _ = crate::store::vec::insert_embedding_checked(
+            // Only vectors the store accepted take part in bucket
+            // comparisons; a rejected write means the store is stamped for
+            // another model and rows read back from it above would not be
+            // comparable with this one anyway.
+            match crate::store::vec::insert_embedding_checked(
                 conn,
                 &mems[idx].id,
                 &emb,
                 &vector_provenance,
-            );
-            embeddings.insert(idx, emb);
+            ) {
+                Ok(()) => {
+                    embeddings.insert(idx, emb);
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "bucket_embeddings: vector write rejected for {}: {e}",
+                        mems[idx].id
+                    );
+                }
+            }
             continue;
         }
         uncached.push((idx, enriched));
@@ -525,13 +538,22 @@ fn bucket_embeddings(
         }
         for ((idx, enriched), emb) in chunk.iter().zip(batch) {
             let _ = crate::embed::EmbedCache::put(conn, enriched, &model, &emb);
-            let _ = crate::store::vec::insert_embedding_checked(
+            match crate::store::vec::insert_embedding_checked(
                 conn,
                 &mems[*idx].id,
                 &emb,
                 &vector_provenance,
-            );
-            embeddings.insert(*idx, emb);
+            ) {
+                Ok(()) => {
+                    embeddings.insert(*idx, emb);
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "bucket_embeddings: vector write rejected for {}: {e}",
+                        mems[*idx].id
+                    );
+                }
+            }
         }
     }
 
@@ -667,18 +689,36 @@ fn run_vec_dedup_inner(
     let mut embeddings_by_id: std::collections::HashMap<String, Vec<f32>> =
         std::collections::HashMap::new();
     let mut pending_embeddings: Vec<(String, String)> = Vec::new();
+    // Codex round-11 P1: a vector only enters `embeddings_by_id` (and from
+    // there HNSW, the candidate search and the merge decision) after the
+    // store accepted it. `insert_embedding_checked` refuses the write when
+    // the store is stamped for another embedding model — a stale process
+    // after a migration — and searching the new-model table with an
+    // old-model vector would contaminate HNSW and could drive a wrong
+    // destructive merge. Refused ids keep `needs_vec_dedup = 1` because the
+    // clear below only runs for ids present in the map.
+    let mut rejected_writes = 0usize;
 
     for (id, topic, summary, content) in &pending {
         let enriched = crate::embed::prepend_metadata(topic, summary, content);
         match crate::embed::EmbedCache::get(conn, &enriched, &model_name) {
             Ok(Some(cached)) => {
-                let _ = crate::store::vec::insert_embedding_checked(
+                match crate::store::vec::insert_embedding_checked(
                     conn,
                     id,
                     &cached,
                     &vector_provenance,
-                );
-                embeddings_by_id.insert(id.clone(), cached);
+                ) {
+                    Ok(()) => {
+                        embeddings_by_id.insert(id.clone(), cached);
+                    }
+                    Err(e) => {
+                        rejected_writes += 1;
+                        tracing::debug!(
+                            "vec_dedup: vector write rejected for {id}: {e}; preserving flag for retry"
+                        );
+                    }
+                }
             }
             _ => pending_embeddings.push((id.clone(), enriched)),
         }
@@ -705,9 +745,24 @@ fn run_vec_dedup_inner(
 
         for ((id, enriched), emb) in chunk.iter().zip(batch_embeddings) {
             let _ = crate::embed::EmbedCache::put(conn, enriched, &model_name, &emb);
-            let _ = crate::store::vec::insert_embedding_checked(conn, id, &emb, &vector_provenance);
-            embeddings_by_id.insert(id.clone(), emb);
+            match crate::store::vec::insert_embedding_checked(conn, id, &emb, &vector_provenance) {
+                Ok(()) => {
+                    embeddings_by_id.insert(id.clone(), emb);
+                }
+                Err(e) => {
+                    rejected_writes += 1;
+                    tracing::debug!(
+                        "vec_dedup: vector write rejected for {id}: {e}; preserving flag for retry"
+                    );
+                }
+            }
         }
+    }
+    if rejected_writes > 0 {
+        tracing::warn!(
+            "vec_dedup: {rejected_writes} vector writes rejected by the store (embedding model \
+             stamp or write error); those memories keep needs_vec_dedup = 1 for retry"
+        );
     }
 
     for (id, _topic, _summary, content) in &pending {

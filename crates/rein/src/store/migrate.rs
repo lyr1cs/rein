@@ -271,14 +271,9 @@ pub async fn reindex_with_embedder(
 
     let (total, embedded, errors) =
         stage_reindex_embeddings(store, config, embedder, scope, _reindex_lock.as_ref()).await?;
-    if total == 0 {
-        return Ok(ReindexReport {
-            total: 0,
-            embedded: 0,
-            errors: 0,
-            skipped_changed: 0,
-        });
-    }
+    // No early return on `total == 0`: the swap below still has to run so
+    // the vector table, its old-model rows and the provenance stamp move
+    // to the configured model (codex round-11 P2).
     if errors > 0 {
         let _ = store
             .conn()
@@ -437,15 +432,21 @@ pub(crate) async fn stage_reindex_embeddings(
         .collect();
 
     let total = rows.len();
-    if total == 0 {
-        return Ok((0, 0, 0));
-    }
-
     // 4. Batch embed and STREAM each batch to a staging table so memory usage
     // stays O(batch) rather than O(total). At 3072-dim floats, 100k memories
     // would otherwise buffer >1GB before the swap — the staging table keeps
     // it on disk and lets us drop batches as they're persisted.
+    //
+    // The staging table is created even when nothing is in scope: an empty
+    // Live scope (every memory deprecated, or a fresh database) must still
+    // complete the swap so the vector table is recreated at the new
+    // dimensions, stale old-model rows are cleared and the provenance stamp
+    // moves to the new model. Otherwise current-model writers would stay
+    // refused by `insert_embedding_checked` (codex round-11 P2).
     schema::create_embed_staging(store.conn())?;
+    if total == 0 {
+        return Ok((0, 0, 0));
+    }
     let mut embedded = 0usize;
     let mut errors = 0usize;
 
@@ -613,6 +614,103 @@ mod tests {
             "{err}"
         );
         drop(held);
+    }
+
+    /// Codex round-11 P2: a model change on a database whose Live scope is
+    /// empty must still replace the vector table and move the provenance
+    /// stamp, otherwise every current-model write stays refused.
+    #[tokio::test]
+    async fn live_scope_reindex_restamps_when_no_live_rows_exist() {
+        use crate::store::schema::VEC_ROWS_PROVENANCE_KEY;
+        use crate::types::{
+            Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, MemoryTier, Source,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::ReinConfig::default();
+        let dims = config.embedding.dimensions;
+        let db_path = dir.path().join("memories.db");
+        let store =
+            crate::store::SqliteStore::new(&db_path, &config.embedding_model(), dims).unwrap();
+        let now = chrono::Utc::now();
+        let gone = Memory {
+            id: ulid::Ulid::new().to_string(),
+            layer: MemoryLayer::LTM,
+            topic: "gone".to_string(),
+            summary: "gone summary".to_string(),
+            content: "gone content".to_string(),
+            keywords: vec![],
+            importance: Importance::Medium,
+            source: Source::Manual,
+            strength: 1.0,
+            decay_lambda: 0.06,
+            access_count: 0,
+            superseded_by: None,
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: 1.0,
+            source_diversity: 1.0,
+            contradiction_score: 0.0,
+            related_ids: vec![],
+            concept_ids: vec![],
+            status: MemoryStatus::Deprecated,
+            embedding: None,
+            tier: MemoryTier::Warm,
+            cluster_id: None,
+            archival_summary: None,
+            archival_summary_at: None,
+            archival_summary_version: None,
+            created_at: now,
+            updated_at: now,
+            last_accessed: now,
+        };
+        let gone_id = store.store(gone).unwrap();
+        // An old-model vector for the deprecated row plus the old stamp.
+        crate::store::vec::insert_embedding(store.conn(), &gone_id, &vec![0.5; dims]).unwrap();
+        let old_provenance = format!("old-model:{dims}");
+        store
+            .conn()
+            .execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES (?1, ?2)",
+                rusqlite::params![VEC_ROWS_PROVENANCE_KEY, old_provenance],
+            )
+            .unwrap();
+        let embedder = crate::embed::EmbedderKind::Mock(
+            crate::embed::MockEmbedder::with_fixed_vector(dims, vec![0.25; dims]),
+        );
+
+        let report =
+            super::reindex_with_embedder(&store, &config, &embedder, super::ReindexScope::Live)
+                .await
+                .unwrap();
+        assert_eq!(report.total, 0);
+        assert_eq!(report.embedded, 0);
+
+        let stamped: String = store
+            .conn()
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?1",
+                rusqlite::params![VEC_ROWS_PROVENANCE_KEY],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let new_provenance = format!("{}:{dims}", config.embedding_model());
+        assert_eq!(
+            stamped, new_provenance,
+            "stamp must move to the configured model"
+        );
+        let rows: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM vec_memories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "old-model rows must not survive the swap");
+        crate::store::vec::insert_embedding_checked(
+            store.conn(),
+            "fresh",
+            &vec![0.5; dims],
+            &new_provenance,
+        )
+        .expect("current-model writer is accepted after the swap");
     }
 
     #[cfg(feature = "test-support")]

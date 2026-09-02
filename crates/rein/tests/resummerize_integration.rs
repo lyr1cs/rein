@@ -1503,3 +1503,55 @@ fn in_progress_claim_blocks_second_worker_and_expires_after_stale_timeout() {
     let backlog = rein::ops::resummerize::backlog_count(&store).unwrap();
     assert_eq!(backlog, 1);
 }
+
+/// Codex round-11 P1 regression guard: when the store is stamped for a
+/// different embedding model (a stale process after a migration), the
+/// checked vector write is refused and vec-dedup must neither search with
+/// that vector nor clear `needs_vec_dedup`.
+#[tokio::test(flavor = "multi_thread")]
+async fn vec_dedup_preserves_flag_when_store_is_stamped_for_another_model() {
+    use rein::embed::{EmbedderKind, MockEmbedder};
+    use rein::ops::dedup::run_vec_dedup_with_embedder;
+
+    let store = SqliteStore::in_memory().unwrap();
+    let config = ReinConfig::default();
+    let dims = config.embedding.dimensions;
+    let canonical_id = store
+        .store(make_memory("stamp-mismatch-test", "body content"))
+        .unwrap();
+    store
+        .conn()
+        .execute(
+            "UPDATE memories SET needs_vec_dedup = 1 WHERE id = ?1",
+            rusqlite::params![&canonical_id],
+        )
+        .unwrap();
+    store
+        .conn()
+        .execute(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES ('vec_rows_provenance', ?1)",
+            rusqlite::params![format!("another-model:{dims}")],
+        )
+        .unwrap();
+
+    let embedder = EmbedderKind::Mock(MockEmbedder::with_fixed_vector(dims, vec![0.5; dims]));
+    run_vec_dedup_with_embedder(&store, &config, embedder);
+
+    let flag: i64 = store
+        .conn()
+        .query_row(
+            "SELECT needs_vec_dedup FROM memories WHERE id = ?1",
+            rusqlite::params![&canonical_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        flag, 1,
+        "refused vector write must preserve needs_vec_dedup"
+    );
+    let rows: i64 = store
+        .conn()
+        .query_row("SELECT COUNT(*) FROM vec_memories", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "no vector may be written under a foreign stamp");
+}
