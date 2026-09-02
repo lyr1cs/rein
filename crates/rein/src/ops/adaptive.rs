@@ -5238,6 +5238,14 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT)")
             .unwrap();
+        // A real store always carries the A12 input epoch row after schema
+        // bring-up; the policy refresh fails closed without it. Seed epoch 0
+        // to match the `source_input_epoch: 0` the A12 fixtures use.
+        conn.execute(
+            "INSERT INTO metadata(key, value) VALUES (?1, '0')",
+            rusqlite::params![crate::store::a12_calibration::A12_INPUT_EPOCH_METADATA_KEY],
+        )
+        .unwrap();
         conn
     }
 
