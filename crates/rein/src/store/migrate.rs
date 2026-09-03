@@ -491,12 +491,14 @@ pub(crate) async fn stage_reindex_embeddings(
     loop {
         let chunk: Vec<(String, String, String, String)> = {
             let mut stmt = store.conn().prepare(&page_sql)?;
+            // A row that fails to decode must fail the reindex (the swap
+            // never runs and the old index survives) rather than vanish
+            // from the staged set (codex round-21 P2).
             let rows: Vec<(String, String, String, String)> = stmt
                 .query_map(rusqlite::params![cursor], |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
                 })?
-                .filter_map(|r| r.ok())
-                .collect();
+                .collect::<Result<Vec<_>, _>>()?;
             rows
         };
         let Some(last) = chunk.last() else {

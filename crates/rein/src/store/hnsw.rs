@@ -84,6 +84,11 @@ impl HnswIndex {
         self.index.size() == 0
     }
 
+    /// Whether `id` currently has an entry in the index.
+    pub fn contains(&self, id: &str) -> bool {
+        self.id_to_key.contains_key(id)
+    }
+
     /// Insert a vector for the given memory ID.
     pub fn insert(&mut self, id: &str, vector: &[f32]) -> ReinResult<()> {
         let key = self.next_key;

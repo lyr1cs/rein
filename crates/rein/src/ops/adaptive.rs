@@ -1079,7 +1079,26 @@ impl SentinelLock {
                     path = %path.display(),
                     "adaptive pipeline: taking over an abandoned single-flight sentinel"
                 );
-                std::fs::remove_file(path)?;
+                // Claim the abandoned sentinel atomically (codex round-21
+                // P1): `rename` succeeds for exactly one contender. A peer
+                // that lost the rename sees NotFound and must not remove
+                // anything — by then the file at `path` may already be the
+                // winner's fresh sentinel — it just tries `create_new`,
+                // which fails once the winner has re-created it.
+                let claim = path.with_file_name(format!(
+                    "{}.stale.{}",
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("sentinel"),
+                    std::process::id()
+                ));
+                match std::fs::rename(path, &claim) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&claim);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
                 match Self::create(path) {
                     Ok(lock) => Ok(Some(lock)),
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
@@ -5844,8 +5863,36 @@ mod tests {
         let taken = SentinelLock::try_acquire(&path, far_future)
             .unwrap()
             .expect("stale sentinel taken over");
+        // Codex round-21 P1: the takeover claims the stale file by rename;
+        // the claim file must not linger.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".stale."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "claim files left behind: {leftovers:?}"
+        );
+        assert!(path.exists(), "the winner holds a fresh sentinel");
         drop(taken);
         assert!(!path.exists());
+
+        // A contender that lost the rename must not touch the winner's fresh
+        // sentinel: with a live holder in place and no stale file to claim,
+        // the takeover path yields None.
+        std::fs::write(&path, b"999999999").unwrap();
+        let winner = SentinelLock::try_acquire(&path, far_future)
+            .unwrap()
+            .expect("stale sentinel taken over");
+        assert!(
+            SentinelLock::try_acquire(&path, far_future)
+                .unwrap()
+                .is_none(),
+            "a fresh sentinel with a live holder is never taken over"
+        );
+        drop(winner);
 
         // An old sentinel whose holder is still alive (our own pid) is never
         // taken over, and a heartbeat makes it young again.

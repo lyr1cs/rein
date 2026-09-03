@@ -156,9 +156,10 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
                             if options.fix {
                                 fixes_applied.extend(apply_local_fixes(config, &store));
                             }
-                            let (hnsw_check, indexed_vectors) =
-                                inspect_hnsw(&store, snapshot.total_memories);
-                            checks.push(check_vector_coverage(config, &snapshot, indexed_vectors));
+                            let live_ids = live_vector_ids(&store).unwrap_or_default();
+                            let (hnsw_check, hnsw_coverage) =
+                                inspect_hnsw(&store, snapshot.total_memories, &live_ids);
+                            checks.push(check_vector_coverage(config, &snapshot, hnsw_coverage));
                             checks.push(check_vector_provenance(config, &snapshot));
                             checks.push(check_tantivy(&store, snapshot.active_memories));
                             checks.push(hnsw_check);
@@ -2215,13 +2216,13 @@ fn count_sql(store: &SqliteStore, sql: &str) -> anyhow::Result<usize> {
 fn check_vector_coverage(
     config: &ReinConfig,
     snapshot: &StoreSnapshot,
-    indexed_vectors: Option<usize>,
+    hnsw: Option<HnswCoverage>,
 ) -> DoctorCheck {
     if snapshot.total_memories == 0 {
         return ok_in(DoctorCategory::Index, "vector_store", "0 memories");
     }
 
-    let Some(indexed_vectors) = indexed_vectors else {
+    let Some(hnsw) = hnsw else {
         let hint = match config.embedding_provider() {
             Provider::None => "embedding provider is disabled",
             Provider::Google if config.embedding.google.api_key.is_none() => {
@@ -2254,7 +2255,7 @@ fn check_vector_coverage(
             "vector_store",
             format!(
                 "no live memories ({} total, {} indexed vectors)",
-                snapshot.total_memories, indexed_vectors
+                snapshot.total_memories, hnsw.indexed
             ),
         );
     }
@@ -2264,7 +2265,7 @@ fn check_vector_coverage(
         snapshot.live_vectors,
         snapshot.live_memories,
         coverage * 100.0,
-        indexed_vectors,
+        hnsw.indexed,
         snapshot.total_memories,
         snapshot.embed_cache_rows,
         snapshot.artifact_rows
@@ -2277,16 +2278,17 @@ fn check_vector_coverage(
             "run `rein warmup` to fill missing cached embeddings",
         );
     }
-    // Codex round-16 P2: a clean HNSW index that holds fewer entries than
-    // the live vector table has missed side-index updates; the SQLite rows
-    // alone must not decide health.
-    if indexed_vectors < snapshot.live_vectors {
+    // Codex round-16 / round-21 P2: a clean HNSW index that lacks entries
+    // for live vectors has missed side-index updates; the SQLite rows alone
+    // must not decide health, and membership — not entry count — decides
+    // (stale deprecated ids can balance the count).
+    if hnsw.missing_live > 0 {
         return warn_with_hint(
             DoctorCategory::Index,
             "vector_store",
             format!(
-                "{message}; HNSW holds {indexed_vectors} of {} live vectors",
-                snapshot.live_vectors
+                "{message}; HNSW is missing {} of {} live vectors",
+                hnsw.missing_live, snapshot.live_vectors
             ),
             "run `rein doctor --fix` (or `rein warmup`) to rebuild the HNSW side index",
         );
@@ -2411,7 +2413,34 @@ fn check_tantivy(store: &SqliteStore, active_memories: usize) -> DoctorCheck {
     }
 }
 
-fn inspect_hnsw(store: &SqliteStore, total_memories: usize) -> (DoctorCheck, Option<usize>) {
+/// What the on-disk HNSW index covers, as seen by doctor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HnswCoverage {
+    /// Entries in the index (may include deprecated or deleted ids).
+    indexed: usize,
+    /// Live memories with a vector row that have no entry in the index.
+    missing_live: usize,
+}
+
+/// Ids of live memories (`status` active / updated) that have a vector row.
+fn live_vector_ids(store: &SqliteStore) -> anyhow::Result<Vec<String>> {
+    let mut stmt = store.conn().prepare(
+        "SELECT m.id
+           FROM memories m
+           JOIN vec_memories v ON v.id = m.id
+          WHERE m.status IN ('active', 'updated')",
+    )?;
+    let ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ids)
+}
+
+fn inspect_hnsw(
+    store: &SqliteStore,
+    total_memories: usize,
+    live_vector_ids: &[String],
+) -> (DoctorCheck, Option<HnswCoverage>) {
     let base_path = store.db_path().with_extension("");
     let index_path = base_path.with_extension("usearch");
     let meta_path = base_path.with_extension("usearch.meta");
@@ -2420,7 +2449,10 @@ fn inspect_hnsw(store: &SqliteStore, total_memories: usize) -> (DoctorCheck, Opt
     if total_memories == 0 && !index_path.exists() {
         return (
             ok_in(DoctorCategory::Index, "hnsw", "not built yet (0 memories)"),
-            Some(0),
+            Some(HnswCoverage {
+                indexed: 0,
+                missing_live: 0,
+            }),
         );
     }
     if !index_path.exists() {
@@ -2457,6 +2489,16 @@ fn inspect_hnsw(store: &SqliteStore, total_memories: usize) -> (DoctorCheck, Opt
                 index.len(),
                 index_path.display()
             );
+            // Membership, not cardinality (codex round-21 P2): an index
+            // holding stale deprecated ids can have exactly as many entries
+            // as there are live vectors while missing live ones.
+            let coverage = HnswCoverage {
+                indexed: index.len(),
+                missing_live: live_vector_ids
+                    .iter()
+                    .filter(|id| !index.contains(id))
+                    .count(),
+            };
             if dirty {
                 (
                     warn_with_hint(
@@ -2465,12 +2507,12 @@ fn inspect_hnsw(store: &SqliteStore, total_memories: usize) -> (DoctorCheck, Opt
                         format!("{message}; dirty marker is present"),
                         "run `rein doctor --fix` or `rein warmup`",
                     ),
-                    Some(index.len()),
+                    Some(coverage),
                 )
             } else {
                 (
                     ok_in(DoctorCategory::Index, "hnsw", message),
-                    Some(index.len()),
+                    Some(coverage),
                 )
             }
         }
@@ -6245,23 +6287,39 @@ mod vector_diagnostics_tests {
         }
     }
 
-    /// Codex round-16 P2: full SQLite coverage with a short HNSW index is
-    /// not healthy.
+    fn hnsw(indexed: usize, missing_live: usize) -> Option<HnswCoverage> {
+        Some(HnswCoverage {
+            indexed,
+            missing_live,
+        })
+    }
+
+    /// Codex round-16 / round-21 P2: full SQLite coverage with an HNSW
+    /// index that lacks live entries is not healthy — even when stale
+    /// deprecated entries make the counts match.
     #[test]
-    fn coverage_warns_when_hnsw_holds_fewer_entries_than_live_vectors() {
+    fn coverage_warns_when_hnsw_misses_live_vectors() {
         let config = ReinConfig::default();
         let snap = snapshot(100, 100);
-        let ok = check_vector_coverage(&config, &snap, Some(100));
+        let ok = check_vector_coverage(&config, &snap, hnsw(100, 0));
         assert_eq!(ok.status, CheckStatus::Ok, "{}", ok.message);
         // Deprecated entries still in the index are not a shortfall.
-        let more = check_vector_coverage(&config, &snap, Some(120));
+        let more = check_vector_coverage(&config, &snap, hnsw(120, 0));
         assert_eq!(more.status, CheckStatus::Ok, "{}", more.message);
-        let short = check_vector_coverage(&config, &snap, Some(40));
+        let short = check_vector_coverage(&config, &snap, hnsw(40, 60));
         assert_eq!(short.status, CheckStatus::Warn, "{}", short.message);
         assert!(
-            short.message.contains("HNSW holds 40 of 100"),
+            short.message.contains("missing 60 of 100"),
             "{}",
             short.message
+        );
+        // Balanced count, stale membership: still a shortfall.
+        let stale = check_vector_coverage(&config, &snap, hnsw(100, 5));
+        assert_eq!(stale.status, CheckStatus::Warn, "{}", stale.message);
+        assert!(
+            stale.message.contains("missing 5 of 100"),
+            "{}",
+            stale.message
         );
     }
 
