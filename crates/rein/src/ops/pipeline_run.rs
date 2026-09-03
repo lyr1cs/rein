@@ -143,6 +143,10 @@ fn now_unix_ms() -> i64 {
 pub struct PipelineRunRecorder<'a> {
     store: &'a SqliteStore,
     record: RefCell<PipelineRunRecord>,
+    /// Called every time a stage is recorded; the pipeline uses it to
+    /// refresh its single-flight sentinel so a long pass is never mistaken
+    /// for a dead one (codex round-19 P2).
+    heartbeat: RefCell<Option<Box<dyn Fn()>>>,
 }
 
 impl<'a> PipelineRunRecorder<'a> {
@@ -162,6 +166,7 @@ impl<'a> PipelineRunRecorder<'a> {
         let recorder = Self {
             store,
             record: RefCell::new(record),
+            heartbeat: RefCell::new(None),
         };
         recorder.persist();
         recorder
@@ -272,6 +277,17 @@ impl<'a> PipelineRunRecorder<'a> {
         }
     }
 
+    /// Register a callback run after every recorded stage.
+    pub fn set_heartbeat(&self, heartbeat: Box<dyn Fn()>) {
+        *self.heartbeat.borrow_mut() = Some(heartbeat);
+    }
+
+    fn beat(&self) {
+        if let Some(heartbeat) = self.heartbeat.borrow().as_ref() {
+            heartbeat();
+        }
+    }
+
     fn push_stage(
         &self,
         name: &str,
@@ -296,6 +312,7 @@ impl<'a> PipelineRunRecorder<'a> {
             detail,
         });
         self.persist();
+        self.beat();
     }
 
     fn persist(&self) {

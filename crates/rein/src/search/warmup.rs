@@ -267,10 +267,12 @@ pub async fn backfill_missing_vec_rows(
         write_metadata(store, VEC_ROWS_PROVENANCE_KEY, &provenance);
     }
 
-    // Collect the rows to work on so memory stays bounded by the gap (or,
-    // for a migration, by the live set) and no write happens while the row
-    // cursor is open.
-    let mut pending: Vec<(String, String)> = Vec::new();
+    // Collect only the ids of the rows to work on: their text is re-read
+    // page by page below, so memory stays bounded by the id list and one
+    // page of text (codex round-19 P1: a large FTS-only vault with no
+    // provider must not buffer its whole corpus), and no write happens while
+    // the row cursor is open.
+    let mut pending: Vec<String> = Vec::new();
     let mut live_total = 0_usize;
     if let Err(e) = store.for_each_for_warmup(|row| {
         if !hnsw_row_is_live(&row.status) {
@@ -280,10 +282,7 @@ pub async fn backfill_missing_vec_rows(
         if reembed_all || existing.contains(&row.id) {
             return Ok(());
         }
-        pending.push((
-            row.id,
-            prepend_metadata(&row.topic, &row.summary, &row.content),
-        ));
+        pending.push(row.id);
         Ok(())
     }) {
         tracing::warn!("warmup: failed to list memories: {e}");
@@ -354,46 +353,59 @@ pub async fn backfill_missing_vec_rows(
         "warmup: live memories without a vector row"
     );
 
-    let mut to_embed: Vec<(String, String)> = Vec::new();
-    for (id, text) in pending {
-        match EmbedCache::get(store.conn(), &text, &model) {
-            Ok(Some(embedding)) if embedding.len() == dims => {
-                match write_validated_row(
-                    store,
-                    &id,
-                    &text,
-                    &embedding,
-                    existing.contains(&id),
-                    &provenance,
-                ) {
-                    Ok(true) => report.backfilled_from_cache += 1,
-                    Ok(false) => report.revalidation_skipped += 1,
-                    Err(e) => {
-                        tracing::warn!(id, "warmup: failed to restore vector row from cache: {e}");
-                        report.errors += 1;
+    // One page of ids at a time: read the text, fill from the cache, and
+    // embed the page's cache misses right away (or count them as skipped
+    // when there is no provider) so nothing corpus-sized is ever retained.
+    const PAGE: usize = 100;
+    let mut fill_errors = 0_usize;
+    for page in pending.chunks(PAGE) {
+        let mut to_embed: Vec<(String, String)> = Vec::new();
+        for id in page {
+            let text = match warmup_text_for(store, id) {
+                Ok(Some(text)) => text,
+                // Deleted or retired since the scan: nothing to fill.
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(id, "warmup: failed to read memory: {e}");
+                    fill_errors += 1;
+                    continue;
+                }
+            };
+            match EmbedCache::get(store.conn(), &text, &model) {
+                Ok(Some(embedding)) if embedding.len() == dims => {
+                    match write_validated_row(
+                        store,
+                        id,
+                        &text,
+                        &embedding,
+                        existing.contains(id),
+                        &provenance,
+                    ) {
+                        Ok(true) => report.backfilled_from_cache += 1,
+                        Ok(false) => report.revalidation_skipped += 1,
+                        Err(e) => {
+                            tracing::warn!(
+                                id,
+                                "warmup: failed to restore vector row from cache: {e}"
+                            );
+                            fill_errors += 1;
+                        }
                     }
                 }
+                _ => to_embed.push((id.clone(), text)),
             }
-            _ => to_embed.push((id, text)),
         }
-    }
-
-    if to_embed.is_empty() {
-        if report.errors == 0 {
-            write_metadata(store, VEC_ROWS_PROVENANCE_KEY, &provenance);
+        if to_embed.is_empty() {
+            continue;
         }
-        return report;
-    }
-    let Some(embedder) = embedder else {
-        report.skipped_no_provider = to_embed.len();
-        return report;
-    };
-
-    for chunk in to_embed.chunks(100) {
-        let texts: Vec<&str> = chunk.iter().map(|(_, text)| text.as_str()).collect();
+        let Some(embedder) = embedder else {
+            report.skipped_no_provider += to_embed.len();
+            continue;
+        };
+        let texts: Vec<&str> = to_embed.iter().map(|(_, text)| text.as_str()).collect();
         match embedder.embed_batch(&texts).await {
-            Ok(embeddings) if embeddings.len() == chunk.len() => {
-                for ((id, text), embedding) in chunk.iter().zip(embeddings.iter()) {
+            Ok(embeddings) if embeddings.len() == to_embed.len() => {
+                for ((id, text), embedding) in to_embed.iter().zip(embeddings.iter()) {
                     if embedding.len() != dims {
                         tracing::warn!(
                             id,
@@ -401,7 +413,7 @@ pub async fn backfill_missing_vec_rows(
                             expected = dims,
                             "warmup: provider returned an embedding of the wrong size"
                         );
-                        report.errors += 1;
+                        fill_errors += 1;
                         continue;
                     }
                     if let Err(e) = EmbedCache::put(store.conn(), text, &model, embedding) {
@@ -419,32 +431,54 @@ pub async fn backfill_missing_vec_rows(
                         Ok(false) => report.revalidation_skipped += 1,
                         Err(e) => {
                             tracing::warn!(id, "warmup: failed to insert vector row: {e}");
-                            report.errors += 1;
+                            fill_errors += 1;
                         }
                     }
                 }
             }
             Ok(embeddings) => {
-                // Any count mismatch means the response cannot be aligned with
-                // the request; treat the whole chunk as failed.
                 tracing::warn!(
-                    requested = chunk.len(),
+                    requested = to_embed.len(),
                     returned = embeddings.len(),
                     "warmup: provider returned a mismatched embedding count"
                 );
-                report.errors += chunk.len();
+                fill_errors += to_embed.len();
             }
             Err(e) => {
                 tracing::warn!("warmup batch failed: {e}");
-                report.errors += chunk.len();
+                fill_errors += to_embed.len();
             }
         }
     }
+    report.errors += fill_errors;
 
-    if report.errors == 0 {
+    if fill_errors == 0 {
         write_metadata(store, VEC_ROWS_PROVENANCE_KEY, &provenance);
     }
     report
+}
+
+/// The text `store()` embeds for a live memory, or `None` when the row is
+/// gone or no longer live.
+fn warmup_text_for(store: &SqliteStore, id: &str) -> crate::types::ReinResult<Option<String>> {
+    use rusqlite::OptionalExtension;
+    Ok(store
+        .conn()
+        .query_row(
+            "SELECT topic, summary, content, status FROM memories WHERE id = ?1",
+            rusqlite::params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .filter(|(_, _, _, status)| hnsw_row_is_live(status))
+        .map(|(topic, summary, content, _)| prepend_metadata(&topic, &summary, &content)))
 }
 
 /// Whether `id` is still a live memory whose enriched text equals `text`.
@@ -2458,6 +2492,66 @@ mod tests {
             Some(format!("old-model:{dims}").as_str()),
             "provenance is not advanced by an incomplete migration"
         );
+    }
+
+    /// Codex round-19 P1: the cache-only path pages the gap; cache hits are
+    /// filled and misses counted as skipped without buffering the corpus.
+    #[tokio::test]
+    async fn cache_only_backfill_pages_the_gap_and_counts_misses() {
+        use crate::types::MemoryStore;
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+        let dims = config.embedding.dimensions;
+        let mut cached_ids = Vec::new();
+        for n in 0..130 {
+            let memory = live_memory(
+                &format!("paged-{n}"),
+                &format!("distinct body number {n} for the paging test {}", n * 7919),
+            );
+            let id = store.store(memory.clone()).unwrap();
+            if n % 40 == 0 {
+                EmbedCache::put(
+                    store.conn(),
+                    &enriched(&memory),
+                    &config.embedding_model(),
+                    &vec![0.5; dims],
+                )
+                .unwrap();
+                cached_ids.push(id);
+            }
+        }
+        let gap: usize = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM memories m
+                  WHERE m.status IN ('active', 'updated')
+                    AND m.id NOT IN (SELECT id FROM vec_memories)",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap() as usize;
+        assert!(
+            gap > 100,
+            "the gap must span more than one page (got {gap})"
+        );
+
+        let report =
+            backfill_missing_vec_rows(&store, &config, None, WarmupOptions::default()).await;
+        assert_eq!(report.errors, 0);
+        assert_eq!(
+            report.backfilled_from_cache + report.skipped_no_provider,
+            gap,
+            "every row in the gap is either filled from cache or counted as skipped"
+        );
+        assert!(report.backfilled_from_cache >= 1);
+        for id in &cached_ids {
+            assert!(
+                crate::store::vec::get_embedding(store.conn(), id)
+                    .unwrap()
+                    .is_some(),
+                "cached row {id} must be filled"
+            );
+        }
     }
 
     #[tokio::test]

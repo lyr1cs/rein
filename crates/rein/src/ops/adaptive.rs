@@ -1105,7 +1105,13 @@ impl SentinelLock {
     /// Heartbeat: refresh the sentinel's modification time so a legitimately
     /// long holder (a multi-hour reindex) is never mistaken for abandoned.
     pub(crate) fn touch(&self) {
-        if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&self.path) {
+        Self::touch_path(&self.path);
+    }
+
+    /// Heartbeat by path, for callers that cannot hold a borrow of the lock
+    /// (the pipeline recorder's stage callback).
+    pub(crate) fn touch_path(path: &std::path::Path) {
+        if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
             let _ = file.set_modified(std::time::SystemTime::now());
         }
     }
@@ -1232,6 +1238,15 @@ pub fn run_adaptive_pipeline_with_trigger(
     // Single-flight losers above return before this point on purpose: only
     // the process holding the lock may overwrite the last-run record.
     let recorder = PipelineRunRecorder::start(store, trigger);
+    // Without `flock` the sentinel is the only single-flight protection and
+    // a stale one is taken over after `PIPELINE_RUN_STALE_RUNNING_MS`: keep
+    // it fresh after every stage so a long pass is never mistaken for a
+    // dead one (codex round-19 P2).
+    #[cfg(not(unix))]
+    if let Some(lock) = _sentinel_lock.as_ref() {
+        let sentinel_path = lock.path.clone();
+        recorder.set_heartbeat(Box::new(move || SentinelLock::touch_path(&sentinel_path)));
+    }
 
     // Restore or create AdaptiveState
     let mut state =
@@ -1258,14 +1273,16 @@ pub fn run_adaptive_pipeline_with_trigger(
     // vectors HDBSCAN never saw would be recorded as covered (codex R5).
     let embedding_write_seq = crate::store::vec::embedding_write_seq(store.conn());
     if embeddings_count >= 50 && should_recluster(&state, embeddings_count, embedding_write_seq) {
-        recorder.stage("m4_cluster", || {
+        if let Err(error) = recorder.stage_result("m4_cluster", || {
             run_hdbscan_clustering(
                 store,
                 &mut state,
                 embeddings_count as usize,
                 embedding_write_seq,
             )
-        });
+        }) {
+            tracing::warn!("adaptive pipeline: recluster pass failed: {error}");
+        }
         recorder.annotate(
             "m4_cluster",
             format!(
@@ -2452,12 +2469,16 @@ fn should_recluster(
             >= min_cluster_size
 }
 
+/// Returns `Err` when the pass could not read its embeddings, could not
+/// persist its labels, or aborted because the clustering generation moved
+/// mid-run — the pipeline records those as a failed `m4_cluster` stage
+/// (codex round-19 P2). Too few embeddings is a skip, not a failure.
 fn run_hdbscan_clustering(
     store: &SqliteStore,
     state: &mut crate::store::adaptive::AdaptiveState,
     count: usize,
     gate_write_seq: u64,
-) {
+) -> Result<(), String> {
     tracing::debug!("M4: running HDBSCAN on {count} embeddings");
 
     // Read all embeddings — hdbscan() internally handles sampling for n > 3000
@@ -2482,11 +2503,11 @@ fn run_hdbscan_clustering(
             .ok()
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
             .unwrap_or_default(),
-        Err(_) => return,
+        Err(e) => return Err(format!("M4: failed to read embeddings: {e}")),
     };
 
     if embeddings.len() < 50 {
-        return;
+        return Ok(());
     }
 
     let min_cluster_size = 5.max(embeddings.len() / 50); // adaptive: ~2% of dataset
@@ -2684,10 +2705,10 @@ fn run_hdbscan_clustering(
                 state.memory_clusters.clear();
                 state.clear_cluster_scoped_learned_state();
                 tracing::warn!("M4: {e}");
-            } else {
-                tracing::error!("M4: failed to persist recluster atomically: {e}");
+                return Err(format!("M4: {e}"));
             }
-            return;
+            tracing::error!("M4: failed to persist recluster atomically: {e}");
+            return Err(format!("M4: failed to persist recluster atomically: {e}"));
         }
     };
     state.memory_clusters = new_clusters;
@@ -2718,6 +2739,7 @@ fn run_hdbscan_clustering(
         state.memory_clusters.len(),
         state.cluster_version,
     );
+    Ok(())
 }
 
 /// Element-wise mean of the given embedding indices.
@@ -8315,7 +8337,7 @@ mod tests {
         let mut state = AdaptiveState::default();
         // Should not panic
         let seq = crate::store::vec::embedding_write_seq(store.conn());
-        run_hdbscan_clustering(&store, &mut state, 60, seq);
+        let _ = run_hdbscan_clustering(&store, &mut state, 60, seq);
 
         // HDBSCAN should complete and increment cluster_version
         assert!(
@@ -8430,7 +8452,7 @@ mod tests {
 
         let pre_run_seq = crate::store::vec::embedding_write_seq(store.conn());
         assert!(pre_run_seq >= 60, "each insert_embedding bumps the counter");
-        run_hdbscan_clustering(&store, &mut state, 60, pre_run_seq);
+        let _ = run_hdbscan_clustering(&store, &mut state, 60, pre_run_seq);
         assert!(state.cluster_version > 0);
 
         // Cluster-scoped keys are wiped (cluster ids are local labels —
