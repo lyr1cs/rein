@@ -2715,11 +2715,14 @@ fn recall_temporal_with_execution_mode(
         .filter(|r| !r.memory.id.starts_with("sm:") && !r.memory.id.starts_with("auto:"))
         .map(|r| r.memory.id.clone())
         .collect();
-    if execution_mode.records_hits() {
+    if execution_mode.records_hits() && !recall_ids.is_empty() {
         store.record_recall_hit(&recall_ids);
+        // Only a recall that moved the hit total can land on the cadence;
+        // running the check otherwise would repeat the full-store quality
+        // scan on every call while the total sits on a multiple of 50
+        // (codex round-15 P2: prompt hooks recall without recording).
+        refresh_quality_weights_on_cadence(store);
     }
-
-    refresh_quality_weights_on_cadence(store);
 
     tracing::debug!(
         elapsed_ms = total_start.elapsed().as_millis() as u64,

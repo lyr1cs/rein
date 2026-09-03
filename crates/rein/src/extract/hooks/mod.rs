@@ -380,10 +380,12 @@ fn recall_prompt_context(
     let (context, emitted) = build_recall_context(&request_id, items, max_chars, max_items)?;
     // Only the memories that made it into the injected text count as recall
     // hits; the recall itself ran without recording any.
-    store.record_recall_hit(&emitted);
-    // Same post-hit cadence as a live recall: the recall above ran without
-    // recording, so its own check saw the pre-increment count.
-    crate::search::recall::refresh_quality_weights_on_cadence(store);
+    if !emitted.is_empty() {
+        store.record_recall_hit(&emitted);
+        // Same post-hit cadence as a live recall, and only after the total
+        // actually moved (the recall above ran without recording).
+        crate::search::recall::refresh_quality_weights_on_cadence(store);
+    }
     Some(context)
 }
 
@@ -1189,6 +1191,56 @@ mod tests {
             weights_written(&store),
             "the 50th recorded hit must refresh the quality weights"
         );
+    }
+
+    /// Codex round-15 P2: a prompt that records no new hit must not repeat
+    /// the quality-weight refresh while the total sits on a multiple of 50 —
+    /// neither from the non-recording recall nor from the hook itself.
+    #[test]
+    fn hook_prompt_recall_does_not_refresh_weights_without_new_hits() {
+        let (store, id) = seeded_store();
+        let config = recall_config();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO metadata(key, value) VALUES (?1, '50')",
+                rusqlite::params![format!("recall_hit:{id}")],
+            )
+            .unwrap();
+        let weights_written = |store: &crate::store::SqliteStore| -> bool {
+            store
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM metadata WHERE key = 'quality:bad_count'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+                > 0
+        };
+
+        // No match: nothing injected, nothing recorded, no refresh.
+        assert!(hook_prompt_output(
+            &config,
+            &prompt_payload("unrelated quokka lantern"),
+            false,
+            Some(&store),
+        )
+        .is_none());
+        assert!(!weights_written(&store));
+
+        // A match moves the total to 51: still no refresh (the in-recall
+        // check must not fire at the pre-record total of 50).
+        hook_prompt_output(
+            &config,
+            &prompt_payload("zebra protocol handshake nonce"),
+            false,
+            Some(&store),
+        )
+        .expect("context for a matching memory");
+        let (_, total_recalls, _) = store.quality_metrics().unwrap();
+        assert_eq!(total_recalls, 51);
+        assert!(!weights_written(&store));
     }
 
     #[test]
