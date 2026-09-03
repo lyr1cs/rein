@@ -33,6 +33,13 @@ pub enum ReinError {
     #[error("config error: {0}")]
     Config(String),
 
+    /// A vector write was refused because the vector table is stamped for
+    /// another embedding model, or holds rows of unknown provenance. The
+    /// store/update paths degrade to "memory without a vector" on this
+    /// variant instead of failing the memory write.
+    #[error("vector provenance: {0}")]
+    VectorProvenance(String),
+
     #[error("embedding error: {0}")]
     Embedding(String),
 

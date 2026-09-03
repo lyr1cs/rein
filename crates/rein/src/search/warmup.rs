@@ -242,13 +242,28 @@ pub async fn backfill_missing_vec_rows(
         && !existing.is_empty()
         && !options.trust_existing_vectors;
     if provenance_unknown {
+        // Codex round-13 P1: rows of unknown provenance admit no new rows —
+        // checked writes refuse the table and warmup must not sidestep that.
         report.provenance_unknown = true;
         tracing::warn!(
             rows = existing.len(),
-            "warmup: existing vector rows have no model provenance; filling missing rows only. \
+            "warmup: existing vector rows have no model provenance; no vector row was written. \
              Re-run with --trust-existing-vectors if they were produced by the configured model, \
              or with --reembed-all (or `rein migrate --reindex`) if the model changed"
         );
+        return report;
+    }
+    if stored_provenance.is_none() && !existing.is_empty() && !reembed_all {
+        // Operator attestation (`--trust-existing-vectors`): stamp before any
+        // row is written so the checked writes below are admitted. The
+        // attestation covers the existing rows and stands on its own even if
+        // the fill below fails part-way.
+        tracing::info!(
+            rows = existing.len(),
+            provenance,
+            "warmup: stamping existing vector rows on operator attestation"
+        );
+        write_metadata(store, VEC_ROWS_PROVENANCE_KEY, &provenance);
     }
 
     // Collect the rows to work on so memory stays bounded by the gap (or,
@@ -317,15 +332,12 @@ pub async fn backfill_missing_vec_rows(
         return report;
     }
 
-    let stamp_allowed = !provenance_unknown;
     if pending.is_empty() {
         tracing::info!(
             live_total,
             "warmup: every live memory already has a vector row"
         );
-        if stamp_allowed {
-            write_metadata(store, VEC_ROWS_PROVENANCE_KEY, &provenance);
-        }
+        write_metadata(store, VEC_ROWS_PROVENANCE_KEY, &provenance);
         return report;
     }
     tracing::info!(
@@ -359,7 +371,7 @@ pub async fn backfill_missing_vec_rows(
     }
 
     if to_embed.is_empty() {
-        if report.errors == 0 && stamp_allowed {
+        if report.errors == 0 {
             write_metadata(store, VEC_ROWS_PROVENANCE_KEY, &provenance);
         }
         return report;
@@ -421,7 +433,7 @@ pub async fn backfill_missing_vec_rows(
         }
     }
 
-    if report.errors == 0 && stamp_allowed {
+    if report.errors == 0 {
         write_metadata(store, VEC_ROWS_PROVENANCE_KEY, &provenance);
     }
     report
@@ -1682,7 +1694,11 @@ mod tests {
     fn test_store() -> (tempfile::TempDir, SqliteStore) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("memories.db");
-        let store = SqliteStore::new(&db_path, "text-embedding-3-small", 3072).unwrap();
+        // The store's model must match `ReinConfig::default()`: the first
+        // vector written through `store()` stamps the table for the store's
+        // model, and warmup compares that stamp with the config.
+        let store =
+            SqliteStore::new(&db_path, &ReinConfig::default().embedding_model(), 3072).unwrap();
         (dir, store)
     }
 
@@ -2445,6 +2461,15 @@ mod tests {
         let mut old = live_memory("legacy", "row from before provenance stamping");
         old.embedding = Some(vec![0.9; dims]);
         let old_id = store.store(old).unwrap();
+        // Simulate a table written by a binary that predates provenance
+        // stamping: `store()` claims an empty table, so drop the stamp again.
+        store
+            .conn()
+            .execute(
+                "DELETE FROM metadata WHERE key = ?1",
+                rusqlite::params![VEC_ROWS_PROVENANCE_KEY],
+            )
+            .unwrap();
         let missing = live_memory("missing", "row without a vector, cached");
         let missing_id = store.store(missing.clone()).unwrap();
         EmbedCache::put(
@@ -2460,12 +2485,12 @@ mod tests {
 
         assert!(report.provenance_unknown);
         assert_eq!(
-            report.backfilled_from_cache, 1,
-            "missing rows are still filled"
+            report.backfilled_from_cache, 0,
+            "an unattested table admits no new rows (codex round-13 P1)"
         );
         assert!(crate::store::vec::get_embedding(store.conn(), &missing_id)
             .unwrap()
-            .is_some());
+            .is_none());
         let kept = crate::store::vec::get_embedding(store.conn(), &old_id)
             .unwrap()
             .unwrap();
@@ -2491,6 +2516,13 @@ mod tests {
             read_metadata(&store, VEC_ROWS_PROVENANCE_KEY).as_deref(),
             Some(format!("{}:{dims}", config.embedding_model()).as_str())
         );
+        assert_eq!(
+            trusted.backfilled_from_cache, 1,
+            "the attested table is filled in the same pass"
+        );
+        assert!(crate::store::vec::get_embedding(store.conn(), &missing_id)
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
@@ -2543,15 +2575,19 @@ mod tests {
         memory.embedding = Some(vec![0.9; dims]);
         let id = store.store(memory).unwrap();
 
+        // `store()` claimed the empty table for the store's model; the
+        // replacement writes under the same provenance.
+        let provenance = format!("{}:{dims}", ReinConfig::default().embedding_model());
+
         // Wrong dimension: sqlite-vec rejects the insert after the delete ran.
         let wrong = vec![0.1; dims + 1];
-        assert!(replace_embedding_row(store.conn(), &id, &wrong, true, "m:1").is_err());
+        assert!(replace_embedding_row(store.conn(), &id, &wrong, true, &provenance).is_err());
         let kept = crate::store::vec::get_embedding(store.conn(), &id)
             .unwrap()
             .expect("previous vector survives a failed replacement");
         assert!((kept[0] - 0.9).abs() < 1e-6);
 
-        replace_embedding_row(store.conn(), &id, &vec![0.3; dims], true, "m:1").unwrap();
+        replace_embedding_row(store.conn(), &id, &vec![0.3; dims], true, &provenance).unwrap();
         let replaced = crate::store::vec::get_embedding(store.conn(), &id)
             .unwrap()
             .unwrap();

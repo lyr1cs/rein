@@ -13,7 +13,7 @@ commands and inventory-backed operation commands.
 | `rein init` | `--dry-run`, `--proxy` | Generate MCP client config and optional proxy shell helpers. |
 | `rein export` | `--format`, `--topic`, `--output` | Export memories as JSON, Markdown, or CSV. |
 | `rein upgrade` | `--topic`, `--dry-run` | Extract knowledge-graph concepts and links from old memories. |
-| `rein warmup` | `--trust-existing-vectors`, `--reembed-all` | Make every live memory durable in the vector store: fill missing `vec_memories` rows from the embedding cache or the provider, then rebuild HNSW. Rows created before provenance stamping are untrusted until attested with `--trust-existing-vectors`; `--reembed-all` re-embeds every live row under the configured model and replaces the table atomically (each row revalidated at publish). |
+| `rein warmup` | `--trust-existing-vectors`, `--reembed-all` | Make every live memory durable in the vector store: fill missing `vec_memories` rows from the embedding cache or the provider, then rebuild HNSW. Rows created before provenance stamping are untrusted: until they are attested with `--trust-existing-vectors` (or re-embedded) the vector store refuses new rows — `warmup` writes nothing, and memories stored meanwhile are kept without a vector and flagged for a later vector pass. `--reembed-all` re-embeds every live row under the configured model and replaces the table atomically (each row revalidated at publish). |
 | `rein worker memory` | none | Drain the async memory queue. |
 | `rein worker dedup-queue` | none | Drain queued store-time dedup jobs. |
 | `rein worker cleanup` | topic selectors, `--all`, `--exact-topics`, `--dry-run` | Run a detached cleanup pass. |

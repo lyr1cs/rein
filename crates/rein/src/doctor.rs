@@ -94,6 +94,8 @@ struct StoreSnapshot {
     /// `status IN ('active', 'updated')`: the rows that are expected to
     /// carry a vector (see `check_vector_coverage`).
     live_memories: usize,
+    /// Live memories with a `vec_memories` row.
+    live_vectors: usize,
     embed_cache_rows: usize,
     artifact_rows: usize,
 }
@@ -2165,12 +2167,23 @@ fn collect_store_snapshot(store: &SqliteStore) -> anyhow::Result<StoreSnapshot> 
         store,
         "SELECT COUNT(*) FROM memories WHERE status IN ('active', 'updated')",
     )?;
+    // Numerator for coverage: live memories that actually have a vector row.
+    // The HNSW length is not usable here — an index built before an upgrade
+    // can still hold deprecated or deleted entries (codex round-13 P2).
+    let live_vectors = count_sql(
+        store,
+        "SELECT COUNT(*)
+           FROM memories m
+           JOIN vec_memories v ON v.id = m.id
+          WHERE m.status IN ('active', 'updated')",
+    )?;
     let embed_cache_rows = count_sql(store, "SELECT COUNT(*) FROM embed_cache")?;
     let artifact_rows = count_sql(store, "SELECT COUNT(*) FROM session_artifacts")?;
     Ok(StoreSnapshot {
         total_memories,
         active_memories,
         live_memories,
+        live_vectors,
         embed_cache_rows,
         artifact_rows,
     })
@@ -2226,13 +2239,14 @@ fn check_vector_coverage(
             ),
         );
     }
-    let coverage = indexed_vectors as f64 / snapshot.live_memories as f64;
+    let coverage = snapshot.live_vectors as f64 / snapshot.live_memories as f64;
     let message = format!(
-        "{} indexed vectors for {} live memories ({} total, {:.0}% coverage, cache={}, artifacts={})",
-        indexed_vectors,
+        "{} of {} live memories have a vector ({:.0}% coverage, hnsw={}, total={}, cache={}, artifacts={})",
+        snapshot.live_vectors,
         snapshot.live_memories,
-        snapshot.total_memories,
         coverage * 100.0,
+        indexed_vectors,
+        snapshot.total_memories,
         snapshot.embed_cache_rows,
         snapshot.artifact_rows
     );

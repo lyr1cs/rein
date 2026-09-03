@@ -24,6 +24,22 @@ use rein::store::adaptive::{
 use rein::store::SqliteStore;
 use rein::types::*;
 
+/// Fixture vector written the way the current binary writes it: through the
+/// provenance-checked path, so the table is claimed for the configured model
+/// and later `vec_dedup` / warmup writes are admitted.
+fn insert_vector_for_current_model(
+    store: &SqliteStore,
+    id: &str,
+    embedding: &[f32],
+) -> rein::types::ReinResult<()> {
+    let provenance = format!(
+        "{}:{}",
+        ReinConfig::default().embedding_model(),
+        embedding.len()
+    );
+    rein::store::vec::insert_embedding_checked(store.conn(), id, embedding, &provenance)
+}
+
 fn make_memory(topic: &str, content: &str) -> Memory {
     Memory {
         id: ulid::Ulid::new().to_string(),
@@ -1055,7 +1071,7 @@ async fn vec_dedup_accepts_updated_canonical_as_strong_match_candidate() {
         .unwrap();
 
     let fixed = vec![0.25f32; dims];
-    rein::store::vec::insert_embedding(store.conn(), &candidate_id, &fixed).unwrap();
+    insert_vector_for_current_model(&store, &candidate_id, &fixed).unwrap();
     let mock = EmbedderKind::Mock(MockEmbedder::with_fixed_vector(dims, fixed));
     run_vec_dedup_with_embedder(&store, &config, mock);
 
@@ -1110,7 +1126,7 @@ async fn vec_dedup_strong_threshold_ignores_lexical_shadow() {
     let mut candidate_embedding = vec![0.0f32; dims];
     candidate_embedding[0] = cosine;
     candidate_embedding[1] = (1.0 - cosine * cosine).sqrt();
-    rein::store::vec::insert_embedding(store.conn(), &candidate_id, &candidate_embedding).unwrap();
+    insert_vector_for_current_model(&store, &candidate_id, &candidate_embedding).unwrap();
     assert!(
         cosine > config.cleanup.vec_dedup_strong_threshold as f32 && cosine < 0.90,
         "fixture cosine must sit between vector config and lexical shadow"
@@ -1169,7 +1185,7 @@ async fn vec_dedup_preserves_flag_when_strong_merge_mark_superseded_fails() {
     store.conn().execute_batch(&trigger_sql).unwrap();
 
     let fixed = vec![0.5f32; dims];
-    rein::store::vec::insert_embedding(store.conn(), &candidate_id, &fixed).unwrap();
+    insert_vector_for_current_model(&store, &candidate_id, &fixed).unwrap();
     let mock = EmbedderKind::Mock(MockEmbedder::with_fixed_vector(dims, fixed));
     run_vec_dedup_with_embedder(&store, &config, mock);
 
@@ -1554,4 +1570,55 @@ async fn vec_dedup_preserves_flag_when_store_is_stamped_for_another_model() {
         .query_row("SELECT COUNT(*) FROM vec_memories", [], |r| r.get(0))
         .unwrap();
     assert_eq!(rows, 0, "no vector may be written under a foreign stamp");
+}
+
+/// Codex round-13 P1/P2: a store whose vector table is stamped for another
+/// model keeps the memory (FTS-visible, flagged for a later vector retry)
+/// instead of failing the write or admitting a foreign-model vector.
+#[test]
+fn store_keeps_memory_without_vector_when_table_is_stamped_for_another_model() {
+    let store = SqliteStore::in_memory().unwrap();
+    store
+        .conn()
+        .execute(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES ('vec_rows_provenance', 'another-model:3072')",
+            [],
+        )
+        .unwrap();
+    let mut memory = make_memory("degraded-store", "body content");
+    memory.embedding = Some(vec![0.5; 3072]);
+    let id = store.store(memory).unwrap();
+
+    let (flag, count): (i64, i64) = store
+        .conn()
+        .query_row(
+            "SELECT needs_vec_dedup, (SELECT COUNT(*) FROM vec_memories) FROM memories WHERE id = ?1",
+            rusqlite::params![&id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(flag, 1, "refused vector write flags the memory for retry");
+    assert_eq!(count, 0, "no foreign-model vector may be written");
+}
+
+/// Codex round-13 P2: a failed vector write rolls the memory row back with
+/// it, so a retry cannot duplicate the memory.
+#[test]
+fn store_rolls_back_memory_row_when_vector_write_fails() {
+    let store = SqliteStore::in_memory().unwrap();
+    let mut memory = make_memory("rolled-back-store", "body content");
+    // Wrong dimensionality: sqlite-vec rejects the row.
+    memory.embedding = Some(vec![0.5; 7]);
+    let err = store
+        .store(memory)
+        .expect_err("dimension mismatch must fail the store");
+    assert!(!err.to_string().is_empty());
+    let rows: i64 = store
+        .conn()
+        .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        rows, 0,
+        "the memory row must not survive a failed vector write"
+    );
 }

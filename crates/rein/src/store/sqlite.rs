@@ -1143,7 +1143,15 @@ impl MemoryStore for SqliteStore {
             MemoryLayer::STM => "STM",
         };
 
-        self.conn.execute(
+        // Codex round-13 P2: the memory row and its vector are one unit. A
+        // failed vector write must not leave an FTS-visible memory behind for
+        // callers without an outer transaction (`migrate_from_qmd`), where the
+        // INSERT above would otherwise autocommit and a retry would duplicate
+        // the row. A provenance refusal is the one non-fatal case: the memory
+        // is kept without a vector (see `write_vector_or_flag`).
+        self.conn.execute_batch("SAVEPOINT store_memory")?;
+        let vector_written = (|| -> ReinResult<bool> {
+            self.conn.execute(
             "INSERT INTO memories (id, layer, topic, summary, content, keywords, importance, source,
              strength, decay_lambda, access_count, superseded_by, related_ids, concept_ids, status,
              tier, cluster_id, created_at, updated_at, last_accessed)
@@ -1172,9 +1180,26 @@ impl MemoryStore for SqliteStore {
             ],
         )?;
 
-        if let Some(ref emb) = memory.embedding {
-            vec::insert_embedding_checked(&self.conn, &id, emb, &self.vector_provenance())?;
-        }
+            match memory.embedding {
+                Some(ref emb) => self.write_vector_or_flag(&id, emb),
+                None => Ok(false),
+            }
+        })();
+        let vector_written = match vector_written {
+            Ok(written) => {
+                if let Err(e) = self.conn.execute_batch("RELEASE store_memory") {
+                    let _ = self.conn.execute_batch("ROLLBACK TO store_memory");
+                    let _ = self.conn.execute_batch("RELEASE store_memory");
+                    return Err(e.into());
+                }
+                written
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK TO store_memory");
+                let _ = self.conn.execute_batch("RELEASE store_memory");
+                return Err(e);
+            }
+        };
 
         // Update side indexes (reuse keywords_json from above)
         self.update_tantivy(
@@ -1184,7 +1209,7 @@ impl MemoryStore for SqliteStore {
             &memory.content,
             &keywords_json,
         );
-        self.update_hnsw(&id, memory.embedding.as_deref());
+        self.update_hnsw(&id, memory.embedding.as_deref().filter(|_| vector_written));
         let _ = self.snapshot_memory_as_evidence(&id, &memory);
         // v0.39 #A5: durable triple persistence (flag-gated, best-effort —
         // never aborts the memory write, mirroring the side-index updates).
@@ -1238,76 +1263,81 @@ impl MemoryStore for SqliteStore {
             memory.status
         };
 
-        let rows = self.conn.execute(
-            "UPDATE memories SET layer=?1, topic=?2, summary=?3, content=?4, keywords=?5,
+        // Codex round-13 P2: row update and vector refresh commit together;
+        // see `store` for the rationale.
+        self.conn.execute_batch("SAVEPOINT update_memory")?;
+        let refreshed = (|| -> ReinResult<(Option<Vec<f32>>, bool)> {
+            let mut vector_refused = false;
+            let rows = self.conn.execute(
+                "UPDATE memories SET layer=?1, topic=?2, summary=?3, content=?4, keywords=?5,
              importance=?6, source=?7, strength=?8, decay_lambda=?9, access_count=?10,
              superseded_by=?11, related_ids=?12, concept_ids=?13, status=?14, tier=?15,
              cluster_id=?16, updated_at=?17, last_accessed=?18 WHERE id=?19",
-            rusqlite::params![
-                layer_db,
-                memory.topic,
-                memory.summary,
-                memory.content,
-                keywords_json,
-                memory.importance.as_str(),
-                memory.source.as_str(),
-                memory.strength,
-                memory.decay_lambda,
-                memory.access_count,
-                memory.superseded_by,
-                related_ids_json,
-                concept_ids_json,
-                status.to_string(),
-                memory.tier.to_string(),
-                memory.cluster_id,
-                now.to_rfc3339(),
-                memory.last_accessed.to_rfc3339(),
-                memory.id,
-            ],
-        )?;
+                rusqlite::params![
+                    layer_db,
+                    memory.topic,
+                    memory.summary,
+                    memory.content,
+                    keywords_json,
+                    memory.importance.as_str(),
+                    memory.source.as_str(),
+                    memory.strength,
+                    memory.decay_lambda,
+                    memory.access_count,
+                    memory.superseded_by,
+                    related_ids_json,
+                    concept_ids_json,
+                    status.to_string(),
+                    memory.tier.to_string(),
+                    memory.cluster_id,
+                    now.to_rfc3339(),
+                    memory.last_accessed.to_rfc3339(),
+                    memory.id,
+                ],
+            )?;
 
-        if rows == 0 {
-            return Err(ReinError::NotFound(format!(
-                "memory {} not found",
-                memory.id
-            )));
-        }
+            if rows == 0 {
+                return Err(ReinError::NotFound(format!(
+                    "memory {} not found",
+                    memory.id
+                )));
+            }
 
-        // v0.39 #A5: refresh durable triples when content changed (flag-gated,
-        // best-effort). DELETE-then-INSERT keeps the persisted fact set in sync
-        // with a rewritten canonical (MergeInto append / intelligent-merge
-        // synthesis), so stale facts from prior content cannot accumulate.
-        if previous.content != memory.content {
-            let _ = self.maybe_persist_triples(&memory.id, &memory.content);
-        }
+            // v0.39 #A5: refresh durable triples when content changed (flag-gated,
+            // best-effort). DELETE-then-INSERT keeps the persisted fact set in sync
+            // with a rewritten canonical (MergeInto append / intelligent-merge
+            // synthesis), so stale facts from prior content cannot accumulate.
+            if previous.content != memory.content {
+                let _ = self.maybe_persist_triples(&memory.id, &memory.content);
+            }
 
-        // v0.26.2 hotfix: when a cold-tier memory's semantic fields (topic /
-        // summary / content) change, the previously generated `archival_summary`
-        // is now stale and would keep being surfaced by
-        // `recall.rs::maybe_archival_summary_for_recall` (its version still
-        // matches `ARCHIVAL_SUMMARY_VERSION`). Null the summary fields and
-        // re-flag for the cold-archive worker so it regenerates against the
-        // current text. Also clear any in-flight claim lease so a stale worker
-        // can't finish into the now-invalidated row.
-        //
-        // Hot/Warm rows with stale archival_summary data are harmless (the
-        // recall gate filters by tier first), and a follow-up M5 tier
-        // recompute will overwrite needs_archival_summary if the row is no
-        // longer cold.
-        if semantic_changed {
-            // v0.26.2 R2 Codex F2: also clear `archival_summary_at` so the
-            // model invariant "timestamp is None iff summary is None" holds.
-            // Otherwise the GUI surface and recall metadata would expose a
-            // stale generated-at timestamp pointing at content that no longer
-            // exists, until the worker regenerates the summary.
+            // v0.26.2 hotfix: when a cold-tier memory's semantic fields (topic /
+            // summary / content) change, the previously generated `archival_summary`
+            // is now stale and would keep being surfaced by
+            // `recall.rs::maybe_archival_summary_for_recall` (its version still
+            // matches `ARCHIVAL_SUMMARY_VERSION`). Null the summary fields and
+            // re-flag for the cold-archive worker so it regenerates against the
+            // current text. Also clear any in-flight claim lease so a stale worker
+            // can't finish into the now-invalidated row.
             //
-            // v0.27.5 R1 — also clear `last_too_large_at`. The backoff stamp
-            // is only meaningful while the row's CURRENT content was rejected
-            // for being oversized; on semantic_changed the body / summary /
-            // topic was rewritten, so the prior verdict no longer applies and
-            // the row should compete for a claim slot at full priority again.
-            self.conn.execute(
-                "UPDATE memories
+            // Hot/Warm rows with stale archival_summary data are harmless (the
+            // recall gate filters by tier first), and a follow-up M5 tier
+            // recompute will overwrite needs_archival_summary if the row is no
+            // longer cold.
+            if semantic_changed {
+                // v0.26.2 R2 Codex F2: also clear `archival_summary_at` so the
+                // model invariant "timestamp is None iff summary is None" holds.
+                // Otherwise the GUI surface and recall metadata would expose a
+                // stale generated-at timestamp pointing at content that no longer
+                // exists, until the worker regenerates the summary.
+                //
+                // v0.27.5 R1 — also clear `last_too_large_at`. The backoff stamp
+                // is only meaningful while the row's CURRENT content was rejected
+                // for being oversized; on semantic_changed the body / summary /
+                // topic was rewritten, so the prior verdict no longer applies and
+                // the row should compete for a claim slot at full priority again.
+                self.conn.execute(
+                    "UPDATE memories
                  SET archival_summary = NULL,
                      archival_summary_at = NULL,
                      archival_summary_version = NULL,
@@ -1316,49 +1346,64 @@ impl MemoryStore for SqliteStore {
                      archival_claim_token = NULL,
                      last_too_large_at = NULL
                  WHERE id = ?1",
-                rusqlite::params![memory.id],
-            )?;
-        }
-        // v0.26.2 R7 F1 + R10 F1: drop the `cold_archive` fallback row
-        // ONLY when the body actually changed. `semantic_changed` includes
-        // topic + summary edits; deleting on those would wipe the only
-        // pre-strip full body for cold rows where `memory.content` is
-        // already the M5-stripped summary, leaving Cap C's worker with
-        // nothing better to compress than the truncated summary itself.
-        // Restrict the invalidation to real `content` rewrites — that's
-        // the case where the archived body is genuinely stale.
-        let content_changed = previous.content != memory.content;
-        if content_changed {
-            self.conn.execute(
-                "DELETE FROM cold_archive WHERE memory_id = ?1",
-                rusqlite::params![memory.id],
-            )?;
-        }
-
-        let refreshed_embedding = if let Some(embedding) = memory.embedding.clone() {
-            vec::insert_embedding_checked(
-                &self.conn,
-                &memory.id,
-                &embedding,
-                &self.vector_provenance(),
-            )?;
-            Some(embedding)
-        } else if semantic_changed {
-            if let Some(cached) = self.cached_embedding_for_memory(memory) {
-                vec::insert_embedding_checked(
-                    &self.conn,
-                    &memory.id,
-                    &cached,
-                    &self.vector_provenance(),
+                    rusqlite::params![memory.id],
                 )?;
-                Some(cached)
-            } else {
-                // Never leave a stale vector row behind when the semantic fields changed.
-                vec::delete_embedding(&self.conn, &memory.id)?;
-                None
             }
-        } else {
-            None
+            // v0.26.2 R7 F1 + R10 F1: drop the `cold_archive` fallback row
+            // ONLY when the body actually changed. `semantic_changed` includes
+            // topic + summary edits; deleting on those would wipe the only
+            // pre-strip full body for cold rows where `memory.content` is
+            // already the M5-stripped summary, leaving Cap C's worker with
+            // nothing better to compress than the truncated summary itself.
+            // Restrict the invalidation to real `content` rewrites — that's
+            // the case where the archived body is genuinely stale.
+            let content_changed = previous.content != memory.content;
+            if content_changed {
+                self.conn.execute(
+                    "DELETE FROM cold_archive WHERE memory_id = ?1",
+                    rusqlite::params![memory.id],
+                )?;
+            }
+
+            let refreshed_embedding = if let Some(embedding) = memory.embedding.clone() {
+                if self.write_vector_or_flag(&memory.id, &embedding)? {
+                    Some(embedding)
+                } else {
+                    vector_refused = true;
+                    None
+                }
+            } else if semantic_changed {
+                if let Some(cached) = self.cached_embedding_for_memory(memory) {
+                    if self.write_vector_or_flag(&memory.id, &cached)? {
+                        Some(cached)
+                    } else {
+                        vector_refused = true;
+                        None
+                    }
+                } else {
+                    // Never leave a stale vector row behind when the semantic fields changed.
+                    vec::delete_embedding(&self.conn, &memory.id)?;
+                    None
+                }
+            } else {
+                None
+            };
+            Ok((refreshed_embedding, vector_refused))
+        })();
+        let (refreshed_embedding, vector_refused) = match refreshed {
+            Ok(value) => {
+                if let Err(e) = self.conn.execute_batch("RELEASE update_memory") {
+                    let _ = self.conn.execute_batch("ROLLBACK TO update_memory");
+                    let _ = self.conn.execute_batch("RELEASE update_memory");
+                    return Err(e.into());
+                }
+                value
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK TO update_memory");
+                let _ = self.conn.execute_batch("RELEASE update_memory");
+                return Err(e);
+            }
         };
 
         // Update side indexes (reuse keywords_json from above)
@@ -1371,7 +1416,7 @@ impl MemoryStore for SqliteStore {
         );
         if let Some(embedding) = refreshed_embedding.as_deref() {
             self.update_hnsw(&memory.id, Some(embedding));
-        } else if semantic_changed {
+        } else if semantic_changed || vector_refused {
             self.remove_from_hnsw(&memory.id);
         }
 
@@ -2808,6 +2853,29 @@ impl SqliteStore {
     /// If the lock can't be acquired (contention, flock failure) the index is
     /// marked dirty so the next rebuild will pick up the missed write, rather
     /// than silently serving a stale index.
+    /// Checked vector write for the store/update paths. A provenance refusal
+    /// (table stamped for another model, or rows of unknown provenance)
+    /// degrades to "memory without a vector": any stale row for the id is
+    /// removed, the memory is flagged `needs_vec_dedup = 1` so the vec_dedup
+    /// pass retries once the operator has attested or re-embedded the table,
+    /// and the caller keeps HNSW untouched. Every other error propagates so
+    /// the surrounding savepoint rolls the memory write back with it.
+    fn write_vector_or_flag(&self, id: &str, embedding: &[f32]) -> ReinResult<bool> {
+        match vec::insert_embedding_checked(&self.conn, id, embedding, &self.vector_provenance()) {
+            Ok(()) => Ok(true),
+            Err(ReinError::VectorProvenance(reason)) => {
+                vec::note_refused_vector_write(id, &reason);
+                vec::delete_embedding(&self.conn, id)?;
+                self.conn.execute(
+                    "UPDATE memories SET needs_vec_dedup = 1 WHERE id = ?1",
+                    rusqlite::params![id],
+                )?;
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     fn update_hnsw(&self, id: &str, embedding: Option<&[f32]>) {
         if let Some(emb) = embedding {
             match self.with_hnsw_lock(emb.len(), |index| index.insert(id, emb)) {

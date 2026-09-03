@@ -65,6 +65,14 @@ pub fn insert_embedding(conn: &Connection, id: &str, embedding: &[f32]) -> ReinR
 /// concurrent reindex swap could commit a new stamp between the read and
 /// the insert and the old-model vector would land in the new-model table,
 /// pass every later provenance check, and never be repaired by warmup.
+///
+/// An unstamped table is claimed by its first writer when it is empty (a
+/// fresh database) and refused while it holds rows of unknown provenance
+/// (codex round-13 P1): letting a checked writer add rows to such a table
+/// would make it permanently indistinguishable from a legacy one, so a later
+/// model change could never be detected and writers of different models
+/// could share the table. `rein warmup --trust-existing-vectors` attests the
+/// rows, `rein migrate --reindex` re-embeds them.
 fn check_vector_provenance(conn: &Connection, writer_provenance: &str) -> ReinResult<()> {
     use rusqlite::OptionalExtension;
     let stamped: Option<String> = conn
@@ -74,16 +82,55 @@ fn check_vector_provenance(conn: &Connection, writer_provenance: &str) -> ReinRe
             |row| row.get(0),
         )
         .optional()?;
-    if let Some(stamped) = stamped {
-        if stamped != writer_provenance {
-            return Err(crate::types::ReinError::Config(format!(
-                "vector store is stamped for embedding model {stamped} but this writer uses \
-                 {writer_provenance}; restart with the current configuration or run \
-                 `rein migrate --reindex`"
-            )));
+    match stamped {
+        Some(stamped) if stamped == writer_provenance => Ok(()),
+        Some(stamped) => Err(crate::types::ReinError::VectorProvenance(format!(
+            "vector store is stamped for embedding model {stamped} but this writer uses \
+             {writer_provenance}; restart with the current configuration or run \
+             `rein migrate --reindex`"
+        ))),
+        None => {
+            let has_rows: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM vec_memories LIMIT 1)",
+                [],
+                |row| row.get(0),
+            )?;
+            if has_rows {
+                return Err(crate::types::ReinError::VectorProvenance(format!(
+                    "vector store holds rows without model provenance; run \
+                     `rein warmup --trust-existing-vectors` if they were produced by \
+                     {writer_provenance}, or `rein migrate --reindex` to re-embed them"
+                )));
+            }
+            // First vector of a fresh database: claim the table for this
+            // model inside the same savepoint as the row.
+            conn.execute(
+                "INSERT INTO metadata(key, value) VALUES (?1, ?2)",
+                rusqlite::params![
+                    crate::store::schema::VEC_ROWS_PROVENANCE_KEY,
+                    writer_provenance
+                ],
+            )?;
+            Ok(())
         }
     }
-    Ok(())
+}
+
+static REFUSED_WRITE_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Log a refused checked write once per process at `warn` (the condition is
+/// per database, not per row) and at `debug` afterwards.
+pub fn note_refused_vector_write(id: &str, reason: &str) {
+    if !REFUSED_WRITE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            id,
+            "vector write refused; memory kept without a vector and flagged needs_vec_dedup = 1 \
+             for retry: {reason}"
+        );
+    } else {
+        tracing::debug!(id, "vector write refused: {reason}");
+    }
 }
 
 fn insert_embedding_inner(
@@ -559,6 +606,61 @@ mod checked_write_tests {
         assert_eq!(vec_rows(writer), 0);
         insert_embedding_checked(writer, "m1", &[0.1; 4], "model-b:4").unwrap();
         assert_eq!(vec_rows(writer), 1);
+    }
+
+    fn stamp_value(conn: &Connection) -> Option<String> {
+        use rusqlite::OptionalExtension;
+        conn.query_row(
+            "SELECT value FROM metadata WHERE key = ?1",
+            rusqlite::params![VEC_ROWS_PROVENANCE_KEY],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    /// Codex round-13 P1: the first checked write on an empty, unstamped
+    /// table claims it for the writer's model.
+    #[test]
+    fn first_checked_write_claims_an_empty_unstamped_table() {
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+        let conn = store.conn();
+        let dims = store.dims;
+        assert!(stamp_value(conn).is_none());
+        insert_embedding_checked(conn, "m1", &vec![0.5; dims], "mine:3072").unwrap();
+        assert_eq!(stamp_value(conn).as_deref(), Some("mine:3072"));
+        let err = insert_embedding_checked(conn, "m2", &vec![0.5; dims], "other:3072").unwrap_err();
+        assert!(
+            matches!(err, crate::types::ReinError::VectorProvenance(_)),
+            "{err}"
+        );
+        assert_eq!(vec_rows(conn), 1);
+    }
+
+    /// Codex round-13 P1: rows of unknown provenance refuse every checked
+    /// write until the operator attests or re-embeds them.
+    #[test]
+    fn checked_write_refuses_an_unstamped_nonempty_table() {
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+        let conn = store.conn();
+        let dims = store.dims;
+        // Legacy row written by an older binary: no stamp.
+        insert_embedding(conn, "legacy", &vec![0.5; dims]).unwrap();
+        assert!(stamp_value(conn).is_none());
+        let err = insert_embedding_checked(conn, "m1", &vec![0.5; dims], "mine:3072").unwrap_err();
+        assert!(
+            matches!(err, crate::types::ReinError::VectorProvenance(_)),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("without model provenance"),
+            "{err}"
+        );
+        assert!(
+            stamp_value(conn).is_none(),
+            "a refused write must not stamp"
+        );
+        assert_eq!(vec_rows(conn), 1);
     }
 
     /// A refused checked write leaves the write sequence untouched: the
