@@ -91,6 +91,9 @@ pub struct DoctorOptions {
 struct StoreSnapshot {
     total_memories: usize,
     active_memories: usize,
+    /// `status IN ('active', 'updated')`: the rows that are expected to
+    /// carry a vector (see `check_vector_coverage`).
+    live_memories: usize,
     embed_cache_rows: usize,
     artifact_rows: usize,
 }
@@ -2156,11 +2159,18 @@ fn collect_store_snapshot(store: &SqliteStore) -> anyhow::Result<StoreSnapshot> 
         store,
         "SELECT COUNT(*) FROM memories WHERE superseded_by IS NULL AND status = 'active'",
     )?;
+    // The population vectors are expected for: `ReindexScope::Live`, the
+    // warmup backfill and the HNSW rebuild all use this status scope.
+    let live_memories = count_sql(
+        store,
+        "SELECT COUNT(*) FROM memories WHERE status IN ('active', 'updated')",
+    )?;
     let embed_cache_rows = count_sql(store, "SELECT COUNT(*) FROM embed_cache")?;
     let artifact_rows = count_sql(store, "SELECT COUNT(*) FROM session_artifacts")?;
     Ok(StoreSnapshot {
         total_memories,
         active_memories,
+        live_memories,
         embed_cache_rows,
         artifact_rows,
     })
@@ -2202,12 +2212,26 @@ fn check_vector_coverage(
         );
     };
 
-    let coverage = indexed_vectors as f64 / snapshot.total_memories as f64;
+    // Codex round-12 P2: deprecated rows intentionally carry no vector after
+    // a Live-scope migration, so the denominator is the live population —
+    // otherwise a vault with >10 % deprecated rows warns forever and
+    // recommends a `rein warmup` that cannot change the number.
+    if snapshot.live_memories == 0 {
+        return ok_in(
+            DoctorCategory::Index,
+            "vector_store",
+            format!(
+                "no live memories ({} total, {} indexed vectors)",
+                snapshot.total_memories, indexed_vectors
+            ),
+        );
+    }
+    let coverage = indexed_vectors as f64 / snapshot.live_memories as f64;
     let message = format!(
-        "{} indexed vectors for {} memories ({} active, {:.0}% coverage, cache={}, artifacts={})",
+        "{} indexed vectors for {} live memories ({} total, {:.0}% coverage, cache={}, artifacts={})",
         indexed_vectors,
+        snapshot.live_memories,
         snapshot.total_memories,
-        snapshot.active_memories,
         coverage * 100.0,
         snapshot.embed_cache_rows,
         snapshot.artifact_rows

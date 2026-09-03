@@ -2251,7 +2251,13 @@ pub fn create_embed_staging(conn: &Connection) -> ReinResult<()> {
 /// staging table; on failure the old index is preserved by rollback and the
 /// staging table remains (caller can retry or clean up).
 pub fn replace_vector_index_from_staging(conn: &Connection, dims: usize) -> ReinResult<()> {
-    replace_vector_index_from_staging_validated(conn, dims, None).map(|_| ())
+    replace_vector_index_from_staging_validated(
+        conn,
+        dims,
+        None,
+        crate::store::migrate::ReindexScope::All,
+    )
+    .map(|_| ())
 }
 
 /// Metadata key recording `"<model>:<dims>"` of the vector rows (see
@@ -2264,11 +2270,19 @@ pub const VEC_ROWS_PROVENANCE_KEY: &str = "vec_rows_provenance";
 /// matches (edited, rewritten, or deleted while embeddings were computed) is
 /// skipped instead of published under a stale vector. Rows staged without a
 /// hash (legacy callers) are published as before. Returns the skipped count.
+///
+/// `scope` is the reindex scope the rows were staged under: for
+/// `ReindexScope::Live` a staged row whose status left `active` / `updated`
+/// while its embedding was computed is skipped as well, even though its text
+/// hash still matches (codex round-12 P2) — otherwise a dead row would enter
+/// HNSW and its bounded candidate window despite the live-only contract.
 pub fn replace_vector_index_from_staging_validated(
     conn: &Connection,
     dims: usize,
     provenance: Option<&str>,
+    scope: crate::store::migrate::ReindexScope,
 ) -> ReinResult<usize> {
+    use crate::store::migrate::ReindexScope;
     let row_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM embed_staging", [], |r| r.get(0))
         .unwrap_or(0);
@@ -2292,26 +2306,37 @@ pub fn replace_vector_index_from_staging_validated(
             let mut write =
                 conn.prepare("INSERT OR REPLACE INTO vec_memories(id, embedding) VALUES (?1, ?2)")?;
             let mut current =
-                conn.prepare("SELECT topic, summary, content FROM memories WHERE id = ?1")?;
+                conn.prepare("SELECT topic, summary, content, status FROM memories WHERE id = ?1")?;
             let mut rows = read.query([])?;
             while let Some(row) = rows.next()? {
                 let id: String = row.get(0)?;
                 let bytes: Vec<u8> = row.get(1)?;
                 let staged_hash: String = row.get(2)?;
-                if !staged_hash.is_empty() {
+                if !staged_hash.is_empty() || scope != ReindexScope::All {
                     use rusqlite::OptionalExtension;
-                    let live_hash = current
+                    let live: Option<(String, String)> = current
                         .query_row(rusqlite::params![id], |r| {
-                            Ok(crate::store::migrate::enriched_text_hash(
-                                &crate::embed::prepend_metadata(
-                                    &r.get::<_, String>(0)?,
-                                    &r.get::<_, String>(1)?,
-                                    &r.get::<_, String>(2)?,
+                            Ok((
+                                crate::store::migrate::enriched_text_hash(
+                                    &crate::embed::prepend_metadata(
+                                        &r.get::<_, String>(0)?,
+                                        &r.get::<_, String>(1)?,
+                                        &r.get::<_, String>(2)?,
+                                    ),
                                 ),
+                                r.get::<_, String>(3)?,
                             ))
                         })
                         .optional()?;
-                    if live_hash.as_deref() != Some(staged_hash.as_str()) {
+                    let publish = match live {
+                        Some((live_hash, status)) => {
+                            (staged_hash.is_empty() || live_hash == staged_hash)
+                                && scope.includes_status(&status)
+                        }
+                        // Deleted while embedding: nothing to publish.
+                        None => false,
+                    };
+                    if !publish {
                         skipped += 1;
                         continue;
                     }

@@ -156,7 +156,6 @@ impl<'a> A12ExclusionIndex<'a> {
                 &query_ids,
                 query_size,
                 bound,
-                self.memory_texts.len(),
                 &self.memory_postings,
                 &self.memory_texts,
             )
@@ -174,7 +173,6 @@ impl<'a> A12ExclusionIndex<'a> {
                 &query_ids,
                 query_size,
                 bound,
-                self.evidence_texts.len(),
                 &self.evidence_postings,
                 &self.evidence_texts,
             ));
@@ -219,26 +217,24 @@ fn near_duplicates(
     query_ids: &[u32],
     query_size: usize,
     bound: f32,
-    row_count: usize,
     postings: &HashMap<u32, Vec<usize>>,
     texts: &[IndexedText],
 ) -> Vec<usize> {
-    let mut counts = vec![0_usize; row_count];
-    let mut touched = Vec::new();
+    // Sparse counters (codex round-12 P2): the work per query follows the
+    // postings the query actually touches. A dense `vec![0; row_count]`
+    // would put an O(views × rows) floor under the corpus build even for
+    // views that share no token with anything.
+    let mut counts: HashMap<usize, usize> = HashMap::new();
     for token in query_ids {
         if let Some(rows) = postings.get(token) {
             for &row in rows {
-                if counts[row] == 0 {
-                    touched.push(row);
-                }
-                counts[row] += 1;
+                *counts.entry(row).or_insert(0) += 1;
             }
         }
     }
-    let mut matches: Vec<usize> = touched
+    let mut matches: Vec<usize> = counts
         .into_iter()
-        .filter(|&row| {
-            let intersection = counts[row];
+        .filter(|&(row, intersection)| {
             let row_size = texts[row].tokens.len();
             // Mirrors `jaccard_from_sets` / `containment_from_sets`: both are
             // defined here because the row shares at least one token.
@@ -248,6 +244,7 @@ fn near_duplicates(
             let containment = intersection as f32 / smaller as f32;
             jaccard.max(containment) >= bound
         })
+        .map(|(row, _)| row)
         .collect();
     matches.sort_unstable();
     matches

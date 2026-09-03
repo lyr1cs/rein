@@ -210,6 +210,16 @@ pub enum ReindexScope {
 }
 
 impl ReindexScope {
+    /// Whether a memory with this `memories.status` belongs to the scope.
+    /// Mirrors `sql_filter`; used by the swap to drop rows whose status
+    /// changed while their embeddings were being computed.
+    pub(crate) fn includes_status(self, status: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Live => matches!(status, "active" | "updated"),
+        }
+    }
+
     fn sql_filter(self) -> &'static str {
         match self {
             Self::All => "",
@@ -290,6 +300,7 @@ pub async fn reindex_with_embedder(
         store.conn(),
         config.embedding.dimensions,
         Some(&provenance),
+        scope,
     )?;
     // The vector table just changed; until the rebuild at the end succeeds
     // the on-disk HNSW is stale. Flag it now so an interruption in the
@@ -616,6 +627,99 @@ mod tests {
         drop(held);
     }
 
+    /// Codex round-12 P2: a row deprecated while its embedding was being
+    /// computed keeps its text hash, so the swap must also re-check the
+    /// status against the reindex scope before publishing its vector.
+    #[tokio::test]
+    async fn live_swap_skips_rows_deprecated_after_staging() {
+        use crate::types::{
+            Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, MemoryTier, Source,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::ReinConfig::default();
+        let dims = config.embedding.dimensions;
+        let db_path = dir.path().join("memories.db");
+        let store =
+            crate::store::SqliteStore::new(&db_path, &config.embedding_model(), dims).unwrap();
+        let now = chrono::Utc::now();
+        let make = |topic: &str| Memory {
+            id: ulid::Ulid::new().to_string(),
+            layer: MemoryLayer::LTM,
+            topic: topic.to_string(),
+            summary: format!("{topic} summary"),
+            content: format!("{topic} content"),
+            keywords: vec![],
+            importance: Importance::Medium,
+            source: Source::Manual,
+            strength: 1.0,
+            decay_lambda: 0.06,
+            access_count: 0,
+            superseded_by: None,
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: 1.0,
+            source_diversity: 1.0,
+            contradiction_score: 0.0,
+            related_ids: vec![],
+            concept_ids: vec![],
+            status: MemoryStatus::Active,
+            embedding: Some(vec![0.9; dims]),
+            tier: MemoryTier::Warm,
+            cluster_id: None,
+            archival_summary: None,
+            archival_summary_at: None,
+            archival_summary_version: None,
+            created_at: now,
+            updated_at: now,
+            last_accessed: now,
+        };
+        let retired_id = store.store(make("retired")).unwrap();
+        let stable_id = store.store(make("stable")).unwrap();
+        let embedder = crate::embed::EmbedderKind::Mock(
+            crate::embed::MockEmbedder::with_fixed_vector(dims, vec![0.25; dims]),
+        );
+
+        let (total, embedded, errors) = super::stage_reindex_embeddings(
+            &store,
+            &config,
+            &embedder,
+            super::ReindexScope::Live,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!((total, embedded, errors), (2, 2, 0));
+
+        // The row is deprecated between staging and the swap; its text (and
+        // therefore its hash) is unchanged.
+        store
+            .conn()
+            .execute(
+                "UPDATE memories SET status = 'deprecated' WHERE id = ?1",
+                rusqlite::params![retired_id],
+            )
+            .unwrap();
+
+        let skipped = crate::store::schema::replace_vector_index_from_staging_validated(
+            store.conn(),
+            dims,
+            Some("test-model:3072"),
+            super::ReindexScope::Live,
+        )
+        .unwrap();
+        assert_eq!(skipped, 1, "the deprecated row must not be published");
+        let published: Vec<String> = store
+            .conn()
+            .prepare("SELECT id FROM vec_memories ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(published, vec![stable_id]);
+    }
+
     /// Codex round-11 P2: a model change on a database whose Live scope is
     /// empty must still replace the vector table and move the provenance
     /// stamp, otherwise every current-model write stays refused.
@@ -787,6 +891,7 @@ mod tests {
             store.conn(),
             dims,
             Some("test-model:3072"),
+            super::ReindexScope::All,
         )
         .unwrap();
         assert_eq!(skipped, 1);

@@ -257,7 +257,7 @@ pub async fn backfill_missing_vec_rows(
     let mut pending: Vec<(String, String)> = Vec::new();
     let mut live_total = 0_usize;
     if let Err(e) = store.for_each_for_warmup(|row| {
-        if row.status != "active" && row.status != "updated" {
+        if !hnsw_row_is_live(&row.status) {
             return Ok(());
         }
         live_total += 1;
@@ -540,6 +540,14 @@ fn write_metadata(store: &SqliteStore, key: &str, value: &str) {
 /// `cleanup_hnsw_staging` at warmup entry) wipes orphan staging files.
 /// Returns `true` if the index is now in a clean, usable state (success or intentionally empty).
 /// Returns `false` if the rebuild was skipped or failed (caller should restore the dirty marker).
+/// The rows the HNSW index covers: the same `status IN ('active', 'updated')`
+/// scope as `ReindexScope::Live` and the warmup backfill. Deprecated rows
+/// are filtered out of vector recall anyway and carry no vector after an
+/// automatic model migration.
+pub(crate) fn hnsw_row_is_live(status: &str) -> bool {
+    matches!(status, "active" | "updated")
+}
+
 pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) -> bool {
     let db_path = store.db_path();
     if db_path.to_str() == Some(":memory:") {
@@ -641,6 +649,13 @@ pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) -> bool {
     let mut total_rows = 0usize;
     let mut skipped_no_vector = 0usize;
     let stream_result = store.for_each_for_warmup(|row| {
+        // Live scope only (codex round-12 P2): counting deprecated rows here
+        // would keep an all-deprecated vault permanently dirty after a
+        // Live-scope migration (`total_rows > 0`, `inserted == 0`) and make
+        // every recall retry the rebuild.
+        if !hnsw_row_is_live(&row.status) {
+            return Ok(());
+        }
         total_rows += 1;
         let text = prepend_metadata(&row.topic, &row.summary, &row.content);
         let emb = match EmbedCache::get(store.conn(), &text, &model) {
@@ -775,7 +790,7 @@ pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) -> bool {
         // results. Explicitly mark dirty so vec_search falls through to
         // sqlite-vec and the NEXT warmup retries.
         tracing::debug!(
-            "hnsw: {total_rows} memories but 0 cached embeddings, marking dirty for retry"
+            "hnsw: {total_rows} live memories but 0 cached embeddings, marking dirty for retry"
         );
         crate::store::hnsw::HnswIndex::mark_dirty(&hnsw_path);
         let _ = std::fs::remove_file(&staging_index);
@@ -2617,6 +2632,77 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "the embedding is also cached for store-time reuse"
+        );
+    }
+}
+
+#[cfg(test)]
+mod hnsw_scope_tests {
+    use super::*;
+    use crate::types::{
+        Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, MemoryTier, Source,
+    };
+
+    fn memory(topic: &str, status: MemoryStatus) -> Memory {
+        let now = chrono::Utc::now();
+        Memory {
+            id: ulid::Ulid::new().to_string(),
+            layer: MemoryLayer::LTM,
+            topic: topic.to_string(),
+            summary: format!("{topic} summary"),
+            content: format!("{topic} content"),
+            keywords: vec![],
+            importance: Importance::Medium,
+            source: Source::Manual,
+            strength: 1.0,
+            decay_lambda: 0.06,
+            access_count: 0,
+            superseded_by: None,
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: 1.0,
+            source_diversity: 1.0,
+            contradiction_score: 0.0,
+            related_ids: vec![],
+            concept_ids: vec![],
+            status,
+            embedding: None,
+            tier: MemoryTier::Warm,
+            cluster_id: None,
+            archival_summary: None,
+            archival_summary_at: None,
+            archival_summary_version: None,
+            created_at: now,
+            updated_at: now,
+            last_accessed: now,
+        }
+    }
+
+    /// Codex round-12 P2: after a Live-scope migration an all-deprecated
+    /// vault has no vectors at all. The HNSW rebuild must treat it as an
+    /// intentionally empty index instead of leaving the dirty marker in
+    /// place forever.
+    #[test]
+    fn populate_hnsw_treats_all_deprecated_vault_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memories.db");
+        let config = ReinConfig::default();
+        let dims = config.embedding.dimensions;
+        let store = SqliteStore::new(&db_path, &config.embedding_model(), dims).unwrap();
+        store
+            .store(memory("gone", MemoryStatus::Deprecated))
+            .unwrap();
+        let hnsw_base = db_path.with_extension("");
+        crate::store::hnsw::HnswIndex::mark_dirty(&hnsw_base);
+
+        assert!(
+            populate_hnsw(&store, &config),
+            "an all-deprecated vault is a clean, empty index"
+        );
+        assert!(
+            !crate::store::hnsw::HnswIndex::is_dirty(&hnsw_base),
+            "deprecated rows must not keep the index dirty"
         );
     }
 }
