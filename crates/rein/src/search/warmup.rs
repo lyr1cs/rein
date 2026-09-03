@@ -264,7 +264,15 @@ pub async fn backfill_missing_vec_rows(
             provenance,
             "warmup: stamping existing vector rows on operator attestation"
         );
-        write_metadata(store, VEC_ROWS_PROVENANCE_KEY, &provenance);
+        if let Err(e) = write_metadata(store, VEC_ROWS_PROVENANCE_KEY, &provenance) {
+            tracing::warn!(
+                "warmup: attestation could not be persisted, vector rows stay unattested and \
+                 checked writes stay refused: {e}"
+            );
+            report.errors += 1;
+            report.provenance_unknown = true;
+            return report;
+        }
     }
 
     // Collect only the ids of the rows to work on: their text is re-read
@@ -344,7 +352,10 @@ pub async fn backfill_missing_vec_rows(
             live_total,
             "warmup: every live memory already has a vector row"
         );
-        write_metadata(store, VEC_ROWS_PROVENANCE_KEY, &provenance);
+        if let Err(e) = write_metadata(store, VEC_ROWS_PROVENANCE_KEY, &provenance) {
+            tracing::warn!("warmup: failed to persist the vector provenance stamp: {e}");
+            report.errors += 1;
+        }
         return report;
     }
     tracing::info!(
@@ -453,7 +464,10 @@ pub async fn backfill_missing_vec_rows(
     report.errors += fill_errors;
 
     if fill_errors == 0 {
-        write_metadata(store, VEC_ROWS_PROVENANCE_KEY, &provenance);
+        if let Err(e) = write_metadata(store, VEC_ROWS_PROVENANCE_KEY, &provenance) {
+            tracing::warn!("warmup: failed to persist the vector provenance stamp: {e}");
+            report.errors += 1;
+        }
     }
     report
 }
@@ -557,7 +571,9 @@ pub fn stamp_vec_rows_provenance(store: &SqliteStore, config: &ReinConfig) {
         config.embedding_model(),
         config.embedding.dimensions
     );
-    write_metadata(store, VEC_ROWS_PROVENANCE_KEY, &provenance);
+    if let Err(e) = write_metadata(store, VEC_ROWS_PROVENANCE_KEY, &provenance) {
+        tracing::warn!("warmup: failed to persist the vector provenance stamp: {e}");
+    }
 }
 
 /// Metadata key recording `"<model>:<dims>"` of the vector rows.
@@ -577,14 +593,17 @@ fn read_metadata(store: &SqliteStore, key: &str) -> Option<String> {
         .flatten()
 }
 
-fn write_metadata(store: &SqliteStore, key: &str, value: &str) {
-    if let Err(e) = store.conn().execute(
+/// Persist one metadata row. Callers decide what a failure means: an
+/// attestation or provenance stamp that did not land leaves the table
+/// refusing checked writes, so it counts as a warmup error (codex round-22
+/// P2).
+fn write_metadata(store: &SqliteStore, key: &str, value: &str) -> crate::types::ReinResult<()> {
+    store.conn().execute(
         "INSERT INTO metadata(key, value) VALUES (?1, ?2) \
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         rusqlite::params![key, value],
-    ) {
-        tracing::warn!(key, "warmup: failed to persist metadata: {e}");
-    }
+    )?;
+    Ok(())
 }
 
 /// Populate (or rebuild) the HNSW index from all cached embeddings in SQLite.
@@ -2472,7 +2491,8 @@ mod tests {
             &store,
             VEC_ROWS_PROVENANCE_KEY,
             &format!("old-model:{dims}"),
-        );
+        )
+        .unwrap();
         let failing = crate::embed::EmbedderKind::Mock(
             crate::embed::MockEmbedder::with_persistent_error(dims, "provider down"),
         );
@@ -2714,7 +2734,8 @@ mod tests {
             &store,
             VEC_ROWS_PROVENANCE_KEY,
             &format!("old-model:{dims}"),
-        );
+        )
+        .unwrap();
         let embedder = crate::embed::EmbedderKind::Mock(
             crate::embed::MockEmbedder::with_fixed_vector(dims, vec![0.25; dims]),
         );

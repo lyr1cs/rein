@@ -1561,16 +1561,37 @@ pub fn run_adaptive_pipeline_with_trigger(
     // reached `feedback_events`, making the entire judge feedback loop
     // dead code in production. When `[ars.llm_judge].enabled = false`,
     // no queue file is written, so the drain is a fast no-op.
-    let drain_stats = recorder.stage("judge_drain", || {
-        crate::ops::llm_judge_worker::drain_queue(store, config)
-    });
-    recorder.annotate(
-        "judge_drain",
-        format!(
+    // Codex round-22 P2: read / dispatch errors and malformed jobs are lost
+    // judge work — a failed stage (and run), with the counts kept as the
+    // stage detail. Drops are policy (cap, surface disabled, contract) and
+    // do not fail the stage.
+    let mut drained = None;
+    let drain_result = recorder.stage_result("judge_drain", || -> Result<(), String> {
+        let stats = crate::ops::llm_judge_worker::drain_queue(store, config);
+        let summary = format!(
             "emitted={} dropped={} errors={} malformed={}",
-            drain_stats.emitted, drain_stats.dropped, drain_stats.errors, drain_stats.malformed
-        ),
-    );
+            stats.emitted, stats.dropped, stats.errors, stats.malformed
+        );
+        let lost = stats.errors > 0 || stats.malformed > 0;
+        drained = Some(stats);
+        if lost {
+            Err(format!("judge drain lost work: {summary}"))
+        } else {
+            Ok(())
+        }
+    });
+    let drain_stats = drained.unwrap_or_default();
+    if let Err(error) = drain_result {
+        tracing::warn!("adaptive pipeline: {error}");
+    } else {
+        recorder.annotate(
+            "judge_drain",
+            format!(
+                "emitted={} dropped={} errors={} malformed={}",
+                drain_stats.emitted, drain_stats.dropped, drain_stats.errors, drain_stats.malformed
+            ),
+        );
+    }
     if drain_stats.emitted > 0
         || drain_stats.dropped > 0
         || drain_stats.errors > 0
@@ -5789,6 +5810,47 @@ mod tests {
                 .iter()
                 .all(|entry| entry.generation == 1)
         );
+    }
+
+    /// Codex round-22 P2: a judge drain that loses work (here a malformed
+    /// queue line) is a failed `judge_drain` stage and a failed run, with the
+    /// counts kept as the stage detail.
+    #[test]
+    fn malformed_judge_queue_line_fails_the_drain_stage_and_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = ReinConfig::default();
+        config.hooks.buffer_dir = dir.path().join("buffer").display().to_string();
+        config.database.path = dir.path().join("rein.db").display().to_string();
+        config.ars.llm_judge.enabled = true;
+        config.llm.provider = "omlx".to_string();
+        config.llm.omlx.model = Some("judge-test".to_string());
+        let queue_path = crate::ops::handlers::judge::judge_queue_path_for_config(&config);
+        std::fs::create_dir_all(queue_path.parent().unwrap()).unwrap();
+        std::fs::write(&queue_path, b"{not json\n").unwrap();
+
+        let store = SqliteStore::in_memory().unwrap();
+        let record =
+            run_adaptive_pipeline_with_trigger(&store, &config, "gc").expect("pipeline ran");
+        let drain = record
+            .stages
+            .iter()
+            .find(|stage| stage.name == "judge_drain")
+            .expect("judge_drain stage recorded");
+        assert_eq!(
+            drain.outcome,
+            crate::ops::pipeline_run::PipelineStageOutcome::Failed,
+            "{drain:?}"
+        );
+        assert!(
+            drain
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("malformed=1"),
+            "{:?}",
+            drain.detail
+        );
+        assert_eq!(record.outcome, PipelineRunOutcome::Failed);
     }
 
     #[test]
