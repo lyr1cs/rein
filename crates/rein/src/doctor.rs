@@ -96,6 +96,10 @@ struct StoreSnapshot {
     live_memories: usize,
     /// Live memories with a `vec_memories` row.
     live_vectors: usize,
+    /// All `vec_memories` rows (any status).
+    vector_rows: usize,
+    /// `vec_rows_provenance` stamp (`model:dims`), if any.
+    vector_provenance: Option<String>,
     embed_cache_rows: usize,
     artifact_rows: usize,
 }
@@ -155,6 +159,7 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
                             let (hnsw_check, indexed_vectors) =
                                 inspect_hnsw(&store, snapshot.total_memories);
                             checks.push(check_vector_coverage(config, &snapshot, indexed_vectors));
+                            checks.push(check_vector_provenance(config, &snapshot));
                             checks.push(check_tantivy(&store, snapshot.active_memories));
                             checks.push(hnsw_check);
                             checks.push(check_resummerize(&store));
@@ -2177,6 +2182,18 @@ fn collect_store_snapshot(store: &SqliteStore) -> anyhow::Result<StoreSnapshot> 
            JOIN vec_memories v ON v.id = m.id
           WHERE m.status IN ('active', 'updated')",
     )?;
+    let vector_rows = count_sql(store, "SELECT COUNT(*) FROM vec_memories")?;
+    let vector_provenance = {
+        use rusqlite::OptionalExtension;
+        store
+            .conn()
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?1",
+                rusqlite::params![crate::store::schema::VEC_ROWS_PROVENANCE_KEY],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+    };
     let embed_cache_rows = count_sql(store, "SELECT COUNT(*) FROM embed_cache")?;
     let artifact_rows = count_sql(store, "SELECT COUNT(*) FROM session_artifacts")?;
     Ok(StoreSnapshot {
@@ -2184,6 +2201,8 @@ fn collect_store_snapshot(store: &SqliteStore) -> anyhow::Result<StoreSnapshot> 
         active_memories,
         live_memories,
         live_vectors,
+        vector_rows,
+        vector_provenance,
         embed_cache_rows,
         artifact_rows,
     })
@@ -2250,15 +2269,72 @@ fn check_vector_coverage(
         snapshot.embed_cache_rows,
         snapshot.artifact_rows
     );
-    if coverage >= 0.9 {
-        ok_in(DoctorCategory::Index, "vector_store", message)
-    } else {
-        warn_with_hint(
+    if coverage < 0.9 {
+        return warn_with_hint(
             DoctorCategory::Index,
             "vector_store",
             message,
             "run `rein warmup` to fill missing cached embeddings",
-        )
+        );
+    }
+    // Codex round-16 P2: a clean HNSW index that holds fewer entries than
+    // the live vector table has missed side-index updates; the SQLite rows
+    // alone must not decide health.
+    if indexed_vectors < snapshot.live_vectors {
+        return warn_with_hint(
+            DoctorCategory::Index,
+            "vector_store",
+            format!(
+                "{message}; HNSW holds {indexed_vectors} of {} live vectors",
+                snapshot.live_vectors
+            ),
+            "run `rein doctor --fix` (or `rein warmup`) to rebuild the HNSW side index",
+        );
+    }
+    ok_in(DoctorCategory::Index, "vector_store", message)
+}
+
+/// Whether the vector table's provenance stamp lets checked vector writes
+/// through (codex round-16 P2). Rows without a stamp, or a stamp for another
+/// model than the configured one, mean every new memory stays FTS-only until
+/// the operator attests or re-embeds the table — a state coverage alone
+/// would report as healthy.
+fn check_vector_provenance(config: &ReinConfig, snapshot: &StoreSnapshot) -> DoctorCheck {
+    let configured = format!(
+        "{}:{}",
+        config.embedding_model(),
+        config.embedding.dimensions
+    );
+    match snapshot.vector_provenance.as_deref() {
+        Some(stamped) if stamped == configured => ok_in(
+            DoctorCategory::Index,
+            "vector_provenance",
+            format!("{} vector rows stamped for {stamped}", snapshot.vector_rows),
+        ),
+        Some(stamped) => warn_with_hint(
+            DoctorCategory::Index,
+            "vector_provenance",
+            format!(
+                "vector rows are stamped for {stamped} but the configuration embeds with \
+                 {configured}; vector writes are refused until the table is migrated"
+            ),
+            "run `rein warmup` to re-embed live rows under the configured model (or `rein migrate --reindex`)",
+        ),
+        None if snapshot.vector_rows == 0 => ok_in(
+            DoctorCategory::Index,
+            "vector_provenance",
+            "no vector rows yet; the first write stamps the table",
+        ),
+        None => warn_with_hint(
+            DoctorCategory::Index,
+            "vector_provenance",
+            format!(
+                "{} vector rows have no model provenance; vector writes are refused and new \
+                 memories stay FTS-only until the rows are attested or re-embedded",
+                snapshot.vector_rows
+            ),
+            "run `rein warmup --trust-existing-vectors` if the rows were produced by the configured model, or `rein migrate --reindex` if the model changed",
+        ),
     }
 }
 
@@ -6149,5 +6225,86 @@ provider = "inherit"
         config.extract.omlx.model = retired.to_string();
         let non_google = check_retired_llm_models(&config);
         assert_eq!(non_google.status, CheckStatus::Ok);
+    }
+}
+
+#[cfg(test)]
+mod vector_diagnostics_tests {
+    use super::*;
+
+    fn snapshot(live_memories: usize, live_vectors: usize) -> StoreSnapshot {
+        StoreSnapshot {
+            total_memories: live_memories + 3,
+            active_memories: live_memories,
+            live_memories,
+            live_vectors,
+            vector_rows: live_vectors,
+            vector_provenance: None,
+            embed_cache_rows: 0,
+            artifact_rows: 0,
+        }
+    }
+
+    /// Codex round-16 P2: full SQLite coverage with a short HNSW index is
+    /// not healthy.
+    #[test]
+    fn coverage_warns_when_hnsw_holds_fewer_entries_than_live_vectors() {
+        let config = ReinConfig::default();
+        let snap = snapshot(100, 100);
+        let ok = check_vector_coverage(&config, &snap, Some(100));
+        assert_eq!(ok.status, CheckStatus::Ok, "{}", ok.message);
+        // Deprecated entries still in the index are not a shortfall.
+        let more = check_vector_coverage(&config, &snap, Some(120));
+        assert_eq!(more.status, CheckStatus::Ok, "{}", more.message);
+        let short = check_vector_coverage(&config, &snap, Some(40));
+        assert_eq!(short.status, CheckStatus::Warn, "{}", short.message);
+        assert!(
+            short.message.contains("HNSW holds 40 of 100"),
+            "{}",
+            short.message
+        );
+    }
+
+    /// Codex round-16 P2: unstamped or foreign-model rows block vector
+    /// writes and must be surfaced even when coverage looks complete.
+    #[test]
+    fn provenance_check_flags_missing_and_mismatched_stamps() {
+        let config = ReinConfig::default();
+        let configured = format!(
+            "{}:{}",
+            config.embedding_model(),
+            config.embedding.dimensions
+        );
+
+        let mut snap = snapshot(10, 10);
+        let missing = check_vector_provenance(&config, &snap);
+        assert_eq!(missing.status, CheckStatus::Warn, "{}", missing.message);
+        assert!(
+            missing.message.contains("no model provenance"),
+            "{}",
+            missing.message
+        );
+        assert!(missing
+            .repair_hint
+            .as_deref()
+            .unwrap_or_default()
+            .contains("--trust-existing-vectors"));
+
+        snap.vector_provenance = Some("other-model:3072".to_string());
+        let mismatch = check_vector_provenance(&config, &snap);
+        assert_eq!(mismatch.status, CheckStatus::Warn, "{}", mismatch.message);
+        assert!(
+            mismatch.message.contains("other-model:3072"),
+            "{}",
+            mismatch.message
+        );
+
+        snap.vector_provenance = Some(configured);
+        let stamped = check_vector_provenance(&config, &snap);
+        assert_eq!(stamped.status, CheckStatus::Ok, "{}", stamped.message);
+
+        let empty = snapshot(0, 0);
+        let fresh = check_vector_provenance(&config, &empty);
+        assert_eq!(fresh.status, CheckStatus::Ok, "{}", fresh.message);
     }
 }

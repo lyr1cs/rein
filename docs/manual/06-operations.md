@@ -353,6 +353,24 @@ rein doctor --fix
   eval-gate artifact root (relative values fail closed); development runs
   may discover a checkout ancestor from the working directory. This check
   is read-only.
+- **`adaptive_pipeline_last_run` (v1.4.0)** — the last adaptive pipeline
+  run (trigger, per-stage durations and outcomes, error). WARN when the
+  pipeline has never run, the last run failed, or a run has been `running`
+  for more than six hours (a killed process). The same record is printed by
+  `rein gc` and exposed as `pipeline_last_run` in `rein adaptive-status`.
+- **`vector_store`** — vector coverage of *live* memories (`status` active /
+  updated; deprecated rows intentionally carry no vector after a model
+  migration). WARN below 90 % coverage, and WARN when the HNSW side index
+  holds fewer entries than the live vector rows (missed side-index updates;
+  `rein doctor --fix` rebuilds it).
+- **`vector_provenance` (v1.4.0)** — whether the vector table's
+  `vec_rows_provenance` stamp admits writes for the configured embedding
+  model. Rows without a stamp (a database from before v1.4) or a stamp for
+  another model mean every new memory is kept **without** a vector (flagged
+  for a later vector pass) until the operator runs
+  `rein warmup --trust-existing-vectors` (same model) or re-embeds
+  (`rein warmup` after a model change, or `rein migrate --reindex`). Run the
+  attestation right after upgrading.
 
 Get machine-readable output:
 
