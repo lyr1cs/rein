@@ -2260,6 +2260,18 @@ pub fn replace_vector_index_from_staging(conn: &Connection, dims: usize) -> Rein
     .map(|_| ())
 }
 
+/// What the staged swap did besides publishing the staged rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StagedSwapOutcome {
+    /// Staged rows not published because the memory changed, left the scope
+    /// or was deleted while its embedding was computed.
+    pub skipped_changed: usize,
+    /// Live memories left without a vector by the swap (written while the
+    /// reindex was staging, or skipped above) and flagged
+    /// `needs_vec_dedup = 1` so the next vec_dedup pass re-embeds them.
+    pub flagged_for_retry: usize,
+}
+
 /// Metadata key recording `"<model>:<dims>"` of the vector rows (see
 /// `search::warmup`). Written inside the swap savepoint so the table and its
 /// provenance can never disagree.
@@ -2281,7 +2293,7 @@ pub fn replace_vector_index_from_staging_validated(
     dims: usize,
     provenance: Option<&str>,
     scope: crate::store::migrate::ReindexScope,
-) -> ReinResult<usize> {
+) -> ReinResult<StagedSwapOutcome> {
     use crate::store::migrate::ReindexScope;
     let row_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM embed_staging", [], |r| r.get(0))
@@ -2296,6 +2308,7 @@ pub fn replace_vector_index_from_staging_validated(
         );"
     );
     let mut skipped = 0_usize;
+    let mut flagged = 0_usize;
     let result = (|| -> ReinResult<()> {
         conn.execute_batch("SAVEPOINT replace_vector_index_staged")?;
         conn.execute_batch("DROP TABLE IF EXISTS vec_memories;")?;
@@ -2344,6 +2357,19 @@ pub fn replace_vector_index_from_staging_validated(
                 write.execute(rusqlite::params![id, bytes])?;
             }
         }
+        // Codex round-17 P1: a memory whose vector was written while the
+        // reindex was staging (accepted under the OLD stamp by a writer of
+        // the old model) just lost it to the table rebuild, and so did every
+        // row the revalidation above skipped. Flag every live memory without
+        // a vector so the next vec_dedup pass re-embeds and re-indexes it;
+        // inside the savepoint so a crash cannot separate flag from swap.
+        flagged = conn.execute(
+            "UPDATE memories SET needs_vec_dedup = 1
+              WHERE status IN ('active', 'updated')
+                AND needs_vec_dedup = 0
+                AND id NOT IN (SELECT id FROM vec_memories)",
+            [],
+        )?;
         // #17 codex R10: churn credit inside the swap savepoint — see the
         // twin comment in `replace_vector_index` for the interrupted-
         // reindex rationale.
@@ -2370,10 +2396,19 @@ pub fn replace_vector_index_from_staging_validated(
     if skipped > 0 {
         tracing::warn!(
             skipped,
-            "vector index swap skipped rows whose memory changed after staging; the next warmup fills them"
+            "vector index swap skipped rows whose memory changed after staging; they are flagged for the next vec_dedup pass"
         );
     }
-    result.map(|_| skipped)
+    if flagged > 0 {
+        tracing::info!(
+            flagged,
+            "vector index swap flagged live memories without a vector for re-embedding (needs_vec_dedup = 1)"
+        );
+    }
+    result.map(|_| StagedSwapOutcome {
+        skipped_changed: skipped,
+        flagged_for_retry: flagged,
+    })
 }
 
 #[cfg(test)]

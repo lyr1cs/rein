@@ -172,16 +172,21 @@ pub struct ReindexReport {
     pub embedded: usize,
     pub errors: usize,
     /// Staged rows not published because the memory changed (or vanished)
-    /// between embedding and the index swap; the next warmup fills them.
+    /// between embedding and the index swap; they are flagged for the next
+    /// vec_dedup pass.
     pub skipped_changed: usize,
+    /// Live memories left without a vector by the swap (written while the
+    /// reindex was staging, or skipped above) and flagged
+    /// `needs_vec_dedup = 1` so the next vec_dedup pass re-embeds them.
+    pub flagged_for_retry: usize,
 }
 
 impl std::fmt::Display for ReindexReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Reindex complete: {}/{} memories embedded, {} errors, {} skipped (changed during reindex)",
-            self.embedded, self.total, self.errors, self.skipped_changed
+            "Reindex complete: {}/{} memories embedded, {} errors, {} skipped (changed during reindex), {} flagged for re-embedding",
+            self.embedded, self.total, self.errors, self.skipped_changed, self.flagged_for_retry
         )
     }
 }
@@ -296,12 +301,14 @@ pub async fn reindex_with_embedder(
         config.embedding_model(),
         config.embedding.dimensions
     );
-    let skipped_changed = schema::replace_vector_index_from_staging_validated(
+    let swap = schema::replace_vector_index_from_staging_validated(
         store.conn(),
         config.embedding.dimensions,
         Some(&provenance),
         scope,
     )?;
+    let skipped_changed = swap.skipped_changed;
+    let flagged_for_retry = swap.flagged_for_retry;
     // The vector table just changed; until the rebuild at the end succeeds
     // the on-disk HNSW is stale. Flag it now so an interruption in the
     // cluster reset below still leaves the index marked for rebuild.
@@ -415,6 +422,7 @@ pub async fn reindex_with_embedder(
         embedded,
         errors,
         skipped_changed,
+        flagged_for_retry,
     })
 }
 
@@ -627,6 +635,101 @@ mod tests {
         drop(held);
     }
 
+    /// Codex round-17 P1: a memory whose vector was written while the
+    /// reindex was staging loses that vector to the swap. It must be flagged
+    /// for the next vec_dedup pass instead of silently staying FTS-only.
+    #[tokio::test]
+    async fn swap_flags_live_rows_whose_vectors_raced_the_reindex() {
+        use crate::types::{
+            Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, MemoryTier, Source,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::ReinConfig::default();
+        let dims = config.embedding.dimensions;
+        let db_path = dir.path().join("memories.db");
+        let store =
+            crate::store::SqliteStore::new(&db_path, &config.embedding_model(), dims).unwrap();
+        let now = chrono::Utc::now();
+        let make = |topic: &str| Memory {
+            id: ulid::Ulid::new().to_string(),
+            layer: MemoryLayer::LTM,
+            topic: topic.to_string(),
+            summary: format!("{topic} summary"),
+            content: format!("{topic} content"),
+            keywords: vec![],
+            importance: Importance::Medium,
+            source: Source::Manual,
+            strength: 1.0,
+            decay_lambda: 0.06,
+            access_count: 0,
+            superseded_by: None,
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: 1.0,
+            source_diversity: 1.0,
+            contradiction_score: 0.0,
+            related_ids: vec![],
+            concept_ids: vec![],
+            status: MemoryStatus::Active,
+            embedding: Some(vec![0.9; dims]),
+            tier: MemoryTier::Warm,
+            cluster_id: None,
+            archival_summary: None,
+            archival_summary_at: None,
+            archival_summary_version: None,
+            created_at: now,
+            updated_at: now,
+            last_accessed: now,
+        };
+        let staged_id = store.store(make("staged")).unwrap();
+        let embedder = crate::embed::EmbedderKind::Mock(
+            crate::embed::MockEmbedder::with_fixed_vector(dims, vec![0.25; dims]),
+        );
+        let (total, embedded, errors) = super::stage_reindex_embeddings(
+            &store,
+            &config,
+            &embedder,
+            super::ReindexScope::Live,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!((total, embedded, errors), (1, 1, 0));
+
+        // A write lands between staging and the swap; its vector is accepted
+        // under the stamp of the moment and will not survive the rebuild.
+        let late_id = store.store(make("late")).unwrap();
+        assert!(crate::store::vec::get_embedding(store.conn(), &late_id)
+            .unwrap()
+            .is_some());
+
+        let outcome = crate::store::schema::replace_vector_index_from_staging_validated(
+            store.conn(),
+            dims,
+            Some("test-model:3072"),
+            super::ReindexScope::Live,
+        )
+        .unwrap();
+        assert_eq!(outcome.skipped_changed, 0);
+        assert_eq!(outcome.flagged_for_retry, 1, "the raced row is flagged");
+        assert!(crate::store::vec::get_embedding(store.conn(), &late_id)
+            .unwrap()
+            .is_none());
+        let flag = |id: &str| -> i64 {
+            store
+                .conn()
+                .query_row(
+                    "SELECT needs_vec_dedup FROM memories WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(flag(&late_id), 1, "raced row waits for the vec_dedup pass");
+        assert_eq!(flag(&staged_id), 0, "published rows are not flagged");
+    }
+
     /// Codex round-12 P2: a row deprecated while its embedding was being
     /// computed keeps its text hash, so the swap must also re-check the
     /// status against the reindex scope before publishing its vector.
@@ -708,7 +811,10 @@ mod tests {
             super::ReindexScope::Live,
         )
         .unwrap();
-        assert_eq!(skipped, 1, "the deprecated row must not be published");
+        assert_eq!(
+            skipped.skipped_changed, 1,
+            "the deprecated row must not be published"
+        );
         let published: Vec<String> = store
             .conn()
             .prepare("SELECT id FROM vec_memories ORDER BY id")
@@ -894,7 +1000,7 @@ mod tests {
             super::ReindexScope::All,
         )
         .unwrap();
-        assert_eq!(skipped, 1);
+        assert_eq!(skipped.skipped_changed, 1);
         let stamped: String = store
             .conn()
             .query_row(

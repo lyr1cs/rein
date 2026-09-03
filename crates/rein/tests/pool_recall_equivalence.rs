@@ -141,7 +141,12 @@ async fn pool_sourced_conn_matches_fresh_conn_recall() {
     for (i, q) in queries.iter().enumerate() {
         let guard = pool.get().await.expect("pool checkout");
         let (conn, detached) = guard.detach();
-        let store = SqliteStore::from_conn(conn, PathBuf::from(&db_path), 3072);
+        let store = SqliteStore::from_conn(
+            conn,
+            PathBuf::from(&db_path),
+            3072,
+            &config.embedding_model(),
+        );
         let ids_pool = recall_ids(&store, &config, q);
         let conn_back = store.into_conn();
         detached.put_back(conn_back);
@@ -338,7 +343,7 @@ async fn concurrent_pool_recall_preserves_determinism() {
         handles.push(tokio::spawn(async move {
             let guard = pool.get().await.unwrap();
             let (conn, detached) = guard.detach();
-            let store = SqliteStore::from_conn(conn, path, 3072);
+            let store = SqliteStore::from_conn(conn, path, 3072, &cfg.embedding_model());
             let ids = recall_ids(&store, &cfg, &q);
             let conn = store.into_conn();
             detached.put_back(conn);

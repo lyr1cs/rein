@@ -1681,18 +1681,37 @@ pub fn run_adaptive_pipeline_with_trigger(
     // is durable. If save_snapshot failed, all pending batches are
     // discarded; the next pipeline pass will re-peek and replay.
     if snapshot_saved {
-        recorder.stage("offset_commits", || {
+        // Codex round-17 P2: a failed commit is a failed stage (and so a
+        // failed run) — the events will be re-peeked, and the run record /
+        // doctor must say so rather than report a completed pipeline.
+        let commits = recorder.stage_result("offset_commits", || -> Result<(), String> {
+            let mut failures: Vec<String> = Vec::new();
             for batch in &pending_offset_batches {
                 let pairs: Vec<(&str, i64)> = batch.iter().map(|(c, id)| (*c, *id)).collect();
                 if let Err(e) = crate::store::adaptive::commit_offset(store.conn(), &pairs) {
+                    let consumers: Vec<&str> = batch.iter().map(|(c, _)| *c).collect();
                     tracing::warn!(
-                        consumers = ?batch.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
+                        consumers = ?consumers,
                         error = %e,
                         "post-save commit_offset failed; events will be re-peeked next pass"
                     );
+                    failures.push(format!("{}: {e}", consumers.join(",")));
                 }
             }
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{} of {} offset batches failed to commit ({})",
+                    failures.len(),
+                    pending_offset_batches.len(),
+                    failures.join("; ")
+                ))
+            }
         });
+        if let Err(error) = commits {
+            tracing::warn!("adaptive pipeline: {error}");
+        }
     } else if !pending_offset_batches.is_empty() {
         tracing::warn!(
             batches = pending_offset_batches.len(),

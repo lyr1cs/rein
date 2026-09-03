@@ -323,6 +323,13 @@ pub async fn backfill_missing_vec_rows(
                 report.embedded = reindex.embedded.saturating_sub(reindex.skipped_changed);
                 report.revalidation_skipped = reindex.skipped_changed;
                 report.vector_table_replaced = true;
+                if reindex.flagged_for_retry > 0 {
+                    tracing::info!(
+                        flagged = reindex.flagged_for_retry,
+                        "warmup: live memories written during the migration (or skipped at the swap) \
+                         are flagged needs_vec_dedup = 1 for the next vec_dedup pass"
+                    );
+                }
             }
             Err(e) => {
                 tracing::warn!("warmup: model migration failed, vector rows left untouched: {e}");

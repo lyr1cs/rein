@@ -381,6 +381,12 @@ impl SqliteStore {
     }
 
     /// Create an in-memory database for testing (default 3072 dims).
+    /// The embedding model this store writes vectors under
+    /// (`config.embedding_model()` of the process that opened it).
+    pub fn embedding_model(&self) -> &str {
+        &self.embedding_model
+    }
+
     pub fn in_memory() -> ReinResult<Self> {
         schema::init_sqlite_vec();
         let conn = Connection::open_in_memory()?;
@@ -414,12 +420,22 @@ impl SqliteStore {
     /// since the pool path targets hot recall where that check would add
     /// per-request latency. Run `rein doctor` or `rein migrate --reindex`
     /// if the embedding model changed.
-    pub fn from_conn(conn: Connection, db_path: PathBuf, dims: usize) -> Self {
+    ///
+    /// `embedding_model` is the configured model (`config.embedding_model()`):
+    /// it becomes the writer provenance of every vector this store writes, so
+    /// a pooled store for an OMLX or custom Google model must not fall back
+    /// to the compiled default (codex round-17 P2).
+    pub fn from_conn(
+        conn: Connection,
+        db_path: PathBuf,
+        dims: usize,
+        embedding_model: &str,
+    ) -> Self {
         Self {
             conn,
             db_path,
             dims,
-            embedding_model: crate::config::ReinConfig::default().embedding_model(),
+            embedding_model: embedding_model.to_string(),
             tantivy_cache: std::cell::RefCell::new(None),
             pool: None,
             pending_index_scrub: std::cell::RefCell::new(Vec::new()),

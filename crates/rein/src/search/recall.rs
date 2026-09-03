@@ -1154,7 +1154,7 @@ fn recall_temporal_with_execution_mode(
             if let Some(pool) = vec_pool.as_ref() {
                 if let Some(guard) = pool.try_get() {
                     let (conn, detached) = guard.detach();
-                    let s = SqliteStore::from_conn(conn, vec_db_path.clone(), vec_dims);
+                    let s = SqliteStore::from_conn(conn, vec_db_path.clone(), vec_dims, &vec_model);
                     let result = try_vector_search(
                         &s,
                         &vec_config,
@@ -1315,7 +1315,7 @@ fn recall_temporal_with_execution_mode(
             if let Some(pool) = kg_pool.as_ref() {
                 if let Some(guard) = pool.try_get() {
                     let (conn, detached) = guard.detach();
-                    let s = SqliteStore::from_conn(conn, kg_db_path.clone(), kg_dims);
+                    let s = SqliteStore::from_conn(conn, kg_db_path.clone(), kg_dims, &kg_model);
                     let result = run_kg_search(
                         &s,
                         &kg_query_str,
@@ -1524,7 +1524,7 @@ fn recall_temporal_with_execution_mode(
                         if let Some(pool) = pool.as_ref() {
                             if let Some(guard) = pool.try_get() {
                                 let (conn, detached) = guard.detach();
-                                let s = SqliteStore::from_conn(conn, db_path.clone(), dims);
+                                let s = SqliteStore::from_conn(conn, db_path.clone(), dims, &model);
                                 let result =
                                     run_kg_search(&s, &eq_str, limit, is_ep, None, t_from, t_to);
                                 let conn_back = s.into_conn();
@@ -3315,6 +3315,7 @@ fn try_tantivy_then_fts5(
                 // rebuild is text-only — it doesn't need the embedding
                 // model recorded or checked.
                 let rebuild_dims = store.dims;
+                let rebuild_model = store.embedding_model().to_string();
                 // v0.30.3 codex R14 P2-#1: my earlier (R13) attempt at
                 // tokio-runtime detection to choose between detached
                 // spawn (server) and sync execute (CLI) was incorrect —
@@ -3354,7 +3355,12 @@ fn try_tantivy_then_fts5(
                             );
                             return;
                         }
-                        let s = SqliteStore::from_conn(conn, rebuild_db_path.clone(), rebuild_dims);
+                        let s = SqliteStore::from_conn(
+                            conn,
+                            rebuild_db_path.clone(),
+                            rebuild_dims,
+                            &rebuild_model,
+                        );
                         crate::search::warmup::try_populate_tantivy(&s);
                     }));
                     if result.is_err() {

@@ -807,7 +807,12 @@ mod tests {
         for _ in 0..5 {
             let guard = pool.get().await.unwrap();
             let (conn, detached) = guard.detach();
-            let store = SqliteStore::from_conn(conn, PathBuf::from(&path), 3072);
+            let store = SqliteStore::from_conn(
+                conn,
+                PathBuf::from(&path),
+                3072,
+                &crate::config::ReinConfig::default().embedding_model(),
+            );
             // A trivial schema-level query — confirms we're really on the
             // migrated DB, not an in-memory throwaway.
             let count: i64 = store
