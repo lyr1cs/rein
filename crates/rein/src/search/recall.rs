@@ -738,6 +738,18 @@ pub fn recall_temporal_with_request_id(
     .results)
 }
 
+/// Refresh the quality weights every ~50 recorded recall hits (the summed
+/// `recall_hit:*` counters). Shared by the live recall path and the prompt
+/// hook: the hook runs `recall_fast_for_context` without recording and then
+/// records only the memories it actually injected, so the check has to run
+/// after that recording rather than inside the recall (codex round-14 P2).
+pub(crate) fn refresh_quality_weights_on_cadence(store: &SqliteStore) {
+    let total_recalls: u64 = store.quality_metrics().map(|(_, r, _)| r).unwrap_or(0);
+    if total_recalls > 0 && total_recalls % 50 == 0 {
+        store.update_quality_weights();
+    }
+}
+
 /// Fast local recall for prompt-time context injection: like [`recall_fast`]
 /// (no expansion, LLM reranker, Supermemory, or remote embedding) and it
 /// still emits `RecallComplete` under `request_id`, but it records no recall
@@ -2707,11 +2719,7 @@ fn recall_temporal_with_execution_mode(
         store.record_recall_hit(&recall_ids);
     }
 
-    // Periodically update quality weights (every ~50 recalls)
-    let total_recalls: u64 = store.quality_metrics().map(|(_, r, _)| r).unwrap_or(0);
-    if total_recalls > 0 && total_recalls % 50 == 0 {
-        store.update_quality_weights();
-    }
+    refresh_quality_weights_on_cadence(store);
 
     tracing::debug!(
         elapsed_ms = total_start.elapsed().as_millis() as u64,

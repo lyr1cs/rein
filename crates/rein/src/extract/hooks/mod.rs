@@ -381,6 +381,9 @@ fn recall_prompt_context(
     // Only the memories that made it into the injected text count as recall
     // hits; the recall itself ran without recording any.
     store.record_recall_hit(&emitted);
+    // Same post-hit cadence as a live recall: the recall above ran without
+    // recording, so its own check saw the pre-increment count.
+    crate::search::recall::refresh_quality_weights_on_cadence(store);
     Some(context)
 }
 
@@ -1142,6 +1145,50 @@ mod tests {
         // Wrong event name never produces output.
         let payload = prompt_payload("x").replace("UserPromptSubmit", "SessionStart");
         assert!(hook_prompt_output(&config, &payload, false, None).is_none());
+    }
+
+    /// Codex round-14 P2: prompt-hook recall hits must drive the same
+    /// quality-weight cadence as live recalls, otherwise installations that
+    /// only recall through the hook keep stale weights forever.
+    #[test]
+    fn hook_prompt_recall_hits_refresh_quality_weights_on_cadence() {
+        let (store, id) = seeded_store();
+        let config = recall_config();
+        // 49 hits recorded so far; the one the hook records next makes 50.
+        store
+            .conn()
+            .execute(
+                "INSERT INTO metadata(key, value) VALUES (?1, '49')",
+                rusqlite::params![format!("recall_hit:{id}")],
+            )
+            .unwrap();
+        let weights_written = |store: &crate::store::SqliteStore| -> bool {
+            store
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM metadata WHERE key = 'quality:bad_count'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+                > 0
+        };
+        assert!(!weights_written(&store));
+
+        hook_prompt_output(
+            &config,
+            &prompt_payload("zebra protocol handshake nonce"),
+            false,
+            Some(&store),
+        )
+        .expect("context for a matching memory");
+
+        let (_, total_recalls, _) = store.quality_metrics().unwrap();
+        assert_eq!(total_recalls, 50);
+        assert!(
+            weights_written(&store),
+            "the 50th recorded hit must refresh the quality weights"
+        );
     }
 
     #[test]
