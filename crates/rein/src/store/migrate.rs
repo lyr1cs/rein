@@ -231,6 +231,14 @@ impl ReindexScope {
             Self::Live => " WHERE status IN ('active', 'updated')",
         }
     }
+
+    /// `WHERE` clause for id-ordered paging (`?1` = last id seen).
+    fn page_filter(self) -> &'static str {
+        match self {
+            Self::All => " WHERE id > ?1",
+            Self::Live => " WHERE status IN ('active', 'updated') AND id > ?1",
+        }
+    }
 }
 
 pub async fn reindex(store: &SqliteStore, config: &ReinConfig) -> anyhow::Result<ReindexReport> {
@@ -407,15 +415,21 @@ pub async fn reindex_with_embedder(
         );
     }
 
-    // 7. Rebuild HNSW and Tantivy side indexes from fresh data (after the
-    // cluster reset above — codex R11 ordering).
+    // 7. Rebuild the HNSW side index from fresh data (after the cluster
+    // reset above — codex R11 ordering). The lexical index does not depend
+    // on the embedding model: only the explicit `rein migrate --reindex`
+    // (`ReindexScope::All`) keeps its historical full rebuild, warmup's
+    // automatic Live migration leaves the Tantivy index it already handled
+    // alone (codex round-18 P2).
     let hnsw_path = store.db_path().with_extension("");
     let _ = std::fs::remove_file(hnsw_path.with_extension("usearch"));
     let _ = std::fs::remove_file(hnsw_path.with_extension("usearch.meta"));
-    let tantivy_path = store.db_path().with_extension("tantivy");
-    let _ = std::fs::remove_dir_all(&tantivy_path);
     crate::search::warmup::populate_hnsw(store, config);
-    crate::search::warmup::populate_tantivy(store);
+    if scope == ReindexScope::All {
+        let tantivy_path = store.db_path().with_extension("tantivy");
+        let _ = std::fs::remove_dir_all(&tantivy_path);
+        crate::search::warmup::populate_tantivy(store);
+    }
 
     Ok(ReindexReport {
         total,
@@ -439,22 +453,21 @@ pub(crate) async fn stage_reindex_embeddings(
     use crate::store::schema;
     use crate::types::Embedder as _;
 
-    let mut stmt = store.conn().prepare(&format!(
-        "SELECT id, topic, summary, content FROM memories{}",
-        scope.sql_filter()
-    ))?;
-    let rows: Vec<(String, String, String, String)> = stmt
-        .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    let total = rows.len();
+    let total: usize = store
+        .conn()
+        .query_row(
+            &format!("SELECT COUNT(*) FROM memories{}", scope.sql_filter()),
+            [],
+            |row| row.get::<_, i64>(0),
+        )?
+        .max(0) as usize;
     // 4. Batch embed and STREAM each batch to a staging table so memory usage
     // stays O(batch) rather than O(total). At 3072-dim floats, 100k memories
     // would otherwise buffer >1GB before the swap — the staging table keeps
-    // it on disk and lets us drop batches as they're persisted.
+    // it on disk and lets us drop batches as they're persisted. The rows
+    // themselves are paged by id in the same batch size (codex round-18 P1):
+    // this migration now runs automatically inside a live server, so the
+    // corpus text must never be materialized either.
     //
     // The staging table is created even when nothing is in scope: an empty
     // Live scope (every memory deprecated, or a fresh database) must still
@@ -469,7 +482,27 @@ pub(crate) async fn stage_reindex_embeddings(
     let mut embedded = 0usize;
     let mut errors = 0usize;
 
-    for chunk in rows.chunks(50) {
+    const PAGE: usize = 50;
+    let page_sql = format!(
+        "SELECT id, topic, summary, content FROM memories{} ORDER BY id LIMIT {PAGE}",
+        scope.page_filter()
+    );
+    let mut cursor = String::new();
+    loop {
+        let chunk: Vec<(String, String, String, String)> = {
+            let mut stmt = store.conn().prepare(&page_sql)?;
+            let rows: Vec<(String, String, String, String)> = stmt
+                .query_map(rusqlite::params![cursor], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+        };
+        let Some(last) = chunk.last() else {
+            break;
+        };
+        cursor = last.0.clone();
         let texts: Vec<String> = chunk
             .iter()
             .map(|(_, topic, summary, content)| {
@@ -536,6 +569,9 @@ pub(crate) async fn stage_reindex_embeddings(
         eprintln!("[{}/{}] Reindexing...", embedded + errors, total);
         if let Some(lock) = heartbeat {
             lock.touch();
+        }
+        if chunk.len() < PAGE {
+            break;
         }
     }
 
@@ -633,6 +669,168 @@ mod tests {
             "{err}"
         );
         drop(held);
+    }
+
+    /// Codex round-18 P1: rows are paged by id, so a corpus larger than one
+    /// page is staged completely without being materialized.
+    #[tokio::test]
+    async fn staging_pages_the_corpus_by_id() {
+        use crate::types::{
+            Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, MemoryTier, Source,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::ReinConfig::default();
+        let dims = config.embedding.dimensions;
+        let db_path = dir.path().join("memories.db");
+        let store =
+            crate::store::SqliteStore::new(&db_path, &config.embedding_model(), dims).unwrap();
+        let now = chrono::Utc::now();
+        for n in 0..120 {
+            let status = if n % 10 == 0 {
+                MemoryStatus::Deprecated
+            } else {
+                MemoryStatus::Active
+            };
+            store
+                .store(Memory {
+                    id: ulid::Ulid::new().to_string(),
+                    layer: MemoryLayer::LTM,
+                    topic: format!("page-{n}"),
+                    summary: format!("summary {n}"),
+                    content: format!("content {n}"),
+                    keywords: vec![],
+                    importance: Importance::Medium,
+                    source: Source::Manual,
+                    strength: 1.0,
+                    decay_lambda: 0.06,
+                    access_count: 0,
+                    superseded_by: None,
+                    canonical_id: None,
+                    support_count: 1,
+                    merge_count: 0,
+                    dedup_confidence: 1.0,
+                    source_diversity: 1.0,
+                    contradiction_score: 0.0,
+                    related_ids: vec![],
+                    concept_ids: vec![],
+                    status,
+                    embedding: None,
+                    tier: MemoryTier::Warm,
+                    cluster_id: None,
+                    archival_summary: None,
+                    archival_summary_at: None,
+                    archival_summary_version: None,
+                    created_at: now,
+                    updated_at: now,
+                    last_accessed: now,
+                })
+                .unwrap();
+        }
+        // `with_fixed_vector` seeds only 64 responses; this corpus needs
+        // 108 + 120 across the two passes below.
+        let embedder =
+            crate::embed::EmbedderKind::Mock(crate::embed::MockEmbedder::with_responses(
+                dims,
+                std::iter::repeat_with(|| Ok(vec![0.25; dims]))
+                    .take(300)
+                    .collect(),
+            ));
+        let (total, embedded, errors) = super::stage_reindex_embeddings(
+            &store,
+            &config,
+            &embedder,
+            super::ReindexScope::Live,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!((total, embedded, errors), (108, 108, 0));
+        let staged: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM embed_staging", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(staged, 108);
+        let (all, all_embedded, _) = super::stage_reindex_embeddings(
+            &store,
+            &config,
+            &embedder,
+            super::ReindexScope::All,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!((all, all_embedded), (120, 120));
+    }
+
+    /// Codex round-18 P2: warmup's automatic Live migration must not rebuild
+    /// the lexical index (warmup already handled it); the explicit All-scope
+    /// reindex keeps its full rebuild.
+    #[tokio::test]
+    async fn live_reindex_leaves_tantivy_alone_but_all_rebuilds_it() {
+        use crate::types::{
+            Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, MemoryTier, Source,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::ReinConfig::default();
+        let dims = config.embedding.dimensions;
+        let db_path = dir.path().join("memories.db");
+        let store =
+            crate::store::SqliteStore::new(&db_path, &config.embedding_model(), dims).unwrap();
+        let now = chrono::Utc::now();
+        store
+            .store(Memory {
+                id: ulid::Ulid::new().to_string(),
+                layer: MemoryLayer::LTM,
+                topic: "lexical".to_string(),
+                summary: "lexical summary".to_string(),
+                content: "lexical content".to_string(),
+                keywords: vec![],
+                importance: Importance::Medium,
+                source: Source::Manual,
+                strength: 1.0,
+                decay_lambda: 0.06,
+                access_count: 0,
+                superseded_by: None,
+                canonical_id: None,
+                support_count: 1,
+                merge_count: 0,
+                dedup_confidence: 1.0,
+                source_diversity: 1.0,
+                contradiction_score: 0.0,
+                related_ids: vec![],
+                concept_ids: vec![],
+                status: MemoryStatus::Active,
+                embedding: Some(vec![0.9; dims]),
+                tier: MemoryTier::Warm,
+                cluster_id: None,
+                archival_summary: None,
+                archival_summary_at: None,
+                archival_summary_version: None,
+                created_at: now,
+                updated_at: now,
+                last_accessed: now,
+            })
+            .unwrap();
+        let tantivy_dir = db_path.with_extension("tantivy");
+        std::fs::create_dir_all(&tantivy_dir).unwrap();
+        let marker = tantivy_dir.join("marker.txt");
+        std::fs::write(&marker, b"untouched").unwrap();
+        let embedder = crate::embed::EmbedderKind::Mock(
+            crate::embed::MockEmbedder::with_fixed_vector(dims, vec![0.25; dims]),
+        );
+
+        super::reindex_with_embedder(&store, &config, &embedder, super::ReindexScope::Live)
+            .await
+            .unwrap();
+        assert!(
+            marker.exists(),
+            "Live scope must not rebuild the lexical index"
+        );
+
+        super::reindex_with_embedder(&store, &config, &embedder, super::ReindexScope::All)
+            .await
+            .unwrap();
+        assert!(!marker.exists(), "All scope rebuilds the lexical index");
     }
 
     /// Codex round-17 P1: a memory whose vector was written while the

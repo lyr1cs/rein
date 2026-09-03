@@ -158,8 +158,9 @@ pub async fn warmup_with_embedder(
     );
 
     if report.vector_table_replaced {
-        // The reindex path already rebuilt HNSW and Tantivy from the new
-        // vector table; a second rebuild would only repeat that work.
+        // The reindex path already rebuilt HNSW from the new vector table; a
+        // second rebuild would only repeat that work. Tantivy was handled by
+        // the cold-start gate above and does not depend on the model.
     } else if should_rebuild_hnsw || report.rows_added() > 0 {
         // One rebuild covers the cold-start gate and the rows added above.
         populate_hnsw(store, config);
