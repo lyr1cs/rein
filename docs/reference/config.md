@@ -102,6 +102,15 @@ operator decision.
 | `[hooks.claude].max_additional_context_chars` | `1200` | Hard cap for the Claude Code `additionalContext` payload. |
 | `[hooks.claude].prompt_context_source` | `"working_set"` | Same semantics as the Codex key. With `"recall"` the context ends with a `rein_feedback: request_id=... memory_ids=...` line so the agent can attribute what it used; `RecallComplete` alone is not a training sample. |
 
+Which table `rein hook prompt` applies is decided per hook process, in this
+order: an explicit `REIN_AGENT_LABEL` (`codex`, `codex-main`, `codex:ci` …
+select `[hooks.codex]`, any other label `[hooks.claude]`); otherwise Claude
+Code's own markers (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`) select
+`[hooks.claude]` even when Codex variables were inherited from a
+Codex-managed shell; only then do `CODEX_THREAD_ID` / `CODEX_CI` select
+`[hooks.codex]`. Codex hooks should always be registered with
+`REIN_AGENT_LABEL=codex` (as in the snippets above).
+
 ## Environment Variables
 
 | Variable | Effect |

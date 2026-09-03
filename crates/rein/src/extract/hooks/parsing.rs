@@ -126,16 +126,46 @@ pub fn is_subagent_hook(input: &str) -> bool {
 
 /// Best-effort runtime client/agent label.
 /// Prefer explicit override, then detect common agent environments.
-/// Whether the calling hook runtime is Codex. Independent of the free-form
-/// `REIN_AGENT_LABEL` display label: a label of `codex`, `codex-main`,
-/// `codex:ci` etc. counts, and so do Codex's own environment variables.
+/// Whether the calling hook runtime is Codex. Precedence (codex round-20
+/// P2): an explicit `REIN_AGENT_LABEL` decides outright (`codex`,
+/// `codex-main`, `codex:ci` … are Codex, anything else is not); otherwise
+/// Claude Code's own markers (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`) win
+/// over Codex variables, which a Claude hook can inherit from a
+/// Codex-managed shell; only then do `CODEX_THREAD_ID` / `CODEX_CI` count.
+/// A Codex hook launched from inside a Claude Code shell should set
+/// `REIN_AGENT_LABEL=codex`.
 pub fn hook_runtime_is_codex() -> bool {
-    if std::env::var("CODEX_THREAD_ID").is_ok() || std::env::var("CODEX_CI").is_ok() {
-        return true;
+    classify_hook_runtime(
+        std::env::var("REIN_AGENT_LABEL").ok().as_deref(),
+        claude_runtime_markers_present(),
+        codex_runtime_markers_present(),
+    )
+}
+
+/// Pure form of [`hook_runtime_is_codex`]; returns `true` for Codex.
+pub(crate) fn classify_hook_runtime(
+    explicit_label: Option<&str>,
+    claude_markers: bool,
+    codex_markers: bool,
+) -> bool {
+    if let Some(label) = explicit_label
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+    {
+        return runtime_label_is_codex(label);
     }
-    std::env::var("REIN_AGENT_LABEL")
-        .ok()
-        .is_some_and(|label| runtime_label_is_codex(&label))
+    if claude_markers {
+        return false;
+    }
+    codex_markers
+}
+
+fn claude_runtime_markers_present() -> bool {
+    std::env::var("CLAUDECODE").is_ok() || std::env::var("CLAUDE_CODE_ENTRYPOINT").is_ok()
+}
+
+fn codex_runtime_markers_present() -> bool {
+    std::env::var("CODEX_THREAD_ID").is_ok() || std::env::var("CODEX_CI").is_ok()
 }
 
 /// `codex` exactly, or `codex` followed by a separator (`codex-main`,
@@ -156,11 +186,14 @@ pub fn runtime_agent_label() -> String {
             return trimmed.to_string();
         }
     }
-    if std::env::var("CODEX_THREAD_ID").is_ok() || std::env::var("CODEX_CI").is_ok() {
-        return "codex".to_string();
-    }
-    if std::env::var("CLAUDECODE").is_ok() || std::env::var("CLAUDE_CODE_ENTRYPOINT").is_ok() {
+    // Claude's own markers before Codex variables a Claude hook may have
+    // inherited from a Codex-managed shell (same precedence as
+    // `hook_runtime_is_codex`).
+    if claude_runtime_markers_present() {
         return "claude-code".to_string();
+    }
+    if codex_runtime_markers_present() {
+        return "codex".to_string();
     }
     if std::env::var("CURSOR_TRACE_ID").is_ok() || std::env::var("CURSOR_AGENT").is_ok() {
         return "cursor".to_string();
@@ -830,5 +863,26 @@ mod tests {
         ] {
             assert!(!super::runtime_label_is_codex(no), "{no}");
         }
+    }
+
+    /// Codex round-20 P2: a Claude Code hook that inherited Codex variables
+    /// from a Codex-managed shell is still a Claude hook; an explicit label
+    /// beats every marker.
+    #[test]
+    fn hook_runtime_prefers_explicit_label_then_claude_markers() {
+        use super::classify_hook_runtime;
+        // Both markers present: Claude wins.
+        assert!(!classify_hook_runtime(None, true, true));
+        // Only Codex markers: Codex.
+        assert!(classify_hook_runtime(None, false, true));
+        // No markers at all: not Codex.
+        assert!(!classify_hook_runtime(None, false, false));
+        // Explicit label decides regardless of markers.
+        assert!(classify_hook_runtime(Some("codex"), true, false));
+        assert!(classify_hook_runtime(Some(" codex:ci "), true, false));
+        assert!(!classify_hook_runtime(Some("claude-code"), false, true));
+        // An empty label is no label.
+        assert!(!classify_hook_runtime(Some("  "), true, true));
+        assert!(classify_hook_runtime(Some(""), false, true));
     }
 }
