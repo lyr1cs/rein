@@ -158,7 +158,7 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
                             }
                             let live_ids = live_vector_ids(&store).unwrap_or_default();
                             let (hnsw_check, hnsw_coverage) =
-                                inspect_hnsw(&store, snapshot.total_memories, &live_ids);
+                                inspect_hnsw(&store, snapshot.live_memories, &live_ids);
                             checks.push(check_vector_coverage(config, &snapshot, hnsw_coverage));
                             checks.push(check_vector_provenance(config, &snapshot));
                             checks.push(check_tantivy(&store, snapshot.active_memories));
@@ -2221,6 +2221,18 @@ fn check_vector_coverage(
     if snapshot.total_memories == 0 {
         return ok_in(DoctorCategory::Index, "vector_store", "0 memories");
     }
+    // Nothing to cover: no live memory needs a vector, so a missing index is
+    // correct and no rebuild could change it (codex round-23 P2).
+    if snapshot.live_memories == 0 {
+        return ok_in(
+            DoctorCategory::Index,
+            "vector_store",
+            format!(
+                "no live memories ({} total, {} vector rows)",
+                snapshot.total_memories, snapshot.vector_rows
+            ),
+        );
+    }
 
     let Some(hnsw) = hnsw else {
         let hint = match config.embedding_provider() {
@@ -2249,16 +2261,6 @@ fn check_vector_coverage(
     // a Live-scope migration, so the denominator is the live population —
     // otherwise a vault with >10 % deprecated rows warns forever and
     // recommends a `rein warmup` that cannot change the number.
-    if snapshot.live_memories == 0 {
-        return ok_in(
-            DoctorCategory::Index,
-            "vector_store",
-            format!(
-                "no live memories ({} total, {} indexed vectors)",
-                snapshot.total_memories, hnsw.indexed
-            ),
-        );
-    }
     let coverage = snapshot.live_vectors as f64 / snapshot.live_memories as f64;
     let message = format!(
         "{} of {} live memories have a vector ({:.0}% coverage, hnsw={}, total={}, cache={}, artifacts={})",
@@ -2436,9 +2438,13 @@ fn live_vector_ids(store: &SqliteStore) -> anyhow::Result<Vec<String>> {
     Ok(ids)
 }
 
+/// `live_memories` is the population the index is expected to cover
+/// (`status` active / updated). A database with none — a fresh install, or
+/// one whose live rows are all deprecated after a Live-scope reindex —
+/// correctly has no index on disk (codex round-23 P2).
 fn inspect_hnsw(
     store: &SqliteStore,
-    total_memories: usize,
+    live_memories: usize,
     live_vector_ids: &[String],
 ) -> (DoctorCheck, Option<HnswCoverage>) {
     let base_path = store.db_path().with_extension("");
@@ -2446,9 +2452,13 @@ fn inspect_hnsw(
     let meta_path = base_path.with_extension("usearch.meta");
     let dirty = HnswIndex::is_dirty(&base_path);
 
-    if total_memories == 0 && !index_path.exists() {
+    if live_memories == 0 && !index_path.exists() {
         return (
-            ok_in(DoctorCategory::Index, "hnsw", "not built yet (0 memories)"),
+            ok_in(
+                DoctorCategory::Index,
+                "hnsw",
+                "not built yet (no live memories)",
+            ),
             Some(HnswCoverage {
                 indexed: 0,
                 missing_live: 0,
@@ -6273,6 +6283,28 @@ provider = "inherit"
 #[cfg(test)]
 mod vector_diagnostics_tests {
     use super::*;
+
+    /// Codex round-23 P2: a database whose live population is empty needs no
+    /// vector index; doctor must not recommend a rebuild that cannot help.
+    #[test]
+    fn coverage_is_ok_without_an_index_when_no_memory_is_live() {
+        let config = ReinConfig::default();
+        let mut snap = snapshot(0, 0);
+        snap.total_memories = 12;
+        snap.vector_rows = 0;
+        let missing_index = check_vector_coverage(&config, &snap, None);
+        assert_eq!(
+            missing_index.status,
+            CheckStatus::Ok,
+            "{}",
+            missing_index.message
+        );
+        assert!(
+            missing_index.message.contains("no live memories"),
+            "{}",
+            missing_index.message
+        );
+    }
 
     fn snapshot(live_memories: usize, live_vectors: usize) -> StoreSnapshot {
         StoreSnapshot {

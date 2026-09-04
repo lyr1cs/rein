@@ -86,24 +86,27 @@ impl SqliteStore {
         format!("{}:{}", self.embedding_model, self.dims)
     }
 
+    /// Codex round-23 P1: the cache is keyed by model, and the vector this
+    /// returns is written under `vector_provenance()` — the model this store
+    /// was opened with. Reading the model from the live config instead would,
+    /// after a config edit, fetch a model-B vector and label it model A.
     fn cached_embedding_for_memory(&self, memory: &Memory) -> Option<Vec<f32>> {
-        let config = crate::config::ReinConfig::load().ok()?;
-        let model = config.embedding_model();
         let enriched =
             crate::embed::prepend_metadata(&memory.topic, &memory.summary, &memory.content);
-        crate::embed::EmbedCache::get(self.conn(), &enriched, &model)
+        crate::embed::EmbedCache::get(self.conn(), &enriched, &self.embedding_model)
             .ok()
             .flatten()
     }
 
     fn infer_cluster_from_cache(&self, memory: &Memory) -> Option<u32> {
-        let config = crate::config::ReinConfig::load().ok()?;
-        let model = config.embedding_model();
+        // Same model discipline as `cached_embedding_for_memory`: cluster
+        // geometry lives in this store's embedding space.
         let enriched =
             crate::embed::prepend_metadata(&memory.topic, &memory.summary, &memory.content);
-        let embedding = crate::embed::EmbedCache::get(self.conn(), &enriched, &model)
-            .ok()
-            .flatten()?;
+        let embedding =
+            crate::embed::EmbedCache::get(self.conn(), &enriched, &self.embedding_model)
+                .ok()
+                .flatten()?;
 
         // Prefer centroid-based assignment (accurate, no N+1 queries).
         // Pass embedding dims so stale centroids from a prior model are automatically rejected.

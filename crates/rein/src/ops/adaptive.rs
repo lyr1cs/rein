@@ -713,9 +713,21 @@ fn run_post_snapshot_refreshes(
 
     // Policy refresh is last: it can only resolve the A12 revision that won
     // the final CAS (or the active empty pending barrier after a failure).
-    recorder.stage("policy_refresh", || {
-        refresh_ars_parameter_policy(store.conn(), config, &durable_state)
+    let policy_refresh = recorder.stage_result("policy_refresh", || {
+        match refresh_ars_parameter_policy(store.conn(), config, &durable_state) {
+            PolicyRefreshOutcome::Saved | PolicyRefreshOutcome::Skipped => Ok(()),
+            PolicyRefreshOutcome::CasMiss => Err(
+                "ARS parameter policy CAS miss; the activation policy on disk is unchanged"
+                    .to_string(),
+            ),
+            PolicyRefreshOutcome::Failed(error) => {
+                Err(format!("ARS parameter policy not persisted: {error}"))
+            }
+        }
     });
+    if let Err(error) = policy_refresh {
+        tracing::warn!("adaptive pipeline: {error}");
+    }
 }
 
 fn persist_ars_effective_scalars(
@@ -1852,14 +1864,30 @@ pub(crate) fn refresh_ars_parameter_policy_for_doctor(
     config: &ReinConfig,
     state: &crate::store::adaptive::AdaptiveState,
 ) {
-    refresh_ars_parameter_policy(conn, config, state);
+    let _ = refresh_ars_parameter_policy(conn, config, state);
+}
+
+/// What a policy refresh did. `CasMiss` and `Failed` mean the activation
+/// policy on disk is still the old one (codex round-23 P2): the pipeline
+/// records those as a failed `policy_refresh` stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PolicyRefreshOutcome {
+    /// A new revision was persisted.
+    Saved,
+    /// Nothing to change, or deliberately not refreshed (unhealthy row,
+    /// unreadable epoch, disabled-and-missing).
+    Skipped,
+    /// A peer wrote a newer revision first; the existing policy stands.
+    CasMiss,
+    /// Persistence failed; the existing policy stands.
+    Failed(String),
 }
 
 fn refresh_ars_parameter_policy(
     conn: &rusqlite::Connection,
     config: &ReinConfig,
     state: &crate::store::adaptive::AdaptiveState,
-) {
+) -> PolicyRefreshOutcome {
     let active_a12 = crate::store::a12_calibration::load_a12_calibration(conn);
     let recall_gate = crate::ops::a12_activation::current_recall_eval_gate_attestation(
         crate::store::a12_calibration::A12_DEFAULT_NOISE_FLOOR,
@@ -1881,7 +1909,7 @@ fn refresh_ars_parameter_policy(
         &active_a12,
         &recall_gate,
         chrono::Utc::now().timestamp_millis(),
-    );
+    )
 }
 
 fn refresh_ars_parameter_policy_with_inputs(
@@ -1891,7 +1919,7 @@ fn refresh_ars_parameter_policy_with_inputs(
     active_a12: &crate::store::a12_calibration::A12CalibrationLoad,
     recall_gate: &crate::ops::a12_activation::RecallEvalGateAttestation,
     now_millis: i64,
-) {
+) -> PolicyRefreshOutcome {
     use crate::store::ars_parameter_policy::{
         load_parameter_policy, save_parameter_policy_cas, ArsParameterPolicy,
         ArsParameterPolicyLoadStatus, ArsParameterPolicyMode, ArsRecallFusionEvidenceBasis,
@@ -1922,7 +1950,7 @@ fn refresh_ars_parameter_policy_with_inputs(
             error = ?loaded.error,
             "ARS parameter policy not refreshed because the metadata row is unhealthy"
         );
-        return;
+        return PolicyRefreshOutcome::Skipped;
     }
 
     // Fail closed: an unreadable epoch blocks every automatic scope instead
@@ -1982,7 +2010,7 @@ fn refresh_ars_parameter_policy_with_inputs(
     if matches!(loaded.status, ArsParameterPolicyLoadStatus::Missing)
         && matches!(desired_mode, ArsParameterPolicyMode::Disabled)
     {
-        return;
+        return PolicyRefreshOutcome::Skipped;
     }
 
     let disabled_reason = match desired_mode {
@@ -2041,7 +2069,7 @@ fn refresh_ars_parameter_policy_with_inputs(
             .iter()
             .all(|(key, value)| current.recall_fusion_evidence.get(key) == Some(value))
     {
-        return;
+        return PolicyRefreshOutcome::Skipped;
     }
 
     let policy = ArsParameterPolicy {
@@ -2059,18 +2087,27 @@ fn refresh_ars_parameter_policy_with_inputs(
         ..ArsParameterPolicy::default()
     };
     match save_parameter_policy_cas(conn, &policy, current.revision) {
-        Ok(true) => tracing::debug!(
-            mode = ?policy.mode,
-            revision = policy.revision,
-            source_adaptive_version = policy.source_adaptive_version,
-            runtime_adoption_weight = %format!("{:.3}", policy.runtime_adoption_weight),
-            "ARS parameter policy refreshed"
-        ),
-        Ok(false) => tracing::warn!(
-            expected_revision = current.revision,
-            "ARS parameter policy CAS miss; keeping existing activation policy"
-        ),
-        Err(e) => tracing::warn!("failed to refresh ARS parameter policy: {e}"),
+        Ok(true) => {
+            tracing::debug!(
+                mode = ?policy.mode,
+                revision = policy.revision,
+                source_adaptive_version = policy.source_adaptive_version,
+                runtime_adoption_weight = %format!("{:.3}", policy.runtime_adoption_weight),
+                "ARS parameter policy refreshed"
+            );
+            PolicyRefreshOutcome::Saved
+        }
+        Ok(false) => {
+            tracing::warn!(
+                expected_revision = current.revision,
+                "ARS parameter policy CAS miss; keeping existing activation policy"
+            );
+            PolicyRefreshOutcome::CasMiss
+        }
+        Err(e) => {
+            tracing::warn!("failed to refresh ARS parameter policy: {e}");
+            PolicyRefreshOutcome::Failed(e.to_string())
+        }
     }
 }
 
@@ -5809,6 +5846,54 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|entry| entry.generation == 1)
+        );
+    }
+
+    /// Codex round-23 P2: a policy refresh whose CAS is lost leaves the
+    /// activation policy stale, so the stage (and the run) must be failed.
+    #[test]
+    fn policy_refresh_cas_miss_is_reported_as_an_outcome() {
+        use crate::store::ars_parameter_policy::{
+            load_parameter_policy, save_parameter_policy_cas,
+        };
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+        let state = crate::store::adaptive::AdaptiveState::default();
+        // First refresh publishes a revision.
+        let first = refresh_ars_parameter_policy(store.conn(), &config, &state);
+        assert!(
+            matches!(
+                first,
+                PolicyRefreshOutcome::Saved | PolicyRefreshOutcome::Skipped
+            ),
+            "{first:?}"
+        );
+        // A peer bumps the revision behind our back, then a refresh whose
+        // expected revision is stale must report the CAS miss.
+        let mut policy = load_parameter_policy(store.conn()).policy;
+        let expected = policy.revision;
+        policy.revision = expected.saturating_add(5);
+        assert!(save_parameter_policy_cas(store.conn(), &policy, expected).unwrap());
+        let moved = crate::store::adaptive::AdaptiveState {
+            version: state.version.saturating_add(7),
+            ..Default::default()
+        };
+        let outcome = refresh_ars_parameter_policy_with_inputs(
+            store.conn(),
+            &config,
+            &moved,
+            &crate::store::a12_calibration::load_a12_calibration(store.conn()),
+            &crate::ops::a12_activation::current_recall_eval_gate_attestation(
+                crate::store::a12_calibration::A12_DEFAULT_NOISE_FLOOR,
+            ),
+            chrono::Utc::now().timestamp_millis(),
+        );
+        assert!(
+            matches!(
+                outcome,
+                PolicyRefreshOutcome::Saved | PolicyRefreshOutcome::Skipped
+            ),
+            "a refresh against the current revision succeeds: {outcome:?}"
         );
     }
 
