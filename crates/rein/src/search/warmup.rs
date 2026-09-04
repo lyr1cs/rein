@@ -161,6 +161,21 @@ pub async fn warmup_with_embedder(
         // The reindex path already rebuilt HNSW from the new vector table; a
         // second rebuild would only repeat that work. Tantivy was handled by
         // the cold-start gate above and does not depend on the model.
+    } else if report.model_changed {
+        // Codex round-24 P1: the configured model differs and the migration
+        // did NOT complete, so `vec_memories` still holds old-model vectors.
+        // Rebuilding from them would publish an index in the old embedding
+        // space and clear the dirty marker, and current-model query vectors
+        // would then search an incompatible index. Leave the existing index
+        // alone and keep it marked dirty until a migration succeeds.
+        if store.db_path().to_str() != Some(":memory:") {
+            crate::store::hnsw::HnswIndex::mark_dirty(&store.db_path().with_extension(""));
+        }
+        tracing::warn!(
+            "warmup: embedding model changed but the migration did not complete; HNSW left \
+             untouched and marked dirty (run `rein warmup` with a working provider, or \
+             `rein migrate --reindex`)"
+        );
     } else if should_rebuild_hnsw || report.rows_added() > 0 {
         // One rebuild covers the cold-start gate and the rows added above.
         populate_hnsw(store, config);
@@ -2511,6 +2526,63 @@ mod tests {
             read_metadata(&store, VEC_ROWS_PROVENANCE_KEY).as_deref(),
             Some(format!("old-model:{dims}").as_str()),
             "provenance is not advanced by an incomplete migration"
+        );
+    }
+
+    /// Codex round-24 P1: a model change whose migration did not complete
+    /// must not rebuild HNSW from the surviving old-model vectors, and must
+    /// leave the index marked dirty.
+    #[tokio::test]
+    async fn failed_model_migration_leaves_hnsw_dirty_and_unrebuilt() {
+        use crate::types::MemoryStore;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memories.db");
+        let config = ReinConfig::default();
+        let dims = config.embedding.dimensions;
+        let store = SqliteStore::new(&db_path, &config.embedding_model(), dims).unwrap();
+        let mut memory = live_memory("old-model-row", "row written by the previous model");
+        memory.embedding = Some(vec![0.9; dims]);
+        store.store(memory).unwrap();
+        // Stamp the table for another model: warmup must migrate, and with no
+        // provider configured the migration cannot complete.
+        write_metadata(
+            &store,
+            VEC_ROWS_PROVENANCE_KEY,
+            &format!("old-model:{dims}"),
+        )
+        .unwrap();
+        let hnsw_base = db_path.with_extension("");
+        crate::store::hnsw::HnswIndex::mark_dirty(&hnsw_base);
+        let sentinel = hnsw_base.with_extension("usearch");
+        std::fs::write(&sentinel, b"sentinel-index").unwrap();
+
+        let report = warmup_with_embedder(&store, &config, None, WarmupOptions::default()).await;
+
+        assert!(report.model_changed, "the model change must be detected");
+        assert!(!report.vector_table_replaced);
+        assert!(
+            crate::store::hnsw::HnswIndex::is_dirty(&hnsw_base),
+            "a failed migration must leave the index dirty"
+        );
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"sentinel-index",
+            "the existing index must not be rebuilt from old-model vectors"
+        );
+        let kept = crate::store::vec::get_embedding(
+            store.conn(),
+            &store
+                .conn()
+                .query_row("SELECT id FROM memories LIMIT 1", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            (kept[0] - 0.9).abs() < 1e-6,
+            "old-model rows survive untouched"
         );
     }
 
