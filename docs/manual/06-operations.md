@@ -130,6 +130,61 @@ Concept living-summary refresh is exposed through the `rein_concept_summary_refr
 MCP tool and `POST /api/concepts/summary_refresh` REST route rather than a CLI
 subcommand.
 
+## Vector Durability And Model Migration
+
+Every live memory should have a row in `vec_memories`. The embedding cache is a
+bounded, 30-day store, so a cache entry is not durable coverage: after eviction
+a memory with no vector row drops out of vector recall entirely.
+
+```bash
+rein warmup                          # fill missing vector rows, then rebuild HNSW
+rein warmup --trust-existing-vectors # attest legacy rows as the configured model
+rein warmup --reembed-all            # re-embed every live row under the current model
+```
+
+`warmup` streams the gap in pages: it reads the ids of live memories without a
+vector row, then for each page fetches the text, writes rows for cache hits and
+embeds the misses. Rows that cannot be embedded keep their retry flag and are
+counted as errors — they are never silently skipped. The HNSW index is rebuilt
+once at the end, over the same live scope.
+
+### The provenance stamp
+
+The vector table carries a `vec_rows_provenance` metadata stamp of the form
+`model:dims`. The first vector written to an empty table claims it for that
+model. After that, a writer whose configured model differs is refused, so two
+processes with different configurations can never mix embedding spaces in one
+table.
+
+A table written before v1.4 has no stamp. Until it is attested, checked vector
+writes are refused: memories are still stored and still searchable through the
+lexical index, but they get no vector and are flagged for a later vector pass.
+Resolve it once, right after upgrading:
+
+- the rows were produced by the configured model → `rein warmup --trust-existing-vectors`
+- the embedding model changed → `rein warmup` (which migrates) or `rein migrate --reindex`
+
+`rein doctor` reports this as `vector_provenance`, and `vector_store` reports
+coverage over live memories together with HNSW membership.
+
+### Model migration
+
+When the configured model differs from the stamp, `warmup` re-embeds the live
+scope and replaces the vector table atomically: embeddings stream into a staging
+table, each staged row is revalidated against the live text and status at
+publish time, and the swap, the provenance stamp and the cluster reset commit
+together. Live memories whose vector was written while the migration was
+staging, or whose row was skipped at publish, are flagged for re-embedding by
+the next adaptive pass.
+
+If the migration cannot complete — no provider, or an embedding failure — the
+old vector table is left untouched and the HNSW index is left marked dirty
+rather than rebuilt from vectors in the old embedding space.
+
+**After upgrading a running deployment**: restart every rein process. A process
+still running the previous configuration is refused vector writes once the store
+is stamped for the current model.
+
 ## Workers And Queues
 
 Rein has file-backed queues for work that should not block the hot path.

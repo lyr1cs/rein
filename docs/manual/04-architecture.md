@@ -167,6 +167,17 @@ and ARS feedback aggregation.
 offsets, concept-summary and synthesis feedback aggregates, calibration state,
 and cluster profiles used by the GUI.
 
+`ops/pipeline_run.rs` records what a pass did. The recorder wraps each stage,
+persists the run to the `adaptive_pipeline_last_run` metadata row as it goes,
+and derives the run outcome from the stage outcomes, so a failure anywhere in
+the pass is visible to doctor and `adaptive-status` instead of being reduced to
+a log line.
+
+`ops/a12_exclusion_index.rs` builds the exclusion index the A12 corpus needs: a
+content-hash map plus interned-token posting lists that reproduce the pairwise
+lexical similarity exactly, turning the leave-one-out corpus build from a
+quadratic scan into a posting-list intersection.
+
 ## GUI
 
 `crates/rein/gui` is a React, TypeScript, Tailwind, and Vite application. The

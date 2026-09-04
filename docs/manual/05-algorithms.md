@@ -971,6 +971,19 @@ member's whole family, including supersede-chain relatives, leaves the
 eligible answer set, so a superseded revision of the held-out row cannot leak
 the answer back in.
 
+Exclusion is answered from an index rather than by comparing every view with
+every row (v1.4). Each row contributes its content hash and its interned token
+set to a hash map and to posting lists. A view's candidates are the rows that
+share at least one token; for a candidate with intersection size `c`, query
+size `a` and row size `b`, the pair is a near-duplicate when
+`max(c / (a + b - c), c / min(a, b))` reaches the bound. Rows sharing no token
+have similarity zero under the original pairwise function, so for a positive
+bound the candidate set is exact, and a non-positive bound returns every row —
+the index reproduces the pairwise semantics rather than approximating them. On
+a 9.7k-memory store this moved the corpus build from about two hours to eight
+seconds; a randomized property test and a real-database equivalence test assert
+the two implementations agree row for row.
+
 ### Family-Disjoint Split
 
 Families are assigned to five folds by hashing a stable family key:
@@ -1021,6 +1034,16 @@ The epoch row self-heals asymmetrically: a missing row is re-created at every
 open (re-creation cannot reset a live counter), while a malformed row is
 repaired only by `rein doctor --fix`, which atomically re-baselines the
 counter and invalidates any active A12 calibration bound to it.
+
+Since v1.4 a run whose epoch advanced mid-flight is no longer thrown away. The
+generation is sealed as `Complete` carrying the identity it was trained on, and
+the runtime resolver rejects it on the epoch check at every recall, so a stale
+generation is readable for diagnostics and worth nothing to activation. The
+stricter guards stay: an identity hash that moved while the epoch did not
+indicates a write outside the trigger set and refuses publication, and the
+replay stage still requires the trace and the corpus to describe one store
+state, because training on a trace whose snapshot moved would bias the
+measurement.
 
 ### Sealed Policy And Fail-Closed Activation
 

@@ -185,6 +185,44 @@ retrieval fusion weights, adjust reranker features, and learn per-cluster dedup
 thresholds. When there is not enough signal, Rein uses cold-start defaults or
 global priors instead of pretending the data is mature.
 
+### Run records (v1.4)
+
+Every pass writes a run record to the `adaptive_pipeline_last_run` metadata row
+before it starts, and updates it after each stage. The record carries a run id,
+the process id, what triggered the pass (`gc`, `consolidate`, `dedup`, `other`),
+start and finish timestamps, an outcome, and one entry per stage with its
+duration, outcome and an optional detail string.
+
+Because the row is written as the pass proceeds, an interrupted run stays
+visible: it keeps the `running` outcome with a stale start timestamp and the
+last stage that completed. A stage that fails — a lost offset commit, a judge
+drain that dropped work to read errors or malformed jobs, an aborted
+reclustering, a policy refresh whose compare-and-swap was lost — marks both the
+stage and the whole run as failed rather than reporting a clean pass.
+
+`rein doctor` reports the record as `adaptive_pipeline_last_run`, `rein
+adaptive-status` exposes it as `pipeline_last_run`, and `rein gc` prints one
+summary line with the total time and the three slowest stages. The row is
+outside the A12 input-epoch trigger set, so recording progress cannot
+invalidate a calibration that is in flight.
+
+### Calibration under concurrent writes (v1.4)
+
+A12 calibration reads a large corpus and replays recall traces, which takes
+minutes on a mature store. Before v1.4 any write that landed during the run
+discarded the whole result. Now the publication step keeps it: the generation is
+published as `Complete` carrying the fingerprint of the state it was actually
+trained on, and the activation side refuses to adopt a generation whose
+`source_input_epoch` no longer matches the store. A stale generation is
+therefore readable for diagnostics but cannot influence recall.
+
+Two guards remain deliberately fail-closed. A snapshot identity that moved while
+the epoch did not (a write outside the trigger set) still refuses publication,
+and the replay stage still requires the trace and the corpus to describe the
+same store state — training on a trace whose local snapshot moved would bias the
+result. On a machine where agent hooks write memories continuously, run the
+pipeline when those sessions are idle if you want A12 to train.
+
 ## ARS Projections
 
 ARS features are optional projections over stored memories and feedback. They
