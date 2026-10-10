@@ -19,6 +19,19 @@ function formatTime(value: number | null) {
   return new Date(value * 1000).toLocaleString();
 }
 
+/**
+ * `/api/oauth/clients` is owner-only. Under `[server] auth = "public"` the
+ * server has no owner token, so the request fails with a JSON 401 body;
+ * render that as guidance instead of the raw wire text.
+ */
+function describeConnectorsError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.includes('REIN_HTTP_TOKEN') || message.includes('owner-only')) {
+    return 'Connectors are owner-only. Set REIN_HTTP_TOKEN, switch [server].auth away from "public", then apply the token in Settings.';
+  }
+  return message;
+}
+
 export default function Connectors() {
   const queryClient = useQueryClient();
   const { data, isLoading, error } = useQuery({
@@ -38,7 +51,9 @@ export default function Connectors() {
       </div>
 
       {isLoading && <div className="text-sm text-[var(--text-muted)]">Loading connectors...</div>}
-      {error && <div className="text-sm text-[var(--hot)]">{(error as Error).message}</div>}
+      {error && (
+        <div className="text-sm text-[var(--hot)]">{describeConnectorsError(error)}</div>
+      )}
 
       <div className="overflow-hidden border border-[var(--border)] bg-[var(--bg-primary)]">
         <table className="w-full text-left text-sm">

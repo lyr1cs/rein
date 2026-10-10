@@ -185,6 +185,8 @@ export default function SynthesisCard({
   // (the hook's internal `key` gate handles that).
   const cardRef = useRef<HTMLDivElement | null>(null);
   const [thumbState, setThumbState] = useState<'up' | 'down' | null>(null);
+  const [thumbPending, setThumbPending] = useState(false);
+  const [thumbError, setThumbError] = useState<string | null>(null);
 
   const synthesisId = outcome?.synthesis_id;
   const sourceCount = outcome?.source_count;
@@ -264,23 +266,32 @@ export default function SynthesisCard({
   );
 
   const handleThumb = useCallback(
-    (up: boolean) => {
-      // UI: latch state immediately so the user sees the choice land.
+    async (up: boolean) => {
+      // Latch only after the server accepted the vote. The previous
+      // optimistic latch showed "You rated this helpful" even when the
+      // POST came back 403 (public auth + public_url refuses every REST
+      // mutation), so votes silently vanished while looking recorded.
       // Re-clicking the same thumb is a no-op (no second POST) — the
       // server only counts the first vote per (synthesis_id, user). We
-      // also disallow flipping (up→down) here for the same reason; if
-      // the user wants to revise they can re-query.
-      setThumbState((prev) => (prev !== null ? prev : up ? 'up' : 'down'));
-      if (thumbState === null) {
-        void postSynthesisInteraction(
-          synthesisId,
-          recallId,
-          { kind: 'explicit_thumb', up },
-          metadata,
-        );
+      // also disallow flipping (up→down) for the same reason; if the
+      // user wants to revise they can re-query.
+      if (thumbState !== null || thumbPending) return;
+      setThumbPending(true);
+      setThumbError(null);
+      const result = await postSynthesisInteraction(
+        synthesisId,
+        recallId,
+        { kind: 'explicit_thumb', up },
+        metadata,
+      );
+      setThumbPending(false);
+      if (result.ok) {
+        setThumbState(up ? 'up' : 'down');
+      } else {
+        setThumbError(result.reason);
       }
     },
-    [synthesisId, recallId, metadata, thumbState],
+    [synthesisId, recallId, metadata, thumbState, thumbPending],
   );
 
   if (!outcome) return null;
@@ -382,8 +393,8 @@ export default function SynthesisCard({
           >
             <button
               type="button"
-              onClick={() => handleThumb(true)}
-              disabled={thumbState !== null}
+              onClick={() => void handleThumb(true)}
+              disabled={thumbState !== null || thumbPending}
               aria-label={
                 thumbState === 'up'
                   ? 'You rated this synthesis helpful'
@@ -401,8 +412,8 @@ export default function SynthesisCard({
             </button>
             <button
               type="button"
-              onClick={() => handleThumb(false)}
-              disabled={thumbState !== null}
+              onClick={() => void handleThumb(false)}
+              disabled={thumbState !== null || thumbPending}
               aria-label={
                 thumbState === 'down'
                   ? 'You rated this synthesis unhelpful'
@@ -424,6 +435,17 @@ export default function SynthesisCard({
           Synthesized at recall time, may be incomplete
         </span>
       </div>
+      {feedbackEnabled && thumbError && (
+        <div
+          role="alert"
+          className="mt-1 text-[10px] text-[var(--hot)]"
+          data-testid="synthesis-feedback-error"
+        >
+          Feedback not saved: {thumbError}. The server refused the write —
+          check <code>[server].auth</code> and apply your
+          <code> REIN_HTTP_TOKEN</code> in Settings.
+        </div>
+      )}
     </div>
   );
 }

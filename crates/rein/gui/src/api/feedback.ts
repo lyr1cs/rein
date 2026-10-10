@@ -27,17 +27,25 @@ import type {
 } from './types';
 
 /**
- * Post one `SynthesisInteraction` feedback event. Returns `true` on
- * success, `false` if the gate refused or the network call failed —
- * callers can use the return for telemetry but should not surface it to
- * the user.
+ * Outcome of one feedback POST. Passive signals (dwell, citation clicks)
+ * ignore it; explicit votes must check `ok` before telling the user the
+ * vote landed — under `[server] auth = "public"` with a `public_url`
+ * configured the server refuses every REST mutation with 403, and a vote
+ * that is shown as recorded but never stored is worse than no vote.
+ */
+export type FeedbackPostResult = { ok: true } | { ok: false; reason: string };
+
+/**
+ * Post one `SynthesisInteraction` feedback event. Never throws: the result
+ * carries `ok: false` plus the server's reason when the provenance gate
+ * refused or the network call failed.
  */
 export async function postSynthesisInteraction(
   synthesisId: string | undefined,
   recallId: string | undefined,
   interaction: SynthesisInteractionKind,
   metadata?: SynthesisMetadata,
-): Promise<boolean> {
+): Promise<FeedbackPostResult> {
   // synthesis_id provenance gate — see §8 invariant 9. Skip silently.
   if (
     typeof synthesisId !== 'string' ||
@@ -45,7 +53,7 @@ export async function postSynthesisInteraction(
     typeof recallId !== 'string' ||
     recallId.length === 0
   ) {
-    return false;
+    return { ok: false, reason: 'synthesis has no feedback id' };
   }
 
   const body: FeedbackPayload = {
@@ -60,10 +68,11 @@ export async function postSynthesisInteraction(
     // Result shape is `{ emitted: number }` per the server, but we don't
     // surface it — observability fire-and-forget pattern.
     await apiPost<{ emitted: number }>('/api/feedback', body);
-    return true;
+    return { ok: true };
   } catch (err) {
     console.warn('[feedback] synthesis_interaction POST failed:', err);
-    return false;
+    const reason = err instanceof Error ? err.message : String(err);
+    return { ok: false, reason };
   }
 }
 
