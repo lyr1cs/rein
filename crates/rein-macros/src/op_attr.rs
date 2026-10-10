@@ -560,12 +560,15 @@ fn emit_rest_block(
     let path = &rest.path;
     let path_span = Span::call_site();
 
-    // Check whether the path contains any brace/template syntax before parsing.
-    // A stray closing brace (`/api/foo/id}`) must be rejected here too; otherwise
-    // it is treated as a literal-only path and the macro emits registry code.
+    // Validate every path at expansion time, placeholder or not. Literal-only
+    // paths used to skip `parse_path_segments`, so `/api//foo` was accepted
+    // and the registry carried a path no request could ever match; the
+    // compile-fail test for it only "passed" because the expanded code failed
+    // to resolve crates in the test harness — a rustc-wording-dependent
+    // snapshot rather than the macro's own diagnostic.
+    let segs = parse_path_segments(path, path_span)?;
     let has_placeholder = path.contains('{') || path.contains('}');
     let path_segments_tokens = if has_placeholder {
-        let segs = parse_path_segments(path, path_span)?;
         quote! { &[ #( #segs ),* ] }
     } else {
         // Literal-only path — no segments needed; exact-match pass handles it.
