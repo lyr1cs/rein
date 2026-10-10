@@ -91,12 +91,12 @@ Three install paths depending on your client:
 rein ships as a Claude Desktop Extension (`.mcpb`). One-click install,
 no Rust toolchain required.
 
-1. Download `rein-v0.37.0.mcpb` from
-   [the v0.37.0 release](https://github.com/lyr1cs/rein/releases/download/v0.37.0/rein-v0.37.0.mcpb).
+1. Download `rein-v1.4.1.mcpb` from
+   [the v1.4.1 release](https://github.com/lyr1cs/rein/releases/download/v1.4.1/rein-v1.4.1.mcpb).
 2. Clear macOS quarantine (one-time, the build is unsigned):
 
    ```bash
-   xattr -d com.apple.quarantine ~/Downloads/rein-v0.37.0.mcpb
+   xattr -d com.apple.quarantine ~/Downloads/rein-v1.4.1.mcpb
    ```
 
 3. Double-click the file. Claude Desktop opens its install dialog.
@@ -130,7 +130,7 @@ need the `rein` binary on your `PATH`:
 cargo install --git https://github.com/lyr1cs/rein --locked rein
 
 # Or pin to a specific release tag (recommended for reproducible installs)
-cargo install --git https://github.com/lyr1cs/rein --tag v0.37.0 --locked rein
+cargo install --git https://github.com/lyr1cs/rein --tag v1.4.1 --locked rein
 ```
 
 > **`--locked` is required.** Without it, `cargo install --git` ignores

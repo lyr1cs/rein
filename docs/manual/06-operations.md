@@ -101,6 +101,56 @@ rein gc --threshold 0.05
 `gc` applies decay and prunes weak STM memories below the configured or supplied
 threshold.
 
+### Scheduling the adaptive pipeline
+
+Nothing inside rein schedules the adaptive pipeline. It runs at the end of a
+non-dry-run `rein gc`, and after `rein consolidate` / `rein dedup` when they
+changed something; `rein serve` (stdio, HTTP, GUI) never runs it. Every
+slow-channel learner lives inside that pass — the M-steps, the LLM judge
+queue drain, the human/judge pair consumer, the `ars_parameter_policy`
+refresh, A12 calibration — so a store without a scheduled pass accumulates
+events and learns nothing from them.
+
+The no-op trigger is:
+
+```bash
+rein gc --threshold 0
+```
+
+Prune removes memories whose strength is *below* the threshold, so `0` prunes
+nothing, decay self-limits to once per 24 h, and the full pipeline still runs.
+Drive it from the host timer. macOS launchd (the cron equivalent on Linux is
+`*/15 * * * * rein gc --threshold 0`):
+
+```xml
+<key>ProgramArguments</key>
+<array>
+  <string>/bin/zsh</string>
+  <string>-lc</string>
+  <string>export REIN_LOG=info; exec /path/to/rein gc --threshold 0</string>
+</array>
+<key>StartInterval</key>
+<integer>900</integer>
+<key>RunAtLoad</key>
+<true/>
+```
+
+- The pass holds a per-database lock; an overlapping tick exits without doing
+  anything, so a short interval is safe.
+- A12 calibration needs a quiet database for the length of the pass. A write
+  that lands meanwhile (a hook store, a GUI vote, a judge verdict) fails
+  `a12_refresh` with `A12 local recall snapshot advanced`, and the run is
+  recorded as `failed`. Every earlier stage (judge drain, pair consumer,
+  policy refresh) has already completed, and the next tick retries; `rein
+  doctor` shows such a run as a WARN on `adaptive_pipeline_last_run`.
+- Do not start the first tick while a `rein serve` is starting: both open
+  the database for writing and the tick can exit with `database is locked`.
+- A daemon installed outside a source checkout must also export
+  `REIN_EVAL_GATE_ROOT` (see Diagnostics, `release_gate`).
+- Watch `rein doctor`: `adaptive_pipeline_last_run` (age and outcome),
+  `judge_call_ledger` (calls in 24 h) and `judge_calibration` (`human_pairs`,
+  `human_kappa`).
+
 Organize related-memory links:
 
 ```bash
@@ -216,6 +266,40 @@ rein worker cleanup-queue
 rein worker merge-refinement-queue
 ```
 
+### LLM judge queue
+
+Judge jobs are file-backed at `<buffer dir>/queue/<db_hash>/judge_queue.jsonl`
+and have no `rein worker` subcommand: the queue drains only in the
+`judge_drain` stage of the adaptive pipeline (see *Scheduling the adaptive
+pipeline* above). Three producers feed it:
+
+- **Runtime sampling** — the rate is `0` while `ars_parameter_policy` is in
+  Shadow. It rises only after at least 30 (judge verdict, explicit thumb)
+  pairs on the same synthesis within 7 days with κ ≥ 0.6, which the runtime
+  path cannot produce by itself. That is the v0.28.7 cost gate, not a fault.
+- **Structural anchors** — `[ars.llm_judge.structural_anchors] mode =
+  "monitor"` adds a few deterministic probe calls per `interval_secs`. They
+  prove the judge path works (`judge_call_ledger` non-zero,
+  `structural_status=ready`) and never promote anything.
+- **Manual trigger** — the `rein_judge_synthesis` MCP tool enqueues a judge
+  for a given `synthesis_id`, bypassing sampling but counting against
+  `daily_call_cap`. This is how an MCP-only client (Claude Code, Codex)
+  produces verdicts.
+
+At drain time the job must still match a synthesis-cache entry younger than
+`[ars.llm_judge].cache_ttl_secs` (default 600; `0` disables the check), or it
+is dropped and counted as `dropped_contract`. With a timer-driven pipeline,
+`cache_ttl_secs` must exceed the tick interval plus the pass duration — a
+15-minute tick wants `cache_ttl_secs = 1800`.
+
+A human pair is a judge verdict plus an explicit thumb on the same
+`synthesis_id`. Thumbs come from the GUI synthesis card (which needs a
+write-capable auth posture, see `07-security.md`) or from `rein_feedback`
+with `synthesis_interaction` / `explicit_thumb`. `rein doctor`'s
+`judge_calibration` line reports `human_pairs` and `human_kappa`; the pair
+consumer runs before the drain inside a pass, so a verdict is counted on the
+following tick.
+
 Use `rein doctor` to inspect queue health, dead letters, provider readiness,
 database state, and side-index status.
 
@@ -301,6 +385,18 @@ rein serve --gui
 The GUI serves static assets at the HTTP root and uses token-protected API
 routes under `/api/*`. If the browser shows a token prompt, use the same token
 as `REIN_HTTP_TOKEN`.
+
+Feedback from the GUI (synthesis thumbs, dwell, clicks) is a REST write. Under
+`[server].auth = "public"` with `public_url` / `allowed_hosts` configured the
+server refuses every REST write with 403, loopback included, so the GUI is
+read-only; since v1.4.1 the synthesis card shows that refusal instead of
+reporting the vote as recorded. For a GUI that can write, run `oauth` (paste
+the owner `REIN_HTTP_TOKEN` once under Settings → Apply Token; the session is
+a per-browser cookie) or `bearer_required`.
+
+Since v1.4.1 `rein serve` exits promptly on SIGINT/SIGTERM even while the
+side-index warmup is running, and the Tantivy rebuild at startup produces a
+single segment (seconds rather than minutes on a 10k-memory store).
 
 ## Proxy Service Management
 
@@ -408,6 +504,10 @@ rein doctor --fix
   eval-gate artifact root (relative values fail closed); development runs
   may discover a checkout ancestor from the working directory. This check
   is read-only.
+- **`gui_runtime`** — whether the GUI pid file names a live listener. When
+  doctor runs inside the GUI process itself (the GUI's doctor page) the HTTP
+  self-probe is skipped and the check reports *served by this process*
+  (v1.4.1); a separate listener is still probed, with a 2 s read timeout.
 - **`adaptive_pipeline_last_run` (v1.4.0)** — the last adaptive pipeline
   run (trigger, per-stage durations and outcomes, error). WARN when the
   pipeline has never run, the last run failed, or a run has been `running`

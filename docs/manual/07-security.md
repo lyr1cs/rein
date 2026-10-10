@@ -36,6 +36,21 @@ The GUI can serve its static shell so a browser can bootstrap and show a token
 input flow. API routes remain token-protected. The session clear route is
 narrowly exempted so a browser can recover from a stale token cookie.
 
+Under `[server].auth = "oauth"` the same `REIN_HTTP_TOKEN` is the **owner
+approval credential**, not a client token: `POST /api/session` with
+`Authorization: Bearer <token>` (the GUI's Settings → Apply Token) sets the
+`rein_oauth_owner` cookie, and owner-only routes — the Connectors page,
+approving or revoking connector grants — require that cookie or bearer. The
+static token is rejected on `/mcp` under `oauth`; connectors authenticate
+with the OAuth grants issued after the owner approves them. Startup refuses
+`oauth` and `bearer_required` without `REIN_HTTP_TOKEN` set.
+
+Under `[server].auth = "public"` with `public_url` / `allowed_hosts`
+configured, the loopback exemption applies to no request, so every REST write
+(`POST` / `PUT` / `DELETE` under `/api/*`, GUI feedback included) is refused
+with 403 while reads stay open. That is the intended read-only posture for a
+tunnel; choose `oauth` or `bearer_required` when the GUI must write.
+
 Proxy clients authenticate with:
 
 ```http

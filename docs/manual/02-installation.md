@@ -324,6 +324,9 @@ OAuth provider). Wildcard binds also require either a bearer token or explicit
 `[server].allow_unauthenticated_loopback` bool; older configs that still set
 it are migrated automatically to the equivalent `auth = "public"` /
 `"bearer_required"` at TOML load time.)
+`"public"` with a `public_url` / `allowed_hosts` set is read-only over REST
+(GUI feedback included); use `"oauth"` or `"bearer_required"` when the GUI
+must write.
 
 ## Proxy
 

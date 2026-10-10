@@ -243,6 +243,12 @@ isn't ambiguous:
 auth = "public"
 ```
 
+`public` with a `public_url` also makes the GUI read-only: the mutation gate
+refuses every REST write, synthesis thumbs included, from a loopback browser
+as well. If GUI feedback should feed judge calibration, use `oauth` (one
+owner-token paste under Settings → Apply Token per browser) or
+`bearer_required`; see `07-security.md` § Auth And Sessions.
+
 **For shared deployments or full read+write claude.ai integration**,
 go through Recipe E (built-in OAuth) below. Be aware the connector
 breaks once during a v0.30.x upgrade because the
