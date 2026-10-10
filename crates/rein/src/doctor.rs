@@ -2127,8 +2127,13 @@ fn http_get_local(
         &SocketAddr::from(([127, 0, 0, 1], port)),
         Duration::from_millis(300),
     )?;
-    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
-    stream.set_write_timeout(Some(Duration::from_millis(500)))?;
+    // `/api/health` walks every topic (~0.25 s on a 10k-memory database,
+    // longer while a side-index rebuild is running). 500 ms made the GUI
+    // runtime check flap to WARN under load; 2 s keeps the probe honest
+    // without making `rein doctor` slow when the port is simply closed
+    // (connect still fails fast).
+    stream.set_read_timeout(Some(Duration::from_millis(2_000)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(2_000)))?;
 
     let mut request =
         format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n");
