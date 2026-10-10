@@ -889,11 +889,32 @@ fn should_spawn_background_warmup(config: &ReinConfig, surface: StartupSurface) 
 }
 
 /// Spawn background warmup task for embedding cache pre-computation.
+/// Run `f` on a plain OS thread the server never joins.
+///
+/// Not `tokio::task::spawn_blocking`: dropping the runtime at process exit
+/// waits for every blocking-pool task, so a SIGINT/SIGTERM during the
+/// side-index rebuild kept `rein serve` alive (holding the database and the
+/// HTTP port) until the rebuild finished. A detached thread dies with the
+/// process; the rebuild's flock releases on exit and `doctor` resets a stale
+/// `.rebuilding` marker, so an interrupted warmup is already recoverable.
+fn spawn_detached_warmup<F>(f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    if let Err(e) = std::thread::Builder::new()
+        .name("rein-warmup".to_string())
+        .spawn(f)
+    {
+        tracing::warn!("failed to spawn background warmup thread: {e}");
+    }
+}
+
 fn spawn_background_warmup(config: &ReinConfig) {
     let warmup_config = config.clone();
-    // SqliteStore is not Send, so we must run the entire warmup (including async embed)
-    // inside spawn_blocking. Use a dedicated current-thread runtime for the async parts.
-    tokio::task::spawn_blocking(move || {
+    // SqliteStore is not Send, so the entire warmup (including async embed)
+    // runs on one thread with a dedicated current-thread runtime for the
+    // async parts.
+    spawn_detached_warmup(move || {
         if let Ok(store) = warmup_config.open_store() {
             // Drain any `pending_grayzone_jobs` rows left over from a crash
             // between the store COMMIT and the file-queue enqueue in the
@@ -1496,6 +1517,29 @@ mod tests {
         assert!(constant_time_eq("secret-token", "secret-token"));
         assert!(!constant_time_eq("secret-token", "secret"));
         assert!(!constant_time_eq("secret-token", "secret-token-longer"));
+    }
+
+    /// Regression: the warmup ran on tokio's blocking pool, and dropping the
+    /// runtime at process exit joins that pool. A SIGINT/SIGTERM during the
+    /// side-index rebuild therefore left `rein serve` alive until the rebuild
+    /// finished (28 minutes on a 10k-memory database on 2026-10-10), holding
+    /// the database and the HTTP port. Shutdown must not wait for warmup.
+    #[test]
+    fn detached_warmup_does_not_block_runtime_shutdown() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let started = std::time::Instant::now();
+        runtime.block_on(async {
+            spawn_detached_warmup(|| std::thread::sleep(std::time::Duration::from_secs(3)));
+        });
+        drop(runtime);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "runtime drop waited for the warmup thread ({:?})",
+            started.elapsed()
+        );
     }
 
     #[test]
