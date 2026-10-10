@@ -9,6 +9,52 @@ The full release notes (with audit-round breakdowns and operator-visible
 schema changes) live on the [GitHub Releases page](https://github.com/lyr1cs/rein/releases).
 This file is a condensed index intended for quick scanning.
 
+## [1.4.1] — 2026-10-10
+
+Maintenance patch on the runway automation line. No schema or config
+changes.
+
+### Fixed
+
+- **Tantivy one-segment-per-memory** — every insert opened a writer,
+  committed one document and dropped the writer before the merge policy
+  could run, and the staged rebuild reused that path (10,651 segments and
+  63,733 files for 10,651 memories; ~28 min per `rein serve` start). The
+  rebuild now loads the corpus through one writer with automatic merges
+  disabled and compacts to a single segment (15 s on the same database);
+  single inserts and deletes wait for their scheduled merges.
+- **`rein serve` could not exit during warmup** — the warmup ran on tokio's
+  blocking pool, which the runtime joins on shutdown, so SIGINT/SIGTERM
+  during a rebuild left a zombie server holding the database and the port
+  (stdio and HTTP alike). Warmup now runs on a detached OS thread.
+- **GUI synthesis thumbs reported success on refused writes** — under
+  `[server] auth = "public"` with a `public_url` configured every REST
+  mutation is rejected with 403, but the thumb latched "You rated this
+  synthesis helpful" before the POST and swallowed the failure. The vote
+  now latches only after the server accepts it and shows the refusal
+  reason otherwise; the Connectors page renders the owner-only 401 as
+  configuration guidance.
+- **Doctor `gui_runtime` false WARN from the GUI's own doctor page** — the
+  in-process check HTTP-probed the very server answering `/api/doctor`
+  and timed out. Doctor now skips the probe when the pid file names the
+  current process; the external probe's read timeout is 2 s.
+- **`#[op]` accepted literal REST paths with empty segments** (`/api//foo`);
+  validation now runs for every path and the compile-fail snapshot is
+  pinned to the macro's own diagnostic instead of rustc crate-resolution
+  wording.
+
+## [1.4.0] — 2026-09-04
+
+Runway automation minor: every adaptive pipeline stage is timed and
+persisted (`adaptive_pipeline_last_run`), A12 publishes a calibration whose
+store moved mid-run instead of discarding it (activation stays fail-closed
+on the input epoch), the leave-one-out corpus build uses an exclusion index
+with identical semantics (2 h → 8 s), `rein warmup` backfills missing
+`vec_memories` rows behind a `vec_rows_provenance` stamp that refuses
+mixed-model writes, and `[hooks.claude]` gives Claude Code prompt-time
+recall context. Config schema version bumps to 4. 1887 lib tests / 0 fail;
+26 adversarial review rounds.
+
 ## [1.3.0] — 2026-07-15
 
 Self-supervised activation minor: the #A12 recall-fusion activation
