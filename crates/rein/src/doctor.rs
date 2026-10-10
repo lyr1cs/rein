@@ -2046,17 +2046,41 @@ fn check_gui_runtime(config: &ReinConfig) -> DoctorCheck {
     let port = config.server.sse_port;
     let pid = crate::service::is_running("gui");
     let port_open = localhost_port_open(port);
-    let probe = if port_open {
-        match probe_gui_health(port) {
+    let probe = gui_runtime_probe(
+        port_open,
+        pid,
+        std::process::id(),
+        || match probe_gui_health(port) {
             Ok(200) => RuntimeProbe::Ok("/api/health returned 200".to_string()),
             Ok(401) => RuntimeProbe::Warn("/api/health returned 401 (token mismatch?)".to_string()),
             Ok(status) => RuntimeProbe::Warn(format!("/api/health returned {status}")),
             Err(e) => RuntimeProbe::Warn(format!("/api/health probe failed: {e}")),
-        }
-    } else {
-        RuntimeProbe::None
-    };
+        },
+    );
     runtime_status_check("gui_runtime", pid, port, port_open, probe)
+}
+
+/// Decide whether to HTTP-probe the GUI listener.
+///
+/// When the doctor runs inside the GUI server itself (`/api/doctor` served
+/// by the process whose pid file says it owns the port), a blocking HTTP
+/// request to that same server from within its request handler only times
+/// out — the GUI's doctor page used to report `gui_runtime` as WARN for
+/// that reason while `rein doctor` from a shell said OK. Being alive and
+/// answering the request is the evidence; skip the probe.
+fn gui_runtime_probe(
+    port_open: bool,
+    pid: Option<u32>,
+    current_pid: u32,
+    probe: impl FnOnce() -> RuntimeProbe,
+) -> RuntimeProbe {
+    if !port_open {
+        return RuntimeProbe::None;
+    }
+    if pid == Some(current_pid) {
+        return RuntimeProbe::Ok("served by this process (self-probe skipped)".to_string());
+    }
+    probe()
 }
 
 fn check_proxy_runtime(config: &ReinConfig) -> DoctorCheck {
@@ -2128,10 +2152,11 @@ fn http_get_local(
         Duration::from_millis(300),
     )?;
     // `/api/health` walks every topic (~0.25 s on a 10k-memory database,
-    // longer while a side-index rebuild is running). 500 ms made the GUI
-    // runtime check flap to WARN under load; 2 s keeps the probe honest
-    // without making `rein doctor` slow when the port is simply closed
-    // (connect still fails fast).
+    // longer while a side-index rebuild is running), so 500 ms was tight.
+    // 2 s keeps the probe honest without making `rein doctor` slow when
+    // the port is simply closed (connect still fails fast). The in-process
+    // case (doctor served by the GUI itself) never reaches this probe —
+    // see `gui_runtime_probe`.
     stream.set_read_timeout(Some(Duration::from_millis(2_000)))?;
     stream.set_write_timeout(Some(Duration::from_millis(2_000)))?;
 
@@ -4610,6 +4635,43 @@ provider = "inherit"
             checks[1].get("repair_hint").and_then(|v| v.as_str()),
             Some("run `rein worker memory`")
         );
+    }
+
+    /// The GUI's own doctor page used to show `gui_runtime` as WARN
+    /// ("/api/health probe failed: Resource temporarily unavailable") while
+    /// `rein doctor` from a shell said OK: the in-process check opened a
+    /// blocking HTTP request to the very server that was busy answering
+    /// `/api/doctor`, and timed out. A server must not probe itself.
+    #[test]
+    fn gui_runtime_probe_skips_self_probe_when_doctor_runs_inside_the_gui_process() {
+        let probed = std::cell::Cell::new(false);
+        let probe = gui_runtime_probe(true, Some(4242), 4242, || {
+            probed.set(true);
+            RuntimeProbe::Warn("must not run".to_string())
+        });
+        assert!(
+            !probed.get(),
+            "doctor inside the GUI process must not HTTP-probe itself"
+        );
+        assert!(
+            matches!(probe, RuntimeProbe::Ok(_)),
+            "own process counts as healthy"
+        );
+    }
+
+    #[test]
+    fn gui_runtime_probe_still_probes_a_separate_listener() {
+        let probed = std::cell::Cell::new(false);
+        let probe = gui_runtime_probe(true, Some(4242), 1, || {
+            probed.set(true);
+            RuntimeProbe::Ok("/api/health returned 200".to_string())
+        });
+        assert!(probed.get());
+        assert!(matches!(probe, RuntimeProbe::Ok(_)));
+        assert!(matches!(
+            gui_runtime_probe(false, None, 1, || RuntimeProbe::Ok(String::new())),
+            RuntimeProbe::None
+        ));
     }
 
     #[test]
