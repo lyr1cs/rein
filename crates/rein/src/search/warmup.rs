@@ -1009,13 +1009,33 @@ pub fn try_populate_tantivy(store: &SqliteStore) -> TantivyRebuildOutcome {
 
     // Stream memories into the Tantivy index. F6 D-M3: peak heap stays
     // O(row_size) — the entire `memories` table is never materialized.
+    //
+    // One shared writer for the whole corpus, committed once at the end.
+    // The previous per-row `insert_strict` committed every document and
+    // dropped the writer before merges ran, so the promoted index carried
+    // one segment per memory (10,621 segments on a 10,621-row database) and
+    // a full rebuild took ~28 minutes.
+    let mut batch = match tantivy.batch() {
+        Ok(batch) => batch,
+        Err(e) => {
+            tracing::warn!("tantivy: failed to open staging writer: {e}");
+            mark_tantivy_dirty(db_path);
+            drop(tantivy);
+            let _ = std::fs::remove_dir_all(&staging_path);
+            let _ = std::fs::remove_file(&rebuilding_path);
+            unlock_tantivy_rebuild_lock(&lock_file);
+            return TantivyRebuildOutcome::Failed {
+                reason: format!("failed to open staging writer: {e}"),
+            };
+        }
+    };
     let mut indexed = 0usize;
     let mut errors = 0usize;
     let mut total_rows = 0usize;
     let stream_result = store.for_each_for_warmup(|row| {
         total_rows += 1;
-        if tantivy
-            .insert_strict(
+        if batch
+            .insert(
                 &row.id,
                 &row.topic,
                 &row.summary,
@@ -1033,6 +1053,7 @@ pub fn try_populate_tantivy(store: &SqliteStore) -> TantivyRebuildOutcome {
     if let Err(e) = stream_result {
         tracing::warn!("tantivy: failed to list memories: {e}");
         mark_tantivy_dirty(db_path);
+        drop(batch);
         drop(tantivy);
         let _ = std::fs::remove_dir_all(&staging_path);
         let _ = std::fs::remove_file(&rebuilding_path);
@@ -1042,21 +1063,17 @@ pub fn try_populate_tantivy(store: &SqliteStore) -> TantivyRebuildOutcome {
         };
     }
 
-    if indexed > 0 {
-        tracing::info!("tantivy: indexed {indexed} documents ({errors} errors)");
-    }
-
-    // v0.30.3 codex R5 P2: any `insert_strict` failure means the staging
-    // index is incomplete. Promoting it would replace a complete prior
-    // index with a partial one — the dirty marker triggers a later retry,
-    // but the last good Tantivy data is already gone. Abort the swap
-    // here, leave the previous prod dir alone, set dirty so the next
-    // rebuild attempt fires.
+    // v0.30.3 codex R5 P2: any insert failure means the staging index is
+    // incomplete. Promoting it would replace a complete prior index with a
+    // partial one — the dirty marker triggers a later retry, but the last
+    // good Tantivy data is already gone. Abort the swap here, leave the
+    // previous prod dir alone, set dirty so the next rebuild attempt fires.
     if errors > 0 {
         tracing::warn!(
             "tantivy: rebuild had {errors} insert errors — not promoting partial index, keeping prior prod"
         );
         mark_tantivy_dirty(db_path);
+        drop(batch);
         drop(tantivy);
         let _ = std::fs::remove_dir_all(&staging_path);
         let _ = std::fs::remove_file(&rebuilding_path);
@@ -1064,6 +1081,24 @@ pub fn try_populate_tantivy(store: &SqliteStore) -> TantivyRebuildOutcome {
         return TantivyRebuildOutcome::Failed {
             reason: format!("{errors} memories failed to index during rebuild"),
         };
+    }
+
+    // Nothing is durable until this commit; a failed commit is a failed
+    // rebuild, same handling as insert errors.
+    if let Err(e) = batch.commit() {
+        tracing::warn!("tantivy: staging commit failed: {e}");
+        mark_tantivy_dirty(db_path);
+        drop(tantivy);
+        let _ = std::fs::remove_dir_all(&staging_path);
+        let _ = std::fs::remove_file(&rebuilding_path);
+        unlock_tantivy_rebuild_lock(&lock_file);
+        return TantivyRebuildOutcome::Failed {
+            reason: format!("staging commit failed: {e}"),
+        };
+    }
+
+    if indexed > 0 {
+        tracing::info!("tantivy: indexed {indexed} documents ({errors} errors)");
     }
 
     // v0.30.2 B2: drop the writer before renaming so any held tantivy
@@ -2863,6 +2898,40 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "the embedding is also cached for store-time reuse"
+        );
+    }
+
+    /// Regression: the staged rebuild used to call the per-document insert
+    /// path, which commits once per row and drops the writer before any merge
+    /// runs — the promoted index carried one segment per memory and a full
+    /// rebuild of a 10k-row database took ~28 minutes. The rebuild must load
+    /// the corpus through one writer and commit once.
+    #[test]
+    fn try_populate_tantivy_builds_a_compact_index() {
+        let (_dir, store) = test_store();
+        for i in 0..40 {
+            store
+                .store(live_memory(
+                    "rebuild",
+                    &format!("rebuild content number {i}"),
+                ))
+                .unwrap();
+        }
+
+        let outcome = try_populate_tantivy(&store);
+
+        assert_eq!(
+            outcome,
+            TantivyRebuildOutcome::Rebuilt {
+                indexed: 40,
+                errors: 0
+            }
+        );
+        let index = tantivy::Index::open_in_dir(store.db_path().with_extension("tantivy")).unwrap();
+        let segments = index.searchable_segment_ids().unwrap().len();
+        assert!(
+            segments <= 2,
+            "rebuild of 40 memories promoted an index with {segments} segments"
         );
     }
 }

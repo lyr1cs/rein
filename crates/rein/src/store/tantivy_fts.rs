@@ -25,6 +25,58 @@ pub struct TantivyFts {
 /// Absence triggers a full rebuild on next open.
 const TOKENIZER_MARKER: &str = ".tokenizer_v2";
 
+/// Writer heap for the per-document paths. Tantivy's minimum.
+const SINGLE_WRITER_HEAP_BYTES: usize = 15_000_000;
+/// Writer heap per indexing thread for bulk loads. Tantivy rejects anything
+/// under 15 MB per thread; a little above that keeps flushes rare.
+const BATCH_WRITER_HEAP_PER_THREAD_BYTES: usize = 16_000_000;
+/// Indexing threads for bulk loads (tantivy's own default cap).
+const BATCH_WRITER_MAX_THREADS: usize = 8;
+
+/// Bulk-load handle returned by [`TantivyFts::batch`]. Every `insert` goes
+/// through one shared writer; nothing is durable until [`Self::commit`].
+pub struct TantivyBatch<'a> {
+    fts: &'a TantivyFts,
+    writer: IndexWriter,
+}
+
+impl TantivyBatch<'_> {
+    pub fn insert(
+        &mut self,
+        id: &str,
+        topic: &str,
+        summary: &str,
+        content: &str,
+        keywords: &str,
+    ) -> Result<(), tantivy::TantivyError> {
+        let fts = self.fts;
+        self.writer
+            .delete_term(tantivy::Term::from_field_text(fts.id_field, id));
+        self.writer.add_document(doc!(
+            fts.id_field => id,
+            fts.topic_field => topic,
+            fts.topic_exact_field => topic,
+            fts.summary_field => summary,
+            fts.content_field => content,
+            fts.keywords_field => keywords,
+        ))?;
+        Ok(())
+    }
+
+    /// Commit once, then fold the per-thread flush segments into a single
+    /// segment. The log merge policy leaves fewer than eight segments alone,
+    /// so without the explicit merge a bulk load lands as one segment per
+    /// indexing thread.
+    pub fn commit(mut self) -> Result<(), tantivy::TantivyError> {
+        self.writer.commit()?;
+        let segment_ids = self.fts.index.searchable_segment_ids()?;
+        if segment_ids.len() > 1 {
+            self.writer.merge(&segment_ids).wait()?;
+        }
+        self.writer.wait_merging_threads()
+    }
+}
+
 impl TantivyFts {
     /// Open or create a Tantivy index at the given directory.
     /// If an old index exists without the jieba tokenizer marker, it is deleted
@@ -212,7 +264,7 @@ impl TantivyFts {
         keywords: &str,
         mark_dirty_on_lock: bool,
     ) -> Result<(), tantivy::TantivyError> {
-        let mut writer: IndexWriter = match self.index.writer(15_000_000) {
+        let mut writer: IndexWriter = match self.index.writer(SINGLE_WRITER_HEAP_BYTES) {
             Ok(w) => w,
             Err(e @ tantivy::TantivyError::LockFailure(..)) => {
                 if mark_dirty_on_lock {
@@ -239,13 +291,44 @@ impl TantivyFts {
             self.keywords_field => keywords,
         ))?;
         writer.commit()?;
-        Ok(())
+        // Dropping the writer right after `commit` cancels the merges the
+        // merge policy just scheduled, which is how a live index ended up
+        // with one segment per memory. Let them finish before releasing
+        // the writer lock.
+        writer.wait_merging_threads()
     }
 
     /// Search for documents matching the query string.
     /// CJK queries are segmented by the jieba tokenizer registered on this index.
     /// When a topic filter is provided, uses BooleanQuery to filter at the index level.
     /// Returns pairs of (memory_id, BM25_score).
+    /// Start a bulk load (used by the staged rebuild). Holds the index
+    /// writer lock until [`TantivyBatch::commit`] or drop; a `LockFailure`
+    /// here means another process is writing and the caller must back off.
+    pub fn batch(&self) -> Result<TantivyBatch<'_>, tantivy::TantivyError> {
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, BATCH_WRITER_MAX_THREADS);
+        self.batch_with_threads(threads)
+    }
+
+    fn batch_with_threads(
+        &self,
+        threads: usize,
+    ) -> Result<TantivyBatch<'_>, tantivy::TantivyError> {
+        let writer: IndexWriter = self
+            .index
+            .writer_with_num_threads(threads, threads * BATCH_WRITER_HEAP_PER_THREAD_BYTES)?;
+        // The log merge policy schedules a background merge as soon as
+        // `commit` lands eight similar segments — one per indexing thread —
+        // and that merge races the explicit compaction in
+        // `TantivyBatch::commit` ("segments ... could not be found in the
+        // SegmentManager"). Bulk loads do their one merge themselves.
+        writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+        Ok(TantivyBatch { fts: self, writer })
+    }
+
     pub fn search(
         &self,
         query_str: &str,
@@ -312,7 +395,7 @@ impl TantivyFts {
 
     /// Delete a document by memory ID.
     pub fn delete(&self, id: &str) -> Result<(), tantivy::TantivyError> {
-        let mut writer: IndexWriter = match self.index.writer(15_000_000) {
+        let mut writer: IndexWriter = match self.index.writer(SINGLE_WRITER_HEAP_BYTES) {
             Ok(w) => w,
             Err(tantivy::TantivyError::LockFailure(..)) => {
                 self.mark_dirty();
@@ -324,7 +407,7 @@ impl TantivyFts {
         let term = tantivy::Term::from_field_text(self.id_field, id);
         writer.delete_term(term);
         writer.commit()?;
-        Ok(())
+        writer.wait_merging_threads()
     }
 
     fn mark_dirty(&self) {
@@ -511,5 +594,99 @@ mod tests {
             results.iter().any(|(id, _)| id == "d1"),
             "D1: open_existing handle must see previously-inserted docs"
         );
+    }
+
+    fn segment_count(fts: &TantivyFts) -> usize {
+        fts.index.searchable_segment_ids().unwrap().len()
+    }
+
+    /// Regression: every `insert` used to open a writer, commit one document
+    /// and drop the writer before the merge policy could run, so a live index
+    /// ended up with exactly one segment per memory (10,621 segments for
+    /// 10,621 rows on the 2026-10-10 audit). Single inserts must let merges
+    /// complete so the segment count stays bounded.
+    #[test]
+    fn single_inserts_do_not_leave_one_segment_per_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let fts = TantivyFts::open(dir.path()).unwrap();
+        for i in 0..40 {
+            fts.insert(
+                &format!("m{i}"),
+                "topic",
+                "summary",
+                &format!("content number {i}"),
+                "kw",
+            )
+            .unwrap();
+        }
+        let segments = segment_count(&fts);
+        assert!(
+            segments < 40,
+            "40 single inserts left {segments} segments (one per document)"
+        );
+        let results = fts.search("content", None, 50).unwrap();
+        assert_eq!(results.len(), 40);
+    }
+
+    /// Bulk loads (the staged rebuild) must share one writer and commit once,
+    /// instead of committing per document.
+    #[test]
+    fn batch_insert_commits_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let fts = TantivyFts::open(dir.path()).unwrap();
+        let mut batch = fts.batch().unwrap();
+        for i in 0..200 {
+            batch
+                .insert(
+                    &format!("m{i}"),
+                    "topic",
+                    "summary",
+                    &format!("content number {i}"),
+                    "kw",
+                )
+                .unwrap();
+        }
+        batch.commit().unwrap();
+        let segments = segment_count(&fts);
+        assert!(
+            segments <= 2,
+            "batch of 200 documents produced {segments} segments"
+        );
+        let results = fts.search("content", None, 300).unwrap();
+        assert_eq!(results.len(), 200);
+    }
+
+    /// Codex review 2026-10-10 P2: with eight indexing threads a single
+    /// commit flushes eight segments, which is exactly the log merge
+    /// policy's threshold — it schedules an automatic merge in the
+    /// background while `commit` runs its explicit merge over the same
+    /// segment ids, and tantivy rejects the explicit merge with
+    /// `InvalidArgument` once the automatic one has replaced them. The
+    /// batch must disable automatic merges so the final compaction is the
+    /// only merge in flight.
+    #[test]
+    fn batch_commit_does_not_race_automatic_merges() {
+        let dir = tempfile::tempdir().unwrap();
+        let fts = TantivyFts::open(dir.path()).unwrap();
+        for round in 0..5 {
+            let mut batch = fts.batch_with_threads(8).unwrap();
+            for i in 0..400 {
+                batch
+                    .insert(
+                        &format!("r{round}-m{i}"),
+                        "topic",
+                        "summary",
+                        &format!("content number {i} round {round}"),
+                        "kw",
+                    )
+                    .unwrap();
+            }
+            batch
+                .commit()
+                .unwrap_or_else(|e| panic!("round {round}: batch commit failed: {e}"));
+            assert_eq!(segment_count(&fts), 1, "round {round}");
+        }
+        let results = fts.search("content", None, 2500).unwrap();
+        assert_eq!(results.len(), 2000);
     }
 }
