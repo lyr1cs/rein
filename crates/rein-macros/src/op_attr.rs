@@ -385,7 +385,9 @@ fn emit_mcp_block(
     let schema_fn = match &fi.params_ty {
         Some(ty) => quote! {
             fn __op_mcp_schema() -> ::schemars::Schema {
-                ::schemars::schema_for!(#ty)
+                // Portable (inlined, flat-typed) form shared by every MCP
+                // client; see `rein::ops::mcp_schema`.
+                ::rein::ops::mcp_schema_for::<#ty>()
             }
         },
         None => quote! {

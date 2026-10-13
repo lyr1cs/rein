@@ -224,45 +224,57 @@ impl schemars::JsonSchema for FeedbackParams {
         std::borrow::Cow::Borrowed("rein::ops::handlers::adaptive::FeedbackParams")
     }
 
-    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        // oneOf union: each branch references the inner type's schema. The
-        // access branch's `kind` is documented as optional with default
-        // `"access"` so existing callers (which omit `kind`) validate against
-        // the schema without a phantom required-field rejection.
-        let access_inner = generator.subschema_for::<AccessFeedbackParams>();
-        let synthesis_inner = generator.subschema_for::<SynthesisInteractionFeedbackParams>();
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        // FLAT object, deliberately. Until 2026-10-13 this was a root
+        // `oneOf` whose branches carried `allOf: [$ref]`; every MCP client
+        // (Claude Code, Claude Desktop, Cursor, Gemini, Codex) flattened
+        // that to "only `kind` declared", so `memory_ids` / `helpful`
+        // reached the server as JSON strings and `synthesis_interaction`
+        // could not be selected at all. Both variants' fields now sit at
+        // the root with their real types; `kind` picks the variant, the
+        // description says which fields each variant needs, and the manual
+        // `Deserialize` above enforces it. Nothing is `required` at the
+        // root because that depends on `kind`.
+        let mut settings = schemars::generate::SchemaSettings::draft2020_12();
+        settings.inline_subschemas = true;
+        let access: serde_json::Value = settings
+            .clone()
+            .into_generator()
+            .into_root_schema_for::<AccessFeedbackParams>()
+            .into();
+        let synthesis: serde_json::Value = settings
+            .into_generator()
+            .into_root_schema_for::<SynthesisInteractionFeedbackParams>()
+            .into();
+
+        let mut properties = serde_json::Map::new();
+        properties.insert(
+            "kind".to_string(),
+            serde_json::json!({
+                "type": "string",
+                "enum": ["access", "synthesis_interaction"],
+                "default": "access",
+                "description": "Which feedback shape this call carries. Omit for `access`."
+            }),
+        );
+        for inner in [&access, &synthesis] {
+            if let Some(props) = inner.get("properties").and_then(|p| p.as_object()) {
+                for (name, prop) in props {
+                    properties
+                        .entry(name.clone())
+                        .or_insert_with(|| prop.clone());
+                }
+            }
+        }
 
         schemars::json_schema!({
             "type": "object",
             "title": "FeedbackParams",
-            "description": "Tagged union dispatched on optional `kind` field. Missing `kind` defaults to `\"access\"` for pre-v0.26 back-compat.",
-            "oneOf": [
-                {
-                    "title": "Access",
-                    "description": "Pre-v0.26 access feedback (default when `kind` is absent).",
-                    "allOf": [access_inner],
-                    "properties": {
-                        "kind": {
-                            "type": "string",
-                            "enum": ["access"],
-                            "default": "access",
-                            "description": "Optional — omit to use the default access shape."
-                        }
-                    }
-                },
-                {
-                    "title": "SynthesisInteraction",
-                    "description": "v0.26 D-direction synthesis interaction event (dwell / click / thumb / immediate-requery).",
-                    "allOf": [synthesis_inner],
-                    "properties": {
-                        "kind": {
-                            "type": "string",
-                            "enum": ["synthesis_interaction"]
-                        }
-                    },
-                    "required": ["kind"]
-                }
-            ]
+            "description": "Record feedback. `kind` selects the shape. \
+        `access` (default when `kind` is omitted): requires `memory_ids`; accepts `request_id`, `query`, `helpful`. \
+        `synthesis_interaction`: requires `synthesis_id`, `recall_id`, `interaction` \
+        (`interaction.kind` is one of `viewed` / `clicked_source` / `immediate_requery` / `explicit_thumb`); accepts `metadata`.",
+            "properties": properties
         })
     }
 }
@@ -613,62 +625,68 @@ mod tests {
         );
     }
 
-    /// Test #4 part C: JsonSchema serialization renders the oneOf without
-    /// panicking and includes both branches. Specifically asserts that the
-    /// access branch documents `kind` as optional with the `"access"` default
-    /// — without this, a strict JSON-Schema-validating client would reject
-    /// every pre-v0.26 caller.
+    /// Test #4 part C (rewritten 2026-10-13): the MCP-facing schema is a FLAT
+    /// object. The previous root `oneOf` + `allOf: [$ref]` shape was
+    /// flattened by every MCP client to "only `kind` declared, enum
+    /// `[\"access\"]`", so `memory_ids` / `helpful` arrived stringified and
+    /// `kind = "synthesis_interaction"` was rejected client-side. Both
+    /// variants' fields must now be declared at the root with real types,
+    /// `kind` must list both values with the `"access"` default, and the
+    /// root must not require anything (which fields are required depends
+    /// on `kind` — documented in the description, enforced by Deserialize).
     #[test]
-    fn feedback_params_jsonschema_renders_oneof_with_optional_kind_default() {
-        let schema = schemars::schema_for!(FeedbackParams);
-        let value = serde_json::to_value(&schema).expect("schema serializes to JSON");
+    fn feedback_params_mcp_schema_is_flat_with_both_kinds_declared() {
+        let value: serde_json::Value = crate::ops::mcp_schema_for::<FeedbackParams>().into();
 
-        // The root schema (or a referenced subschema) must contain a `oneOf`
-        // with two branches. We allow either inline `oneOf` at the root or
-        // inside the schema's definitions/$defs (schemars 1.x emits the
-        // top-level type that way for refs).
-        let oneof = value
-            .pointer("/oneOf")
-            .or_else(|| value.pointer("/definitions/FeedbackParams/oneOf"))
-            .or_else(|| value.pointer("/$defs/FeedbackParams/oneOf"))
-            .expect("schema must expose a oneOf for the FeedbackParams variants");
-        let branches = oneof.as_array().expect("oneOf must be an array");
+        assert_eq!(value["type"], serde_json::json!("object"));
+        for key in ["oneOf", "anyOf", "allOf", "$defs", "$ref"] {
+            assert!(
+                value.get(key).is_none(),
+                "root must not carry `{key}`: {value}"
+            );
+        }
+
+        let kind = &value["properties"]["kind"];
+        assert_eq!(kind["type"], serde_json::json!("string"));
         assert_eq!(
-            branches.len(),
-            2,
-            "FeedbackParams schema must declare two variants (Access + SynthesisInteraction)"
+            kind["enum"],
+            serde_json::json!(["access", "synthesis_interaction"])
         );
+        assert_eq!(kind["default"], serde_json::json!("access"));
 
-        // Locate the Access branch and confirm `kind` is documented optional
-        // with default `"access"`. The branch order is stable per the manual
-        // impl above (Access first), so we check by index.
-        let access_branch = &branches[0];
-        let kind_default = access_branch
-            .pointer("/properties/kind/default")
-            .expect("Access branch must document kind default");
-        assert_eq!(kind_default, &serde_json::Value::String("access".into()));
-        // Access branch must NOT mark `kind` required (back-compat: pre-v0.26
-        // payloads omit it).
-        let access_required = access_branch
-            .pointer("/required")
-            .and_then(|v| v.as_array())
+        let props = &value["properties"];
+        assert_eq!(props["memory_ids"]["type"], serde_json::json!("array"));
+        assert_eq!(
+            props["memory_ids"]["items"]["type"],
+            serde_json::json!("string")
+        );
+        assert_eq!(props["helpful"]["type"], serde_json::json!("boolean"));
+        assert_eq!(props["request_id"]["type"], serde_json::json!("string"));
+        assert_eq!(props["query"]["type"], serde_json::json!("string"));
+        assert_eq!(props["synthesis_id"]["type"], serde_json::json!("string"));
+        assert_eq!(props["recall_id"]["type"], serde_json::json!("string"));
+        assert_eq!(props["metadata"]["type"], serde_json::json!("object"));
+        // The nested interaction enum survives as `anyOf` (portable form of
+        // the serde internally-tagged enum), one branch per variant.
+        let interaction_branches = props["interaction"]["anyOf"]
+            .as_array()
+            .expect("interaction keeps its variant branches");
+        assert_eq!(interaction_branches.len(), 4);
+
+        let required = value
+            .get("required")
+            .and_then(|r| r.as_array())
             .cloned()
             .unwrap_or_default();
         assert!(
-            !access_required.iter().any(|v| v.as_str() == Some("kind")),
-            "Access branch MUST NOT require `kind` (back-compat invariant)"
+            required.is_empty(),
+            "root must not require any field (kind-dependent): {required:?}"
         );
 
-        // SynthesisInteraction branch documents kind as required.
-        let synth_branch = &branches[1];
-        let synth_required = synth_branch
-            .pointer("/required")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
+        let description = value["description"].as_str().unwrap_or_default();
         assert!(
-            synth_required.iter().any(|v| v.as_str() == Some("kind")),
-            "SynthesisInteraction branch must require kind"
+            description.contains("memory_ids") && description.contains("synthesis_id"),
+            "description must tell clients which fields each kind needs: {description}"
         );
     }
 }

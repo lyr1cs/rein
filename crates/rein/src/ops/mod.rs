@@ -29,6 +29,7 @@ pub mod trust_measurement;
 pub mod error;
 pub mod handlers;
 pub mod inventory;
+pub mod mcp_schema;
 pub mod render;
 pub mod runtime;
 
@@ -39,6 +40,7 @@ pub use error::OpsErrorKind;
 pub use inventory::{
     AuthPolicy, OpKind, OpsCliEntry, OpsMcpEntry, OpsMetadata, OpsRestEntry, PathSegment,
 };
+pub use mcp_schema::{coerce_args, make_portable, mcp_schema_for};
 pub use render::{IntoCliText, IntoJson, IntoMarkdown};
 pub use runtime::{OpsRuntime, SurfaceKind};
 

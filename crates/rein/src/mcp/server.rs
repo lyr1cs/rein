@@ -52,6 +52,7 @@ impl ReinServer {
     ) -> Option<Result<String, String>> {
         let entry =
             inventory::iter::<crate::ops::OpsMcpEntry>().find(|e| e.mcp_name == tool_name)?;
+        let args = coerce_tool_args(entry, args);
         let runtime = std::sync::Arc::new(crate::ops::OpsRuntime::for_mcp(std::sync::Arc::new(
             self.config.clone(),
         )));
@@ -62,6 +63,26 @@ impl ReinServer {
                 .map_err(|e| e.to_string()),
         )
     }
+}
+
+/// Decode arguments a client shipped as JSON strings (or whole floats for
+/// integer params) against the tool's own advertised schema. A client-side
+/// encoding bug then surfaces as one WARN line naming the tool and params
+/// instead of a serde error that takes the tool offline for that client.
+fn coerce_tool_args(
+    entry: &crate::ops::OpsMcpEntry,
+    mut args: serde_json::Value,
+) -> serde_json::Value {
+    let schema: serde_json::Value = (entry.input_schema)().into();
+    let coerced = crate::ops::coerce_args(&schema, &mut args);
+    if !coerced.is_empty() {
+        tracing::warn!(
+            tool = entry.mcp_name,
+            params = ?coerced,
+            "mcp: client sent typed params as JSON strings; decoded them against the tool schema"
+        );
+    }
+    args
 }
 
 #[cfg(test)]
@@ -828,6 +849,7 @@ impl ServerHandler for ReinServer {
             .clone()
             .map(serde_json::Value::Object)
             .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+        let args_value = coerce_tool_args(entry, args_value);
         let runtime = std::sync::Arc::new(crate::ops::OpsRuntime::for_mcp(std::sync::Arc::new(
             self.config.clone(),
         )));
@@ -2181,6 +2203,135 @@ mod tests {
     /// Adding/removing a tool, or changing a tool's args, breaks this —
     /// enforcing the 1.0 contract that the MCP tool surface is stable. Update
     /// `GOLDEN` only with an intentional, documented API change.
+    /// Every MCP client re-encodes `inputSchema` into its own LLM
+    /// function-calling format, and the common subset is small (see
+    /// `ops::mcp_schema`). This walks what `list_tools` actually hands to
+    /// clients and rejects any construct outside that subset, so a new
+    /// `#[op]` cannot silently ship a schema that one client flattens into
+    /// "all params undeclared" (the 2026-10-13 `rein_feedback` failure).
+    #[test]
+    fn mcp_tool_schemas_are_portable_across_clients() {
+        const FORBIDDEN_ANYWHERE: &[&str] = &[
+            "$ref",
+            "$defs",
+            "definitions",
+            "$schema",
+            "format",
+            "const",
+            "oneOf",
+            "allOf",
+        ];
+        const DATA_KEYS: &[&str] = &["enum", "default", "examples"];
+        const SCHEMA_MAPS: &[&str] = &["properties", "patternProperties"];
+
+        fn walk(v: &serde_json::Value, path: &str, problems: &mut Vec<String>) {
+            let Some(obj) = v.as_object() else {
+                if let Some(arr) = v.as_array() {
+                    for (i, item) in arr.iter().enumerate() {
+                        walk(item, &format!("{path}[{i}]"), problems);
+                    }
+                }
+                return;
+            };
+            for key in FORBIDDEN_ANYWHERE {
+                if obj.contains_key(*key) {
+                    problems.push(format!("{path}: forbidden key `{key}`"));
+                }
+            }
+            if obj.get("type").map(|t| t.is_array()).unwrap_or(false) {
+                problems.push(format!("{path}: `type` is an array {}", obj["type"]));
+            }
+            for (key, child) in obj {
+                if DATA_KEYS.contains(&key.as_str()) {
+                    continue;
+                }
+                if SCHEMA_MAPS.contains(&key.as_str()) {
+                    if let Some(props) = child.as_object() {
+                        for (name, prop) in props {
+                            let has_shape = prop.get("type").is_some()
+                                || prop.get("enum").is_some()
+                                || prop.get("anyOf").is_some();
+                            if !has_shape {
+                                problems.push(format!(
+                                    "{path}/{key}/{name}: property has no type/enum/anyOf ({prop})"
+                                ));
+                            }
+                            walk(prop, &format!("{path}/{key}/{name}"), problems);
+                        }
+                    }
+                    continue;
+                }
+                walk(child, &format!("{path}/{key}"), problems);
+            }
+        }
+
+        let mut problems = Vec::new();
+        for entry in inventory::iter::<crate::ops::OpsMcpEntry>() {
+            let tool = inventory_entry_to_tool(entry);
+            let schema = serde_json::Value::Object((*tool.input_schema).clone());
+            let root = schema.as_object().expect("tool schema is an object");
+            if root.get("type") != Some(&serde_json::Value::String("object".into())) {
+                problems.push(format!("{}: root `type` is not \"object\"", entry.mcp_name));
+            }
+            if !root
+                .get("properties")
+                .map(|p| p.is_object())
+                .unwrap_or(false)
+            {
+                problems.push(format!(
+                    "{}: root has no `properties` object",
+                    entry.mcp_name
+                ));
+            }
+            if root.contains_key("anyOf") {
+                problems.push(format!(
+                    "{}: root `anyOf` (clients flatten it)",
+                    entry.mcp_name
+                ));
+            }
+            walk(&schema, entry.mcp_name, &mut problems);
+        }
+        assert!(
+            problems.is_empty(),
+            "non-portable MCP tool schemas:\n{}",
+            problems.join("\n")
+        );
+    }
+
+    /// Receive-side counterpart of the portability lint: the exact payload
+    /// Claude Code shipped on 2026-10-13 (array + boolean as JSON strings)
+    /// must deserialize once run through `coerce_args` against the tool's
+    /// own schema, so a client-side stringification bug degrades to a WARN
+    /// instead of taking `rein_feedback` offline.
+    #[test]
+    fn call_tool_args_are_coerced_against_the_tool_schema() {
+        let entry = inventory::iter::<crate::ops::OpsMcpEntry>()
+            .find(|e| e.mcp_name == "rein_feedback")
+            .expect("rein_feedback registered");
+        let schema: serde_json::Value = (entry.input_schema)().into();
+        let mut args = serde_json::json!({
+            "kind": "access",
+            "request_id": "01M4T949ANF943BVQ8GW6T2M0M",
+            "memory_ids": "[\"01KR0S0GGBJ18AF0138VKPWEJ9\",\"01KR15H6TKSQ4J0E26ET1ED2ZJ\"]",
+            "helpful": "true",
+            "query": "rein_feedback MCP schema"
+        });
+        let mut coerced = crate::ops::coerce_args(&schema, &mut args);
+        coerced.sort();
+        assert_eq!(coerced, vec!["helpful", "memory_ids"]);
+
+        let parsed: crate::ops::handlers::adaptive::FeedbackParams =
+            serde_json::from_value(args).expect("coerced payload deserializes");
+        match parsed {
+            crate::ops::handlers::adaptive::FeedbackParams::Access(p) => {
+                assert_eq!(p.memory_ids.len(), 2);
+                assert_eq!(p.helpful, Some(true));
+                assert_eq!(p.request_id.as_deref(), Some("01M4T949ANF943BVQ8GW6T2M0M"));
+            }
+            other => panic!("expected Access variant, got {other:?}"),
+        }
+    }
+
     #[test]
     fn mcp_tool_arg_surface_is_frozen() {
         let mut lines: Vec<String> = inventory::iter::<crate::ops::OpsMcpEntry>()
@@ -2213,6 +2364,12 @@ mod tests {
         lines.sort();
         let snapshot = lines.join("\n");
         // Frozen at v1.0 (2026-05-30). Update ONLY with an intentional API change.
+        //
+        // 2026-10-13 (v1.4.2): `rein_feedback` moved from a root `oneOf`
+        // (which every MCP client flattened to zero declared params) to a
+        // flat object listing both variants' fields; `kind` selects the
+        // variant and nothing is `required` at the root. Wire payloads are
+        // unchanged — only the advertised schema moved.
         const GOLDEN: &str = "\
 rein_adaptive_status: props[] req[]
 rein_archive_summary_refresh: props[force,memory_id] req[memory_id]
@@ -2226,7 +2383,7 @@ rein_consolidate: props[all,dry_run,merge_variants,pattern,summary,topic,topics]
 rein_dedup: props[dry_run,merge_variants] req[]
 rein_dedup_concepts: props[] req[]
 rein_evidence: props[canonical_id,limit] req[canonical_id]
-rein_feedback: props[] req[]
+rein_feedback: props[helpful,interaction,kind,memory_ids,metadata,query,recall_id,request_id,synthesis_id] req[]
 rein_feedback_concept_summary: props[concept_id,concept_summary_id,interaction,living_summary_id,metadata,recall_id] req[concept_id,interaction,recall_id]
 rein_forget: props[id] req[id]
 rein_gc: props[dry_run,threshold] req[]
