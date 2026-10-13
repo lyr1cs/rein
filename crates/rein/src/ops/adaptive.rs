@@ -5319,10 +5319,12 @@ fn run_m6_threshold_learning(
                     let sim = crate::extract::similarity(&mem_a.content, &mem_b.content);
                     if sim > 0.30 {
                         // Moderate+ similarity AND high co-recall → flag for merge
+                        // IDs only — summaries are memory content and this
+                        // runs inside the adaptive tick at INFO.
                         tracing::info!(
-                            "M6 co-recall: '{}'↔'{}' co-recall={}/{}, sim={:.2} — likely duplicate",
-                            &mem_a.summary.chars().take(30).collect::<String>(),
-                            &mem_b.summary.chars().take(30).collect::<String>(),
+                            "M6 co-recall: {}↔{} co-recall={}/{}, sim={:.2} — likely duplicate",
+                            id_a,
+                            id_b,
                             co_count,
                             min_count,
                             sim,

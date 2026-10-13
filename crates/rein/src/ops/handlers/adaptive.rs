@@ -660,18 +660,71 @@ mod tests {
             props["memory_ids"]["items"]["type"],
             serde_json::json!("string")
         );
-        assert_eq!(props["helpful"]["type"], serde_json::json!("boolean"));
-        assert_eq!(props["request_id"]["type"], serde_json::json!("string"));
-        assert_eq!(props["query"]["type"], serde_json::json!("string"));
+        // Optional fields keep their nullability in the one type-array form
+        // every client accepts, so an explicit null is still valid.
+        assert_eq!(
+            props["helpful"]["type"],
+            serde_json::json!(["boolean", "null"])
+        );
+        assert_eq!(
+            props["request_id"]["type"],
+            serde_json::json!(["string", "null"])
+        );
+        assert_eq!(
+            props["query"]["type"],
+            serde_json::json!(["string", "null"])
+        );
         assert_eq!(props["synthesis_id"]["type"], serde_json::json!("string"));
         assert_eq!(props["recall_id"]["type"], serde_json::json!("string"));
-        assert_eq!(props["metadata"]["type"], serde_json::json!("object"));
+        assert_eq!(
+            props["metadata"]["type"],
+            serde_json::json!(["object", "null"])
+        );
+        assert_eq!(
+            props["metadata"]["properties"]["cluster_id"]["type"],
+            serde_json::json!(["integer", "null"])
+        );
         // The nested interaction enum survives as `anyOf` (portable form of
-        // the serde internally-tagged enum), one branch per variant.
+        // the serde internally-tagged enum), one branch per variant, each
+        // branch carrying its tag as a single-value enum plus its payload.
         let interaction_branches = props["interaction"]["anyOf"]
             .as_array()
             .expect("interaction keeps its variant branches");
-        assert_eq!(interaction_branches.len(), 4);
+        let mut tags: Vec<String> = interaction_branches
+            .iter()
+            .map(|b| {
+                b["properties"]["kind"]["enum"][0]
+                    .as_str()
+                    .expect("branch tag")
+                    .to_string()
+            })
+            .collect();
+        tags.sort();
+        assert_eq!(
+            tags,
+            vec![
+                "clicked_source",
+                "explicit_thumb",
+                "immediate_requery",
+                "viewed"
+            ]
+        );
+        for branch in interaction_branches {
+            let payload = match branch["properties"]["kind"]["enum"][0].as_str() {
+                Some("viewed") => "dwell_ms",
+                Some("clicked_source") => "source_index",
+                Some("immediate_requery") => "gap_ms",
+                Some("explicit_thumb") => "up",
+                other => panic!("unexpected tag {other:?}"),
+            };
+            assert!(
+                branch["properties"][payload].get("type").is_some(),
+                "branch payload `{payload}` must carry a type: {branch}"
+            );
+            let required = branch["required"].as_array().expect("branch required");
+            assert!(required.contains(&serde_json::json!("kind")));
+            assert!(required.contains(&serde_json::json!(payload)));
+        }
 
         let required = value
             .get("required")

@@ -52,37 +52,47 @@ impl ReinServer {
     ) -> Option<Result<String, String>> {
         let entry =
             inventory::iter::<crate::ops::OpsMcpEntry>().find(|e| e.mcp_name == tool_name)?;
-        let args = coerce_tool_args(entry, args);
         let runtime = std::sync::Arc::new(crate::ops::OpsRuntime::for_mcp(std::sync::Arc::new(
             self.config.clone(),
         )));
         runtime.set_compact(self.compact());
         Some(
-            (entry.invoke)(runtime, args)
+            invoke_with_arg_repair(entry, runtime, args)
                 .await
                 .map_err(|e| e.to_string()),
         )
     }
 }
 
-/// Decode arguments a client shipped as JSON strings (or whole floats for
-/// integer params) against the tool's own advertised schema. A client-side
-/// encoding bug then surfaces as one WARN line naming the tool and params
-/// instead of a serde error that takes the tool offline for that client.
-fn coerce_tool_args(
+/// Invoke an inventory op with the client's arguments as sent. Only if the
+/// op rejects the payload at deserialization are string-encoded (or
+/// float-encoded) values for params the advertised schema declares as
+/// array / object / boolean / number decoded, and the call retried once.
+/// A payload the op accepts as sent is never rewritten, so ops whose custom
+/// deserializers take alternative encodings (comma-separated topic lists)
+/// keep their meaning. A repaired call logs one WARN naming the tool and
+/// params: that line is the signal that a client encodes arguments wrongly.
+async fn invoke_with_arg_repair(
     entry: &crate::ops::OpsMcpEntry,
-    mut args: serde_json::Value,
-) -> serde_json::Value {
-    let schema: serde_json::Value = (entry.input_schema)().into();
-    let coerced = crate::ops::coerce_args(&schema, &mut args);
-    if !coerced.is_empty() {
-        tracing::warn!(
-            tool = entry.mcp_name,
-            params = ?coerced,
-            "mcp: client sent typed params as JSON strings; decoded them against the tool schema"
-        );
+    runtime: std::sync::Arc<crate::ops::OpsRuntime>,
+    args: serde_json::Value,
+) -> crate::types::ReinResult<String> {
+    let first = (entry.invoke)(runtime.clone(), args.clone()).await;
+    if !matches!(first, Err(crate::types::ReinError::Serialization(_))) {
+        return first;
     }
-    args
+    let schema: serde_json::Value = (entry.input_schema)().into();
+    let mut repaired = args;
+    let coerced = crate::ops::coerce_args(&schema, &mut repaired);
+    if coerced.is_empty() {
+        return first;
+    }
+    tracing::warn!(
+        tool = entry.mcp_name,
+        params = ?coerced,
+        "mcp: op rejected the payload; decoded string- or float-encoded params against the advertised schema and retried"
+    );
+    (entry.invoke)(runtime, repaired).await
 }
 
 #[cfg(test)]
@@ -849,14 +859,13 @@ impl ServerHandler for ReinServer {
             .clone()
             .map(serde_json::Value::Object)
             .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-        let args_value = coerce_tool_args(entry, args_value);
         let runtime = std::sync::Arc::new(crate::ops::OpsRuntime::for_mcp(std::sync::Arc::new(
             self.config.clone(),
         )));
         // Propagate the server-level compact flag so the macro-emitted MCP
         // output branch renders IntoMarkdown when compact is set.
         runtime.set_compact(self.compact());
-        match (entry.invoke)(runtime, args_value).await {
+        match invoke_with_arg_repair(entry, runtime, args_value).await {
             Ok(body) => Ok(rmcp::model::CallToolResult::success(vec![
                 rmcp::model::Content::text(body),
             ])),
@@ -2216,21 +2225,39 @@ mod tests {
             "$defs",
             "definitions",
             "$schema",
+            "$dynamicRef",
+            "$dynamicAnchor",
             "format",
             "const",
             "oneOf",
             "allOf",
+            "not",
+            "if",
+            "then",
+            "else",
+            "dependentSchemas",
+            "dependentRequired",
+            "unevaluatedProperties",
+            "unevaluatedItems",
         ];
-        const DATA_KEYS: &[&str] = &["enum", "default", "examples"];
+        // Only schema-bearing keywords are traversed, mirroring
+        // `ops::mcp_schema::make_portable`: members of `enum` / `default` /
+        // `examples` and vendor annotations are data, not schemas.
         const SCHEMA_MAPS: &[&str] = &["properties", "patternProperties"];
+        const SCHEMA_SINGLE: &[&str] =
+            &["items", "additionalProperties", "propertyNames", "contains"];
+        const SCHEMA_LISTS: &[&str] = &["anyOf", "oneOf", "allOf", "prefixItems"];
+
+        /// `[x, "null"]` is the one type-array form every client handles
+        /// (Gemini CLI rewrites it to `nullable: true`).
+        fn is_nullable_pair(t: &serde_json::Value) -> bool {
+            t.as_array()
+                .map(|a| a.len() == 2 && a[0].is_string() && a[1] == "null")
+                .unwrap_or(false)
+        }
 
         fn walk(v: &serde_json::Value, path: &str, problems: &mut Vec<String>) {
             let Some(obj) = v.as_object() else {
-                if let Some(arr) = v.as_array() {
-                    for (i, item) in arr.iter().enumerate() {
-                        walk(item, &format!("{path}[{i}]"), problems);
-                    }
-                }
                 return;
             };
             for key in FORBIDDEN_ANYWHERE {
@@ -2238,30 +2265,41 @@ mod tests {
                     problems.push(format!("{path}: forbidden key `{key}`"));
                 }
             }
-            if obj.get("type").map(|t| t.is_array()).unwrap_or(false) {
-                problems.push(format!("{path}: `type` is an array {}", obj["type"]));
+            if let Some(t) = obj.get("type") {
+                if t.is_array() && !is_nullable_pair(t) {
+                    problems.push(format!(
+                        "{path}: `type` array is not the `[x, \"null\"]` form: {t}"
+                    ));
+                }
             }
-            for (key, child) in obj {
-                if DATA_KEYS.contains(&key.as_str()) {
-                    continue;
-                }
-                if SCHEMA_MAPS.contains(&key.as_str()) {
-                    if let Some(props) = child.as_object() {
-                        for (name, prop) in props {
-                            let has_shape = prop.get("type").is_some()
-                                || prop.get("enum").is_some()
-                                || prop.get("anyOf").is_some();
-                            if !has_shape {
-                                problems.push(format!(
-                                    "{path}/{key}/{name}: property has no type/enum/anyOf ({prop})"
-                                ));
-                            }
-                            walk(prop, &format!("{path}/{key}/{name}"), problems);
+            for key in SCHEMA_MAPS {
+                if let Some(props) = obj.get(*key).and_then(|c| c.as_object()) {
+                    for (name, prop) in props {
+                        let has_shape = prop.get("type").is_some()
+                            || prop.get("enum").is_some()
+                            || prop.get("anyOf").is_some();
+                        if !has_shape {
+                            problems.push(format!(
+                                "{path}/{key}/{name}: property has no type/enum/anyOf ({prop})"
+                            ));
                         }
+                        walk(prop, &format!("{path}/{key}/{name}"), problems);
                     }
-                    continue;
                 }
-                walk(child, &format!("{path}/{key}"), problems);
+            }
+            for key in SCHEMA_SINGLE {
+                if let Some(child) = obj.get(*key) {
+                    if child.is_object() {
+                        walk(child, &format!("{path}/{key}"), problems);
+                    }
+                }
+            }
+            for key in SCHEMA_LISTS {
+                if let Some(items) = obj.get(*key).and_then(|c| c.as_array()) {
+                    for (i, item) in items.iter().enumerate() {
+                        walk(item, &format!("{path}/{key}[{i}]"), problems);
+                    }
+                }
             }
         }
 
@@ -2298,38 +2336,173 @@ mod tests {
         );
     }
 
-    /// Receive-side counterpart of the portability lint: the exact payload
-    /// Claude Code shipped on 2026-10-13 (array + boolean as JSON strings)
-    /// must deserialize once run through `coerce_args` against the tool's
-    /// own schema, so a client-side stringification bug degrades to a WARN
-    /// instead of taking `rein_feedback` offline.
-    #[test]
-    fn call_tool_args_are_coerced_against_the_tool_schema() {
-        let entry = inventory::iter::<crate::ops::OpsMcpEntry>()
-            .find(|e| e.mcp_name == "rein_feedback")
+    /// Receive-side counterpart of the portability lint, through the real
+    /// dispatch path: the exact payload Claude Code shipped on 2026-10-13
+    /// (array + boolean as JSON strings) must get past deserialization and
+    /// reach the handler. The temp store holds no such memory, so the
+    /// handler's own "not found" is the expected outcome; a serde error
+    /// would mean the repair path was bypassed.
+    #[tokio::test]
+    async fn dispatch_repairs_string_encoded_args_before_the_handler_runs() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut config = crate::config::ReinConfig::default();
+        config.database.path = tmp
+            .path()
+            .join("memories.db")
+            .to_string_lossy()
+            .into_owned();
+        let server = ReinServer::new(config);
+        let result = server
+            .dispatch_inventory(
+                "rein_feedback",
+                serde_json::json!({
+                    "kind": "access",
+                    "request_id": "01M4T949ANF943BVQ8GW6T2M0M",
+                    "memory_ids": "[\"01KR0S0GGBJ18AF0138VKPWEJ9\"]",
+                    "helpful": "true",
+                    "query": "rein_feedback MCP schema"
+                }),
+            )
+            .await
             .expect("rein_feedback registered");
-        let schema: serde_json::Value = (entry.input_schema)().into();
-        let mut args = serde_json::json!({
-            "kind": "access",
-            "request_id": "01M4T949ANF943BVQ8GW6T2M0M",
-            "memory_ids": "[\"01KR0S0GGBJ18AF0138VKPWEJ9\",\"01KR15H6TKSQ4J0E26ET1ED2ZJ\"]",
-            "helpful": "true",
-            "query": "rein_feedback MCP schema"
-        });
-        let mut coerced = crate::ops::coerce_args(&schema, &mut args);
-        coerced.sort();
-        assert_eq!(coerced, vec!["helpful", "memory_ids"]);
+        let err = result.expect_err("memory does not exist in the temp store");
+        assert!(
+            err.contains("not found"),
+            "handler must run and reject the id: {err}"
+        );
+        assert!(
+            !err.contains("serialization error"),
+            "payload must be repaired before deserialization: {err}"
+        );
+    }
 
-        let parsed: crate::ops::handlers::adaptive::FeedbackParams =
-            serde_json::from_value(args).expect("coerced payload deserializes");
-        match parsed {
-            crate::ops::handlers::adaptive::FeedbackParams::Access(p) => {
-                assert_eq!(p.memory_ids.len(), 2);
-                assert_eq!(p.helpful, Some(true));
-                assert_eq!(p.request_id.as_deref(), Some("01M4T949ANF943BVQ8GW6T2M0M"));
+    // ── invoke_with_arg_repair policy, with fake inventory entries ────────
+
+    fn repair_fake_schema() -> schemars::Schema {
+        let v = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "helpful": {"type": ["boolean", "null"]},
+                "topics": {"type": ["array", "null"], "items": {"type": "string"}}
             }
-            other => panic!("expected Access variant, got {other:?}"),
+        });
+        schemars::Schema::from(v.as_object().cloned().expect("object"))
+    }
+
+    static STRICT_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static NOT_FOUND_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    type InvokeFuture = std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::types::ReinResult<String>> + Send>,
+    >;
+
+    /// Rejects a string-typed `helpful` the way a derived Deserialize would.
+    fn strict_invoke(
+        _runtime: std::sync::Arc<crate::ops::OpsRuntime>,
+        args: serde_json::Value,
+    ) -> InvokeFuture {
+        STRICT_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            if args.get("helpful").map(|v| v.is_string()).unwrap_or(false) {
+                let e = serde_json::from_value::<bool>(args["helpful"].clone())
+                    .expect_err("string is not a bool");
+                return Err(crate::types::ReinError::Serialization(e));
+            }
+            Ok(args.to_string())
+        })
+    }
+
+    /// Accepts anything, like an op whose custom deserializer takes a
+    /// comma-separated string as well as an array.
+    fn lenient_invoke(
+        _runtime: std::sync::Arc<crate::ops::OpsRuntime>,
+        args: serde_json::Value,
+    ) -> InvokeFuture {
+        Box::pin(async move { Ok(args.to_string()) })
+    }
+
+    fn not_found_invoke(
+        _runtime: std::sync::Arc<crate::ops::OpsRuntime>,
+        _args: serde_json::Value,
+    ) -> InvokeFuture {
+        NOT_FOUND_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move { Err(crate::types::ReinError::NotFound("memory x".into())) })
+    }
+
+    fn fake_entry(
+        invoke: fn(std::sync::Arc<crate::ops::OpsRuntime>, serde_json::Value) -> InvokeFuture,
+    ) -> crate::ops::OpsMcpEntry {
+        crate::ops::OpsMcpEntry {
+            op_name: "fake",
+            mcp_name: "rein_fake",
+            description: "fake op for repair-policy tests",
+            mutating: false,
+            input_schema: repair_fake_schema,
+            invoke,
         }
+    }
+
+    fn fake_runtime() -> std::sync::Arc<crate::ops::OpsRuntime> {
+        std::sync::Arc::new(crate::ops::OpsRuntime::for_mcp(std::sync::Arc::new(
+            crate::config::ReinConfig::default(),
+        )))
+    }
+
+    #[tokio::test]
+    async fn repair_retries_once_after_a_deserialization_error() {
+        let entry = fake_entry(strict_invoke);
+        let before = STRICT_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let out = invoke_with_arg_repair(
+            &entry,
+            fake_runtime(),
+            serde_json::json!({"helpful": "true", "topics": ["a"]}),
+        )
+        .await
+        .expect("repaired payload is accepted on retry");
+        let echoed: serde_json::Value = serde_json::from_str(&out).expect("echo is JSON");
+        assert_eq!(echoed["helpful"], serde_json::json!(true));
+        assert_eq!(
+            STRICT_CALLS.load(std::sync::atomic::Ordering::SeqCst) - before,
+            2,
+            "original attempt + one retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn repair_never_rewrites_a_payload_the_op_accepts() {
+        // `topics` is declared as an array, but this op also accepts a
+        // string. A string that happens to parse as JSON must reach the op
+        // untouched: decoding it would change which topic is selected.
+        let entry = fake_entry(lenient_invoke);
+        let out = invoke_with_arg_repair(
+            &entry,
+            fake_runtime(),
+            serde_json::json!({"topics": "[\"alpha\"]", "helpful": "true"}),
+        )
+        .await
+        .expect("op accepts the payload as sent");
+        let echoed: serde_json::Value = serde_json::from_str(&out).expect("echo is JSON");
+        assert_eq!(echoed["topics"], serde_json::json!("[\"alpha\"]"));
+        assert_eq!(echoed["helpful"], serde_json::json!("true"));
+    }
+
+    #[tokio::test]
+    async fn repair_does_not_retry_on_other_errors() {
+        let entry = fake_entry(not_found_invoke);
+        let before = NOT_FOUND_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let err = invoke_with_arg_repair(
+            &entry,
+            fake_runtime(),
+            serde_json::json!({"helpful": "true"}),
+        )
+        .await
+        .expect_err("not-found propagates");
+        assert!(matches!(err, crate::types::ReinError::NotFound(_)), "{err}");
+        assert_eq!(
+            NOT_FOUND_CALLS.load(std::sync::atomic::Ordering::SeqCst) - before,
+            1,
+            "a non-deserialization error must not trigger a retry"
+        );
     }
 
     #[test]

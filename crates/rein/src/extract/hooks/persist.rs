@@ -362,7 +362,7 @@ pub fn store_extracted_report(
         }
 
         let content_for_activation = item.content.clone();
-        let memory_summary_for_log = item.summary.clone();
+        let memory_summary_len = item.summary.len();
         let importance = item
             .importance
             .parse::<crate::types::Importance>()
@@ -436,10 +436,12 @@ pub fn store_extracted_report(
             // machinery gets a chance instead of marking it done.
             Err(e) => {
                 stats.store_failed_count += 1;
-                // Length only — the summary is memory content and WARN is
-                // the default stderr level.
+                // Identify the item by its proposed id and summary length —
+                // the summary is memory content and WARN is the default
+                // stderr level.
                 tracing::warn!(
-                    summary_len = memory_summary_for_log.len(),
+                    memory_id = %proposed_id,
+                    summary_len = memory_summary_len,
                     error = %e,
                     "store_with_dedup failed for admitted extraction item"
                 );
