@@ -436,8 +436,10 @@ pub fn store_extracted_report(
             // machinery gets a chance instead of marking it done.
             Err(e) => {
                 stats.store_failed_count += 1;
+                // Length only — the summary is memory content and WARN is
+                // the default stderr level.
                 tracing::warn!(
-                    summary = %memory_summary_for_log,
+                    summary_len = memory_summary_for_log.len(),
                     error = %e,
                     "store_with_dedup failed for admitted extraction item"
                 );

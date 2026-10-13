@@ -684,8 +684,11 @@ pub fn run_recall_synthesis_with_policy(
             }
         }
         Err(e) => {
+            // Length only: the query is user prompt text and WARN is the
+            // default stderr level, so logging it verbatim would copy user
+            // content into every client's MCP log on each provider hiccup.
             tracing::warn!(
-                query = %query,
+                query_len = query.len(),
                 error = %e,
                 "recall_synthesis: LLM call failed (non-fatal, returning results without synthesis)"
             );

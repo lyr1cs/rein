@@ -1900,10 +1900,14 @@ fn recall_temporal_with_execution_mode(
         }
         let result = crate::search::rrf::reciprocal_rank_fusion(&lists, rrf_k);
         if result.is_empty() && fts_empty && vec_empty && kg_empty && ep_empty {
-            // Diagnostic: every channel returned zero candidates. Emit a single
-            // structured log line so silent empty recalls are observable in ops.
-            tracing::info!(
-                query = %query,
+            // Diagnostic: every channel returned zero candidates. One
+            // structured line so silent empty recalls stay observable. DEBUG
+            // and length-only on purpose: the A12 holdout pass drives tens
+            // of thousands of recalls per tick whose "query" is a memory's
+            // own text, and at INFO with `%query` this single line grew the
+            // launchd stderr log to ~1 GB of memory content.
+            tracing::debug!(
+                query_len = query.len(),
                 "recall: all channels returned zero candidates"
             );
         }
