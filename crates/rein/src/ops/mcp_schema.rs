@@ -459,11 +459,7 @@ fn coerce_scalar(declared: &str, value: &Value) -> Option<Value> {
 /// (`"7.000"`, `"1e2"`), so `f64` rounding cannot manufacture integrality
 /// out of a value such as `"1.0000000000000001"`.
 fn lexically_integral(text: &str) -> bool {
-    let mantissa = text
-        .trim()
-        .split(['e', 'E'])
-        .next()
-        .unwrap_or("");
+    let mantissa = text.trim().split(['e', 'E']).next().unwrap_or("");
     match mantissa.split_once('.') {
         Some((_, fraction)) => fraction.chars().all(|c| c == '0'),
         None => true,
