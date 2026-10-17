@@ -398,6 +398,17 @@ Since v1.4.1 `rein serve` exits promptly on SIGINT/SIGTERM even while the
 side-index warmup is running, and the Tantivy rebuild at startup produces a
 single segment (seconds rather than minutes on a 10k-memory store).
 
+Since v1.4.2 the HTTP server keeps a small sidecar next to the database,
+`<db dir>/<db file name>.mcp-sessions-<bind>-<port>-<hash>.json` (mode 0600), holding the `initialize`
+parameters of every Streamable HTTP session seen (capped at 1024 entries and
+4 MiB in total, oldest dropped; a session whose `initialize` exceeds 16 KiB is
+not retained). It lets expired and pre-restart sessions resume without the
+client re-initializing. It contains session ids and the client-reported
+name/version/capabilities only — no tokens, no memory content. It is safe
+to delete while the server is stopped; the only effect is that clients
+holding a pre-restart session id get one `404 Session not found` and
+re-initialize. `rein doctor` shows its state under `mcp_session_store`.
+
 ## Proxy Service Management
 
 Start and stop the record-only proxy:

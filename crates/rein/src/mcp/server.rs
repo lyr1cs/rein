@@ -2,8 +2,14 @@ use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::{ServerHandler, ServiceExt};
 
 use crate::config::ReinConfig;
+use crate::mcp::session_store::PersistentSessionStore;
 use http_body_util::BodyExt;
+use rmcp::transport::streamable_http_server::{
+    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+};
 use serde_json::Value;
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 /// MCP server for rein memory system.
 ///
@@ -997,18 +1003,74 @@ pub async fn run_stdio(config: ReinConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Build the rmcp Streamable HTTP service exactly as `run_http` serves it,
+/// so integration tests exercise the production configuration (host-guard
+/// mirroring, stateful mode, session store) without binding a port.
+///
+/// `session_store` is assigned on the config BEFORE
+/// `StreamableHttpService::new`: rmcp allocates its restore coordination
+/// map only when the store is present at construction, so setting the
+/// field afterwards silently disables restore.
+pub fn build_mcp_http_service(
+    config: ReinConfig,
+    cancel: CancellationToken,
+    session_manager: Arc<LocalSessionManager>,
+    session_store: Arc<PersistentSessionStore>,
+) -> StreamableHttpService<ReinServer, LocalSessionManager> {
+    // v0.28.13 hotfix: propagate `[server].allowed_hosts` to rmcp's own
+    // streamable-HTTP host guard. rmcp 1.6 added its own DNS-rebinding
+    // host check (default `["localhost", "127.0.0.1", "::1"]`) which runs
+    // ahead of rein's `validate_http_request_host`. Without this bridge,
+    // rein's own allowlist is ignored for any non-loopback Host header
+    // (e.g. requests proxied through a Tailscale Funnel hostname).
+    //
+    // Three cases:
+    //   1. Operator set `[server].allowed_hosts` explicitly → mirror the
+    //      rein-derived allowlist (loopback + extras) into rmcp.
+    //   2. Specific bind (loopback or LAN IP) without an explicit
+    //      allowlist → mirror the bind-derived allowlist into rmcp.
+    //   3. Wildcard bind (`0.0.0.0`/`::`) with no allowlist → bearer auth
+    //      is the only sentinel (the startup guard in `run_http` enforced
+    //      that `REIN_HTTP_TOKEN` is set), so disable rmcp's host check
+    //      rather than letting it reject every non-loopback request and
+    //      break documented Docker / bearer-protected deployment modes.
+    let bind_host = &config.server.sse_bind;
+    let cfg_allowed = config.server.allowed_hosts.as_deref();
+    let rmcp_allowed_hosts = if cfg_allowed.is_some_and(|hosts| !hosts.is_empty())
+        || is_specific_bind_host(&normalize_host_for_guard(bind_host))
+    {
+        Some(http_allowed_hosts(bind_host, cfg_allowed))
+    } else {
+        None
+    };
+    let mut http_config = StreamableHttpServerConfig::default()
+        .with_stateful_mode(true)
+        .with_cancellation_token(cancel);
+    http_config = match rmcp_allowed_hosts {
+        Some(hosts) => http_config.with_allowed_hosts(hosts),
+        None => http_config.disable_allowed_hosts(),
+    };
+    // Issue #4: expired (idle > keep_alive) and pre-restart sessions are
+    // re-created from this store instead of answering 404.
+    http_config.session_store = Some(session_store);
+
+    // NOTE: Each HTTP session creates its own ReinServer with a separate
+    // SqliteStore. The Mutex only serializes within a single session (MCP
+    // handles one request at a time). Cross-session concurrency is handled
+    // by having independent connections.
+    StreamableHttpService::new(
+        move || Ok(ReinServer::new(config.clone())),
+        session_manager,
+        http_config,
+    )
+}
+
 /// Start the MCP server over HTTP (Streamable HTTP / SSE).
 /// Accessible via Tailscale or LAN for remote memory queries.
 pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
     if should_spawn_background_warmup(&config, StartupSurface::Http) {
         spawn_background_warmup(&config);
     }
-
-    use rmcp::transport::streamable_http_server::{
-        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
-    };
-    use std::sync::Arc;
-    use tokio_util::sync::CancellationToken;
 
     let bind = format!("{}:{}", config.server.sse_bind, config.server.sse_port);
     let config_clone = config.clone();
@@ -1053,52 +1115,16 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
 
     let cancel = CancellationToken::new();
 
-    let session_manager = Arc::new(LocalSessionManager::default());
-    // v0.28.13 hotfix: propagate `[server].allowed_hosts` to rmcp's own
-    // streamable-HTTP host guard. rmcp 1.6 added its own DNS-rebinding
-    // host check (default `["localhost", "127.0.0.1", "::1"]`) which runs
-    // ahead of rein's `validate_http_request_host`. Without this bridge,
-    // rein's own allowlist is ignored for any non-loopback Host header
-    // (e.g. requests proxied through a Tailscale Funnel hostname).
-    //
-    // Three cases:
-    //   1. Operator set `[server].allowed_hosts` explicitly → mirror the
-    //      rein-derived allowlist (loopback + extras) into rmcp.
-    //   2. Specific bind (loopback or LAN IP) without an explicit
-    //      allowlist → mirror the bind-derived allowlist into rmcp.
-    //   3. Wildcard bind (`0.0.0.0`/`::`) with no allowlist → bearer auth
-    //      is the only sentinel (the startup guard above enforced that
-    //      `REIN_HTTP_TOKEN` is set), so disable rmcp's host check rather
-    //      than letting it reject every non-loopback request and break
-    //      documented Docker / bearer-protected deployment modes.
-    let bind_host = &config.server.sse_bind;
-    let cfg_allowed = config.server.allowed_hosts.as_deref();
-    let rmcp_allowed_hosts = if cfg_allowed.is_some_and(|hosts| !hosts.is_empty())
-        || is_specific_bind_host(&normalize_host_for_guard(bind_host))
-    {
-        Some(http_allowed_hosts(bind_host, cfg_allowed))
-    } else {
-        None
-    };
-    let mut http_config = StreamableHttpServerConfig::default()
-        .with_stateful_mode(true)
-        .with_cancellation_token(cancel.clone());
-    http_config = match rmcp_allowed_hosts {
-        Some(hosts) => http_config.with_allowed_hosts(hosts),
-        None => http_config.disable_allowed_hosts(),
-    };
-
-    // NOTE: Each HTTP session creates its own ReinServer with a separate SqliteStore.
-    // The Mutex only serializes within a single session (MCP handles one request at a time).
-    // Cross-session concurrency is handled by having independent connections.
-    let service = StreamableHttpService::new(
-        move || {
-            let server = ReinServer::new(config_clone.clone());
-            Ok(server)
-        },
-        session_manager,
-        http_config,
+    let session_store_path = crate::mcp::session_store::mcp_session_store_path(&config);
+    let session_store = Arc::new(PersistentSessionStore::open(session_store_path.clone()));
+    tracing::info!(
+        path = %session_store_path.display(),
+        restored = session_store.len(),
+        "mcp sessions: persisted sessions loaded; idle sessions expire after rmcp's default keep-alive and are re-created transparently on the next request"
     );
+    let session_manager = Arc::new(LocalSessionManager::default());
+    let service =
+        build_mcp_http_service(config_clone, cancel.clone(), session_manager, session_store);
 
     let listener = match tokio::net::TcpListener::bind(&bind).await {
         Ok(l) => l,

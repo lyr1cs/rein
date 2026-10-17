@@ -184,6 +184,19 @@ Without one of the auth postures in step 1, `rein serve --sse` exits
 immediately with `REIN_HTTP_TOKEN must be set`. Without step 2 the
 listener starts but rejects every tunnel request.
 
+**Session lifetime.** rmcp (rein's MCP transport layer) expires a Streamable
+HTTP session after 300 s without a request. Since v1.4.2 that expiry is
+invisible to clients: rein keeps each session's `initialize` parameters in
+memory and in `<db dir>/<db file name>.mcp-sessions-<bind>-<port>-<hash>.json`, and a request that
+carries an expired or pre-restart `Mcp-Session-Id` is served after rmcp
+re-creates the session under the same id. Clients that never re-initialize
+on `404 Session not found` (several SDKs don't, e.g. typescript-sdk #1708)
+keep working across idle gaps and `rein serve` restarts. A 404 still
+happens when the client itself sent `DELETE /mcp`, when more than 1024
+sessions were seen since that one (oldest is dropped), or when the sidecar
+file was deleted or unreadable before a restart; in those cases the client
+must re-initialize as the spec requires.
+
 Expose the listener publicly via one of (no Tailscale or domain
 required for the simpler ones):
 

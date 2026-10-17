@@ -51,6 +51,32 @@ transport (current MCP standard since spec version 2025-06-18). The
 deployment work is to terminate HTTPS in front of it and route
 authenticated traffic through.
 
+### Session lifetime
+
+rmcp expires a Streamable HTTP session after 300 s without a request
+(`SessionConfig::DEFAULT_KEEP_ALIVE`). rein does not change that value;
+instead it registers a session store, so when a request arrives with an
+expired `Mcp-Session-Id`, rmcp re-creates the session under the same id by
+replaying the stored `initialize` and serves the request. The store is
+mirrored to `<db dir>/<db file name>.mcp-sessions-<bind>-<port>-<hash>.json`, so sessions also survive
+`rein serve` restarts. Nothing to configure.
+
+What this means operationally:
+
+- Clients do not need to implement the spec's "re-initialize on 404" rule
+  to stay usable; those that do implement it keep working unchanged.
+- With `REIN_LOG=debug` you will see rmcp's `worker quit with reason:
+  IdleTimeout(300s)` lines followed by rein's `mcp session restore` INFO
+  line on the next request. Both are normal.
+- A GET resume (`Last-Event-ID`) against a restored session has no event
+  history to replay; rmcp answers it with `200` and a fresh stream, so
+  clients that reconnect their standalone SSE stream simply continue. Tool
+  calls are unaffected either way.
+- A 404 still occurs after an explicit client `DELETE /mcp`, after more
+  than 1024 sessions have been seen since that one, or when the sidecar
+  was deleted or corrupt before a restart. `rein doctor` reports the
+  sidecar as `mcp_session_store`.
+
 ### One rein memory, two Claude transports
 
 The important mental model is **not** "install rein twice." It is one

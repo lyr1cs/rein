@@ -123,6 +123,7 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
     checks.push(check_claude_hooks());
     checks.push(check_codex_mcp_server(config));
     checks.push(check_gui_runtime(config));
+    checks.push(check_mcp_session_store(config));
     checks.push(check_proxy_runtime(config));
     checks.push(check_overview_version());
     checks.push(check_release_metadata_versions());
@@ -752,6 +753,48 @@ fn count_rest_operations_in_source(source: &str) -> usize {
 /// memory database (PostToolUse / PreCompact / Stop) and, with
 /// `[hooks.claude].inject_prompt_context`, inject prompt-time context
 /// (UserPromptSubmit).
+/// Always inspects the configured sidecar path: `rein serve --sse` /
+/// `--gui` enable the HTTP surface only inside the server process, so the
+/// `[server]` flags seen by a separate `rein doctor` say nothing about
+/// whether a sidecar exists. A missing file is simply reported as OK.
+fn check_mcp_session_store(config: &ReinConfig) -> DoctorCheck {
+    check_mcp_session_store_at(&crate::mcp::session_store::mcp_session_store_path(config))
+}
+
+/// Streamable HTTP sessions are restored from a sidecar after idle expiry
+/// and across restarts (issue #4). This only reports the sidecar's state;
+/// a corrupt file is not fatal (the server starts empty and rewrites it).
+fn check_mcp_session_store_at(path: &Path) -> DoctorCheck {
+    use crate::mcp::session_store::{inspect_sidecar, SidecarStatus};
+    match inspect_sidecar(path) {
+        SidecarStatus::Missing => ok_in(
+            DoctorCategory::Runtime,
+            "mcp_session_store",
+            format!(
+                "no persisted MCP sessions yet ({}); idle sessions restore transparently once a client initializes",
+                path.display()
+            ),
+        ),
+        SidecarStatus::Readable { sessions } => ok_in(
+            DoctorCategory::Runtime,
+            "mcp_session_store",
+            format!(
+                "{sessions} persisted MCP session(s) in {}; idle and pre-restart sessions restore transparently",
+                path.display()
+            ),
+        ),
+        SidecarStatus::Corrupt(err) => warn_with_hint(
+            DoctorCategory::Runtime,
+            "mcp_session_store",
+            format!(
+                "MCP session sidecar {} is unreadable ({err}); the next `rein serve` starts with no restorable sessions and clients get one 404 each",
+                path.display()
+            ),
+            "delete the file; rein rewrites it on the next client initialize",
+        ),
+    }
+}
+
 fn check_claude_hooks() -> DoctorCheck {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return ok_in(
@@ -5612,6 +5655,47 @@ provider = "inherit"
         let check = check_adaptive_pipeline_last_run(&store, &ReinConfig::default());
         assert_eq!(check.status, CheckStatus::Warn);
         assert!(check.message.contains("error=snapshot save failed"));
+    }
+
+    #[test]
+    fn mcp_session_store_missing_ok_corrupt_warn_readable_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp-sessions-8680.json");
+
+        let missing = check_mcp_session_store_at(&path);
+        assert_eq!(missing.status, CheckStatus::Ok);
+        assert!(
+            missing.message.contains("no persisted MCP sessions"),
+            "{}",
+            missing.message
+        );
+
+        std::fs::write(
+            &path,
+            r#"{"schema":1,"sessions":[{"id":"abc","created_at_unix":1,"state":{"initialize_params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}}]}"#,
+        )
+        .unwrap();
+        let readable = check_mcp_session_store_at(&path);
+        assert_eq!(readable.status, CheckStatus::Ok);
+        assert!(
+            readable.message.contains("1 persisted MCP session"),
+            "{}",
+            readable.message
+        );
+
+        std::fs::write(&path, "{not json").unwrap();
+        let corrupt = check_mcp_session_store_at(&path);
+        assert_eq!(corrupt.status, CheckStatus::Warn);
+        assert!(
+            corrupt.message.contains("unreadable"),
+            "{}",
+            corrupt.message
+        );
+        assert!(corrupt
+            .repair_hint
+            .as_deref()
+            .unwrap_or_default()
+            .contains("delete"));
     }
 
     #[test]
