@@ -9,6 +9,55 @@ The full release notes (with audit-round breakdowns and operator-visible
 schema changes) live on the [GitHub Releases page](https://github.com/lyr1cs/rein/releases).
 This file is a condensed index intended for quick scanning.
 
+## [1.4.2] — 2026-10-17
+
+Maintenance patch on the runway automation line. No schema or config
+changes.
+
+### Fixed
+
+- **Streamable HTTP sessions expired after 5 minutes idle and never
+  recovered** (GitHub #4) — rmcp drops an idle session after 300 s and
+  answers the next request with `404 Session not found`; several MCP
+  clients never re-initialize on that 404 (typescript-sdk #1708), so every
+  tool call failed until the client process restarted. rein now registers
+  an rmcp `SessionStore`: a request carrying an expired or pre-restart
+  `Mcp-Session-Id` is served after rmcp re-creates the session under the
+  same id from the stored `initialize` parameters. State is mirrored to
+  `<db dir>/<db file name>.mcp-sessions-<bind>-<port>-<hash>.json` (mode
+  0600; 1024 entries / 16 KiB per entry / 4 MiB total), so sessions also
+  survive `rein serve` restarts. `rein doctor` reports the sidecar as
+  `mcp_session_store`. A 404 still follows a client `DELETE`, eviction
+  past the budget, a deleted / corrupt sidecar, or an entry whose
+  protocol version the running rmcp cannot replay (such entries are not
+  retained, so a failed replay can never pin a client on 500).
+- **MCP tool schemas were not portable across clients** — `rein_feedback`
+  advertised a root `oneOf` of `allOf: [$ref]` branches; Claude Code
+  flattened it to a single enum and shipped arrays and booleans as JSON
+  strings, so access feedback from Claude Code had failed since v0.26.
+  Every tool schema now goes through one generator that inlines subschemas
+  into the subset all clients accept (no `$ref` / `$defs` / `oneOf` /
+  `const` / `format`; nullability kept as `type: [x, "null"]`), and
+  `call_tool` repairs string- or float-encoded arguments only after the op
+  rejected the payload as sent.
+- **Memory and query text in default-level logs** — the recall
+  zero-candidate INFO line carried the full query (the A12 holdout pass
+  had grown a launchd log to ~950 MB of memory content in three days); it
+  and two WARN lines now log lengths only. Provider HTTP error bodies (up
+  to 500 chars, which proxies fill with the rejected prompt) and
+  unparseable LLM output (up to 200 chars) no longer appear in error
+  messages: `provider_status_error` / `unparseable_output_error` keep the
+  operation, status and lengths and emit the preview at DEBUG only.
+
+### Changed
+
+- rmcp 1.6.0 → 1.8.0: idle-session expiry is a DEBUG `IdleTimeout`
+  instead of an ERROR fatal; tool schemas built by rein bypass rmcp's
+  schemars sanitizer, so `list_tools` output is unchanged.
+- Dependency advisories closed: h2 0.4.20, quinn-proto 0.11.19, rustls
+  0.23.46, chacha20 0.10.2 (yanked release replaced), react-router 7.18.4
+  (GUI).
+
 ## [1.4.1] — 2026-10-10
 
 Maintenance patch on the runway automation line. No schema or config
