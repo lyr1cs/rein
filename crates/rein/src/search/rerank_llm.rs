@@ -69,10 +69,10 @@ impl GeminiReranker {
         let text_body = resp.text().await?;
 
         if !status.is_success() {
-            return Err(ReinError::Extract(format!(
-                "Gemini rerank API returned {}: {}",
+            return Err(ReinError::Extract(crate::types::provider_status_error(
+                "Gemini rerank API",
                 status,
-                crate::types::truncate_for_error(&text_body, 500)
+                &text_body,
             )));
         }
 
@@ -148,10 +148,10 @@ impl OmlxReranker {
                 let status = resp.status();
                 let body = resp.text().await?;
                 if !status.is_success() {
-                    let truncated: String = body.chars().take(500).collect();
-                    return Err(ReinError::Extract(format!(
-                        "OMLX rerank API returned {}: {truncated}",
-                        status
+                    return Err(ReinError::Extract(crate::types::provider_status_error(
+                        "OMLX rerank API",
+                        status,
+                        &body,
                     )));
                 }
                 body

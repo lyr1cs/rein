@@ -474,10 +474,10 @@ impl GeminiExtractor {
         let text_body = resp.text().await?;
 
         if !status.is_success() {
-            return Err(ReinError::Extract(format!(
-                "Gemini API returned {}: {}",
+            return Err(ReinError::Extract(crate::types::provider_status_error(
+                "Gemini extract API",
                 status,
-                crate::types::truncate_for_error(&text_body, 500)
+                &text_body,
             )));
         }
 
@@ -601,10 +601,10 @@ impl OmlxExtractor {
             let status = resp.status();
             let body = resp.text().await?;
             if !status.is_success() {
-                let truncated: String = body.chars().take(500).collect();
-                return Err(ReinError::Extract(format!(
-                    "OMLX API returned {}: {truncated}",
-                    status
+                return Err(ReinError::Extract(crate::types::provider_status_error(
+                    "OMLX extract API",
+                    status,
+                    &body,
                 )));
             }
             body
@@ -622,10 +622,10 @@ impl OmlxExtractor {
                     let status = resp.status();
                     let body = resp.text().await?;
                     if !status.is_success() {
-                        let truncated: String = body.chars().take(500).collect();
-                        return Err(ReinError::Extract(format!(
-                            "OMLX API returned {}: {truncated}",
-                            status
+                        return Err(ReinError::Extract(crate::types::provider_status_error(
+                            "OMLX extract API",
+                            status,
+                            &body,
                         )));
                     }
                     body
@@ -1693,9 +1693,9 @@ fn parse_extraction_result(text: &str) -> ReinResult<ExtractionResult> {
         });
     }
 
-    Err(ReinError::Extract(format!(
-        "failed to parse extraction result: {}",
-        cleaned.chars().take(200).collect::<String>()
+    Err(ReinError::Extract(crate::types::unparseable_output_error(
+        "extraction result",
+        &cleaned,
     )))
 }
 
@@ -1735,9 +1735,9 @@ fn parse_dedup_verdict(text: &str) -> ReinResult<DedupVerdict> {
         }
     }
 
-    Err(ReinError::Extract(format!(
-        "failed to parse dedup verdict: {}",
-        cleaned.chars().take(200).collect::<String>()
+    Err(ReinError::Extract(crate::types::unparseable_output_error(
+        "dedup verdict",
+        &cleaned,
     )))
 }
 
@@ -1762,9 +1762,9 @@ fn parse_llm_json(text: &str) -> ReinResult<Vec<ExtractedMemory>> {
         }
     }
 
-    Err(ReinError::Extract(format!(
-        "failed to parse LLM output as ExtractedMemory array: {}",
-        cleaned.chars().take(200).collect::<String>()
+    Err(ReinError::Extract(crate::types::unparseable_output_error(
+        "ExtractedMemory array",
+        &cleaned,
     )))
 }
 

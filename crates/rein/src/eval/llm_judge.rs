@@ -330,18 +330,19 @@ fn build_concept_user_prompt(
 ///
 /// Strips code fences first (Gemini and OMLX both occasionally wrap JSON
 /// in ```json ... ``` despite `responseMimeType: application/json`),
-/// trims, then `serde_json::from_str`. On parse failure returns
-/// `ReinError::Extract` carrying a truncated copy of the offending output
-/// — eval callers log this and score the case as a miss.
+/// trims, then `serde_json::from_str`. On parse failure returns a
+/// content-free `ReinError::Extract` (the offending output is only logged
+/// at DEBUG) — eval callers log this and score the case as a miss.
 fn parse_judge_output(raw: &str) -> ReinResult<JudgeOutcome> {
     let cleaned = strip_code_fences(raw);
     let trimmed = cleaned.trim();
     serde_json::from_str::<JudgeOutcome>(trimmed).map_err(|e| {
-        // Truncate the included raw output so a multi-megabyte hallucinated
-        // response doesn't end up in error logs / Scorecard JSON.
-        let snippet: String = trimmed.chars().take(200).collect();
+        // The judge output quotes synthesis and source text, so the
+        // message stays content-free (serde position + length); the
+        // preview goes to DEBUG via the shared helper.
         ReinError::Extract(format!(
-            "judge JSON parse failed: {e}; raw output (truncated): {snippet}"
+            "{} ({e})",
+            crate::types::unparseable_output_error("judge output", trimmed)
         ))
     })
 }
@@ -503,7 +504,7 @@ mod tests {
         match err {
             ReinError::Extract(msg) => {
                 assert!(
-                    msg.starts_with("judge JSON parse failed"),
+                    msg.starts_with("failed to parse judge output"),
                     "error message should identify itself as judge parse failure: {msg}"
                 );
             }

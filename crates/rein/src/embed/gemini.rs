@@ -168,10 +168,10 @@ impl Embedder for GeminiEmbedder {
         let (status, text_body) = send_with_retry(&self.client, &url, &self.api_key, &body).await?;
 
         if !status.is_success() {
-            let truncated: String = text_body.chars().take(500).collect();
-            return Err(ReinError::Embedding(format!(
-                "Gemini API returned {}: {truncated}",
-                status
+            return Err(ReinError::Embedding(crate::types::provider_status_error(
+                "Gemini embed API",
+                status,
+                &text_body,
             )));
         }
 
@@ -212,10 +212,10 @@ impl Embedder for GeminiEmbedder {
         let (status, text_body) = send_with_retry(&self.client, &url, &self.api_key, &body).await?;
 
         if !status.is_success() {
-            let truncated: String = text_body.chars().take(500).collect();
-            return Err(ReinError::Embedding(format!(
-                "Gemini batch API returned {}: {truncated}",
-                status
+            return Err(ReinError::Embedding(crate::types::provider_status_error(
+                "Gemini batch embed API",
+                status,
+                &text_body,
             )));
         }
 

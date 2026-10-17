@@ -350,10 +350,10 @@ impl GeminiClassifier {
         let status = resp.status();
         let text_body = resp.text().await?;
         if !status.is_success() {
-            return Err(ReinError::Extract(format!(
-                "Gemini classify API returned {}: {}",
+            return Err(ReinError::Extract(crate::types::provider_status_error(
+                "Gemini classify API",
                 status,
-                crate::types::truncate_for_error(&text_body, 500)
+                &text_body,
             )));
         }
 
@@ -416,10 +416,10 @@ impl OmlxClassifier {
                 let status = resp.status();
                 let body = resp.text().await?;
                 if !status.is_success() {
-                    return Err(ReinError::Extract(format!(
-                        "OMLX classify API returned {}: {}",
+                    return Err(ReinError::Extract(crate::types::provider_status_error(
+                        "OMLX classify API",
                         status,
-                        crate::types::truncate_for_error(&body, 500)
+                        &body,
                     )));
                 }
                 body
@@ -443,8 +443,8 @@ fn parse_verdict(content: &str) -> ReinResult<VerdictResult> {
     let cleaned = strip_fences(content);
     let v: VerdictResult = serde_json::from_str(&cleaned).map_err(|e| {
         ReinError::Extract(format!(
-            "verdict JSON parse failed: {e} (preview: {})",
-            crate::types::truncate_for_error(&cleaned, 200)
+            "{} ({e})",
+            crate::types::unparseable_output_error("merge verdict", &cleaned)
         ))
     })?;
     // Ignore/CreateNew should never carry synthesized content — clear it.

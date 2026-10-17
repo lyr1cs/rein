@@ -127,10 +127,10 @@ impl GeminiExpander {
         let text_body = resp.text().await?;
 
         if !status.is_success() {
-            return Err(ReinError::Extract(format!(
-                "Gemini expand API returned {}: {}",
+            return Err(ReinError::Extract(crate::types::provider_status_error(
+                "Gemini expand API",
                 status,
-                crate::types::truncate_for_error(&text_body, 500)
+                &text_body,
             )));
         }
 
@@ -218,10 +218,10 @@ impl OmlxExpander {
                 let status = resp.status();
                 let body = resp.text().await?;
                 if !status.is_success() {
-                    let truncated: String = body.chars().take(500).collect();
-                    return Err(ReinError::Extract(format!(
-                        "OMLX expand API returned {}: {truncated}",
-                        status
+                    return Err(ReinError::Extract(crate::types::provider_status_error(
+                        "OMLX expand API",
+                        status,
+                        &body,
                     )));
                 }
                 body

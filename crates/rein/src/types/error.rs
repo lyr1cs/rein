@@ -97,9 +97,65 @@ pub fn truncate_for_error(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
 }
 
+/// Content-free summary of a non-success provider response, for error
+/// messages that reach WARN logs and MCP clients at the default level.
+///
+/// Providers and proxies routinely echo the rejected request in the error
+/// body, so embedding even a truncated body copies prompt / memory text into
+/// every client's log on each provider hiccup. The message keeps the
+/// operation, HTTP status and body length; the body preview is emitted at
+/// DEBUG only (`REIN_LOG=debug`), which operators opt into deliberately.
+pub fn provider_status_error(op: &str, status: reqwest::StatusCode, body: &str) -> String {
+    let body_chars = body.chars().count();
+    tracing::debug!(
+        op,
+        status = status.as_u16(),
+        body_chars,
+        body_preview = %truncate_for_error(body, 500),
+        "provider returned a non-success status"
+    );
+    format!("{op} returned {status} (body {body_chars} chars; preview at debug level)")
+}
+
+/// Content-free summary of LLM output that failed to parse. Same contract as
+/// [`provider_status_error`]: generated text can quote the prompt (and thus
+/// memory content) verbatim, so it is emitted at DEBUG only.
+pub fn unparseable_output_error(what: &str, output: &str) -> String {
+    let output_chars = output.chars().count();
+    tracing::debug!(
+        what,
+        output_chars,
+        output_preview = %truncate_for_error(output, 200),
+        "LLM output failed to parse"
+    );
+    format!(
+        "failed to parse {what}: unparseable LLM output ({output_chars} chars; preview at debug level)"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_status_error_keeps_body_out_of_message() {
+        let msg = provider_status_error(
+            "Test API",
+            reqwest::StatusCode::BAD_REQUEST,
+            "echoed secret prompt",
+        );
+        assert!(!msg.contains("echoed secret prompt"), "{msg}");
+        assert!(msg.starts_with("Test API returned 400"), "{msg}");
+        assert!(msg.contains("body 20 chars"), "{msg}");
+    }
+
+    #[test]
+    fn unparseable_output_error_keeps_output_out_of_message() {
+        let msg = unparseable_output_error("dedup verdict", "密码是 hunter2");
+        assert!(!msg.contains("hunter2"), "{msg}");
+        assert!(msg.starts_with("failed to parse dedup verdict"), "{msg}");
+        assert!(msg.contains("11 chars"), "{msg}");
+    }
 
     #[test]
     fn kind_falls_back_to_not_found_variant() {
