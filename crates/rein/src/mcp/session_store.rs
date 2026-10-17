@@ -32,9 +32,13 @@
 //! Security: restore only fires for ids already in this store, and ids are
 //! server-generated UUIDs written after a successful `initialize`. rein's
 //! auth policy runs on every request before rmcp sees it, so restore never
-//! bypasses auth. The sidecar holds session ids plus the client-reported
-//! name / version / capabilities — no tokens, no memory content — and is
-//! written with mode 0600.
+//! bypasses auth: an id lets an already-authenticated caller attach to a
+//! session, exactly as a live id does today. Entries have no time-based
+//! expiry — only the count / byte budgets and an explicit client `DELETE`
+//! remove them; `created_at_unix` is recorded for operators reading the
+//! sidecar, not consulted on restore. The sidecar holds session ids plus
+//! the client-reported name / version / capabilities — no tokens, no
+//! memory content — and is written with mode 0600.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -87,8 +91,17 @@ struct Entry {
 }
 
 impl Entry {
-    /// `None` when the serialized form exceeds `MAX_SESSION_BYTES`.
+    /// `None` when the entry must not be retained: its serialized form
+    /// exceeds `MAX_SESSION_BYTES`, or its protocol version is one this
+    /// rmcp cannot replay. A replay that fails inside rmcp's restore path
+    /// answers 500 on every request and never clears the entry, so the
+    /// client would never fall back to re-initializing; not retaining it
+    /// turns that into one 404 instead.
     fn new(session: &StoredSession) -> Option<Self> {
+        let version = &session.state.initialize_params.protocol_version;
+        if !rmcp::model::ProtocolVersion::KNOWN_VERSIONS.contains(version) {
+            return None;
+        }
         let json = serde_json::to_string(session).ok()?;
         if json.len() > MAX_SESSION_BYTES {
             return None;
@@ -249,6 +262,18 @@ impl PersistentSessionStore {
     }
 }
 
+/// Client-supplied strings are bounded before they reach a log line
+/// (an entry may carry up to `MAX_SESSION_BYTES` of client info).
+fn log_field(raw: &str) -> String {
+    const MAX: usize = 64;
+    if raw.chars().count() <= MAX {
+        raw.to_owned()
+    } else {
+        let head: String = raw.chars().take(MAX).collect();
+        format!("{head}…")
+    }
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -330,7 +355,17 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+    // Make the rename durable too: without a directory fsync a power loss
+    // can bring back the previous snapshot (one extra 404, not corruption).
+    // Best effort — some filesystems refuse to fsync a directory handle.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 /// `Ok(None)` when the file does not exist; `Err` for any other read or
@@ -366,8 +401,8 @@ impl SessionStore for PersistentSessionStore {
             // observable. Session ids are not sensitive.
             tracing::info!(
                 session_id,
-                client = %state.initialize_params.client_info.name,
-                client_version = %state.initialize_params.client_info.version,
+                client = %log_field(&state.initialize_params.client_info.name),
+                client_version = %log_field(&state.initialize_params.client_info.version),
                 "mcp session restore: expired or pre-restart session found in store"
             );
         }
@@ -612,6 +647,37 @@ mod tests {
             .unwrap();
         assert!(!store.contains("small"));
         assert_eq!(store.lock().total_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_protocol_version_is_not_retained() {
+        let store = PersistentSessionStore::in_memory();
+        let future: SessionState = serde_json::from_value(serde_json::json!({
+            "initialize_params": {
+                "protocolVersion": "2099-01-01",
+                "capabilities": {},
+                "clientInfo": {"name": "time-traveller", "version": "0"}
+            }
+        }))
+        .expect("rmcp accepts unknown protocol version strings");
+        store.store("s1", &future).await.unwrap();
+        assert!(
+            !store.contains("s1"),
+            "unreplayable version is not retained"
+        );
+        assert!(store.load("s1").await.unwrap().is_none());
+
+        store.store("s2", &state("ok")).await.unwrap();
+        assert!(store.contains("s2"));
+    }
+
+    #[test]
+    fn log_field_is_bounded() {
+        assert_eq!(log_field("short"), "short");
+        let long = "x".repeat(200);
+        let bounded = log_field(&long);
+        assert_eq!(bounded.chars().count(), 65);
+        assert!(bounded.ends_with('…'));
     }
 
     #[tokio::test]
