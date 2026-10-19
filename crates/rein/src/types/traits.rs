@@ -57,8 +57,21 @@ pub trait Embedder {
     /// Used for cache keying and model-change detection.
     fn model_name(&self) -> &str;
     fn dimensions(&self) -> usize;
+    /// True when query and document vectors come from different request
+    /// roles (`input_type`), so they must never share a cache entry.
+    fn asymmetric(&self) -> bool {
+        false
+    }
+    /// Document-side embedding (what gets stored).
     async fn embed(&self, text: &str) -> ReinResult<Vec<f32>>;
     async fn embed_batch(&self, texts: &[&str]) -> ReinResult<Vec<Vec<f32>>>;
+    /// Query-side embedding; symmetric models fall back to `embed`.
+    async fn embed_query(&self, text: &str) -> ReinResult<Vec<f32>> {
+        self.embed(text).await
+    }
+    async fn embed_query_batch(&self, texts: &[&str]) -> ReinResult<Vec<Vec<f32>>> {
+        self.embed_batch(texts).await
+    }
 }
 
 /// Cloud synchronization for cross-validation.

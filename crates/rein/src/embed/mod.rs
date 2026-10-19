@@ -71,6 +71,33 @@ impl Embedder for EmbedderKind {
             Self::Mock(e) => e.embed_batch(texts).await,
         }
     }
+
+    fn asymmetric(&self) -> bool {
+        match self {
+            Self::Gemini(e) => e.asymmetric(),
+            Self::Omlx(e) => e.asymmetric(),
+            #[cfg(feature = "test-support")]
+            Self::Mock(e) => e.asymmetric(),
+        }
+    }
+
+    async fn embed_query(&self, text: &str) -> ReinResult<Vec<f32>> {
+        match self {
+            Self::Gemini(e) => e.embed_query(text).await,
+            Self::Omlx(e) => e.embed_query(text).await,
+            #[cfg(feature = "test-support")]
+            Self::Mock(e) => e.embed_query(text).await,
+        }
+    }
+
+    async fn embed_query_batch(&self, texts: &[&str]) -> ReinResult<Vec<Vec<f32>>> {
+        match self {
+            Self::Gemini(e) => e.embed_query_batch(texts).await,
+            Self::Omlx(e) => e.embed_query_batch(texts).await,
+            #[cfg(feature = "test-support")]
+            Self::Mock(e) => e.embed_query_batch(texts).await,
+        }
+    }
 }
 
 /// Create an embedder from config. Returns None if provider is "none" or API key is missing.
@@ -92,5 +119,18 @@ pub fn create_embedder(config: &crate::config::ReinConfig) -> Option<EmbedderKin
             config.embedding.dimensions,
         ))),
         Provider::None => None,
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn embed_query_defaults_to_embed() {
+        let e = EmbedderKind::Mock(MockEmbedder::with_fixed_vector(3, vec![1.0, 2.0, 3.0]));
+        assert!(!e.asymmetric());
+        assert_eq!(e.embed_query("q").await.unwrap(), vec![1.0, 2.0, 3.0]);
+        assert_eq!(e.embed_query_batch(&["a", "b"]).await.unwrap().len(), 2);
     }
 }
