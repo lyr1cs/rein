@@ -109,16 +109,7 @@ pub fn render(map: &BTreeMap<String, String>) -> String {
 /// created 0700; an existing directory keeps its permissions (the file may
 /// live in a shared directory via `REIN_SECRETS_FILE`).
 pub fn write_to(path: &Path, map: &BTreeMap<String, String>) -> io::Result<()> {
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        if !dir.exists() {
-            std::fs::create_dir_all(dir)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-            }
-        }
-    }
+    ensure_parent_dir(path)?;
     let tmp = path.with_extension(format!("env.tmp-{}", std::process::id()));
     {
         let mut opts = std::fs::OpenOptions::new();
@@ -137,6 +128,50 @@ pub fn write_to(path: &Path, map: &BTreeMap<String, String>) -> io::Result<()> {
     Ok(())
 }
 
+fn ensure_parent_dir(path: &Path) -> io::Result<()> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        if !dir.exists() {
+            std::fs::create_dir_all(dir)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Serialise read-modify-write edits across processes. `set_key` /
+/// `unset_key` each load the file, change one entry and rename a fresh copy
+/// over it; two CLI invocations interleaving those steps would silently drop
+/// the other's change. The lock is a 0600 sibling (`secrets.env.lock`) held
+/// with a blocking `flock(LOCK_EX)` until the guard drops (after the rename).
+#[cfg(unix)]
+fn lock_for_edit(path: &Path) -> io::Result<Option<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    ensure_parent_dir(path)?;
+    let lock_path = path.with_extension("env.lock");
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)?;
+    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Some(f))
+}
+
+#[cfg(not(unix))]
+fn lock_for_edit(_path: &Path) -> io::Result<Option<std::fs::File>> {
+    Ok(None)
+}
+
 /// Upsert one key. Rejects invalid names and blank values before touching the file.
 pub fn set_key(path: &Path, name: &str, value: &str) -> Result<(), String> {
     if !valid_name(name) {
@@ -151,6 +186,7 @@ pub fn set_key(path: &Path, name: &str, value: &str) -> Result<(), String> {
     if value.chars().any(|c| c == '\n' || c == '\r') {
         return Err("value must be a single line".to_string());
     }
+    let _lock = lock_for_edit(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut map = load_from(path)?;
     map.insert(name.to_string(), value.to_string());
     write_to(path, &map).map_err(|e| format!("{}: {e}", path.display()))
@@ -158,6 +194,7 @@ pub fn set_key(path: &Path, name: &str, value: &str) -> Result<(), String> {
 
 /// Remove one key; `Ok(false)` when it was not there (or the file is missing).
 pub fn unset_key(path: &Path, name: &str) -> Result<bool, String> {
+    let _lock = lock_for_edit(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut map = load_from(path)?;
     if map.remove(name).is_none() {
         return Ok(false);
@@ -169,6 +206,62 @@ pub fn unset_key(path: &Path, name: &str) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn concurrent_edits_keep_every_key() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.env");
+        set_key(&path, "SEED_KEY", "seed").unwrap();
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..12 {
+                        set_key(&path, &format!("KEY_{t}_{i}"), &format!("v{t}{i}")).unwrap();
+                    }
+                    // Interleave removals of our own keys with the other
+                    // writers' inserts: a lost update would resurrect them.
+                    for i in 0..6 {
+                        assert!(unset_key(&path, &format!("KEY_{t}_{i}")).unwrap());
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let map = load_from(&path).unwrap();
+        assert_eq!(map.get("SEED_KEY").map(String::as_str), Some("seed"));
+        for t in 0..8 {
+            for i in 0..6 {
+                assert!(
+                    !map.contains_key(&format!("KEY_{t}_{i}")),
+                    "KEY_{t}_{i} resurrected"
+                );
+            }
+            for i in 6..12 {
+                assert_eq!(
+                    map.get(&format!("KEY_{t}_{i}")).map(String::as_str),
+                    Some(format!("v{t}{i}").as_str()),
+                    "KEY_{t}_{i} lost"
+                );
+            }
+        }
+        let lock = dir.path().join("secrets.env.lock");
+        assert_eq!(
+            std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
 
     #[test]
     #[cfg(unix)]
