@@ -392,6 +392,12 @@ pub fn apply_set_provider(
     // (capability bits, unknown names, judge provider, …).
     let cfg = crate::config::ReinConfig::load_from_str(&text)
         .map_err(|e| format!("resulting config is invalid, nothing written: {e}"))?;
+    // Loading only checks the tables; resolve the surfaces this edit touches
+    // the way the runtime will (model present, endpoint known for the vendor,
+    // auth header parseable), so a config that would silently disable the
+    // surface at runtime is refused here instead.
+    resolve_affected_surfaces(&cfg, &req.surface)
+        .map_err(|e| format!("resulting config does not resolve, nothing written: {e}"))?;
 
     let mut hints = Vec::new();
     let embedding_changed = diff.iter().any(|d| d.key.starts_with("embedding."));
@@ -408,6 +414,62 @@ pub fn apply_set_provider(
         }
     }
     Ok(SetProviderOutcome { text, diff, hints })
+}
+
+/// LLM sections whose runtime resolution depends on a surface edit.
+fn llm_sections_for_surface(surface: &str) -> &'static [&'static str] {
+    match surface {
+        "extract" => &["extract", "extract.async_memory", "extract.dedup"],
+        "async_memory" => &["extract.async_memory"],
+        "intelligent_merge" => &["extract.intelligent_merge"],
+        "query_expansion" => &["query_expansion"],
+        "reranker" => &["search.llm_reranker"],
+        "resummerize" => &["resummerize"],
+        "ars" => &[
+            "ars.recall_synthesis",
+            "ars.concept_summary",
+            "ars.cold_archive",
+        ],
+        "judge" => &["ars.llm_judge", "ars.llm_judge.nightly_cron"],
+        "llm" => &[
+            "extract",
+            "extract.async_memory",
+            "extract.intelligent_merge",
+            "extract.dedup",
+            "query_expansion",
+            "search.llm_reranker",
+            "ars.recall_synthesis",
+            "ars.concept_summary",
+            "ars.cold_archive",
+            "resummerize",
+            "ars.llm_judge",
+            "ars.llm_judge.nightly_cron",
+        ],
+        _ => &[],
+    }
+}
+
+/// Run the runtime resolvers for the surfaces an edit affects.
+fn resolve_affected_surfaces(cfg: &crate::config::ReinConfig, surface: &str) -> Result<(), String> {
+    if surface == "embedding" {
+        if cfg.embedding_provider() == crate::config::Provider::Omlx {
+            let name = cfg.embedding_provider_name();
+            let preset = crate::vendors::vendor_preset(&name);
+            if crate::embed::resolve_embedding_endpoint(&name, &cfg.embedding.omlx.endpoint, preset)
+                .is_none()
+            {
+                return Err(format!(
+                    "embedding provider \"{name}\" has no default embeddings endpoint — pass --endpoint"
+                ));
+            }
+        }
+        return Ok(());
+    }
+    for section in llm_sections_for_surface(surface) {
+        cfg.resolve_llm_for(section)
+            .map_err(|e| format!("[{section}] {e}"))?;
+    }
+    Ok(())
 }
 
 /// The env var the chosen provider will read for this surface, if any.
@@ -607,6 +669,39 @@ mod tests {
         assert!(err.contains("no chat API"), "{err}");
         let err = apply_set_provider("", &req("extract", "nope")).unwrap_err();
         assert!(err.contains("invalid"), "{err}");
+    }
+
+    #[test]
+    fn edits_that_would_not_resolve_at_runtime_are_refused() {
+        // Azure has no default endpoint: chat and embeddings both need --endpoint.
+        let mut r = req("extract", "azure");
+        r.model = Some("gpt-5-mini".into());
+        let err = apply_set_provider("", &r).unwrap_err();
+        assert!(
+            err.contains("nothing written") && err.contains("endpoint"),
+            "{err}"
+        );
+        r.endpoint = Some("https://example.openai.azure.com/openai/v1".into());
+        apply_set_provider("", &r).unwrap();
+
+        let mut r = req("embedding", "azure");
+        r.model = Some("text-embedding-3-large".into());
+        let err = apply_set_provider("", &r).unwrap_err();
+        assert!(err.contains("--endpoint"), "{err}");
+        r.endpoint = Some("https://example.openai.azure.com/openai/v1".into());
+        apply_set_provider("", &r).unwrap();
+
+        // An unparseable auth header fails before anything is written.
+        let mut r = req("judge", "openai");
+        r.model = Some("gpt-5".into());
+        r.auth_header = Some("basic".into());
+        let err = apply_set_provider("", &r).unwrap_err();
+        assert!(err.contains("auth_header"), "{err}");
+
+        // A vendor without a model at any level is refused for the judge.
+        let r = req("judge", "openai");
+        let err = apply_set_provider("", &r).unwrap_err();
+        assert!(err.contains("model"), "{err}");
     }
 
     #[test]
