@@ -977,6 +977,28 @@ impl SqliteStore {
             }
         }
 
+        // Evidence already attached to a source (an earlier merge or
+        // consolidation archived its own sources there) is removed by the
+        // `memory_evidence` ON DELETE CASCADE when the source row goes, so
+        // snapshot it first and reattach it to the replacement below. The
+        // source's own self-row is skipped: the loop after the insert
+        // archives the source itself.
+        let mut inherited_evidence: Vec<MemoryEvidence> = Vec::new();
+        for id in memory_ids {
+            match self.list_all_memory_evidence_oldest_first(id) {
+                Ok(rows) => inherited_evidence.extend(
+                    rows.into_iter()
+                        .filter(|row| row.memory_id.as_deref() != Some(id.as_str())),
+                ),
+                Err(e) => {
+                    let _ = self.conn.execute_batch(
+                        "ROLLBACK TO consolidate_by_ids; RELEASE consolidate_by_ids",
+                    );
+                    return Err(e);
+                }
+            }
+        }
+
         // Delete only the specified IDs. For each id, scrub it out of related_ids
         // and episodes.memory_ids BEFORE the DELETE so we don't leave dangling refs.
         // Concepts.source_memory_ids are handled by the migration pass below (old_id
@@ -1044,13 +1066,29 @@ impl SqliteStore {
             }
         }
 
-        // Insert replacement
+        // Insert replacement. Its `related_ids` were built from the sources
+        // just deleted; drop those so the new canonical carries no dangling
+        // references.
+        let mut replacement = replacement;
+        replacement
+            .related_ids
+            .retain(|related| !memory_ids.contains(related));
         let replacement_id = replacement.id.clone();
         if let Err(e) = self.store(replacement) {
             let _ = self
                 .conn
                 .execute_batch("ROLLBACK TO consolidate_by_ids; RELEASE consolidate_by_ids");
             return Err(e);
+        }
+
+        for mut evidence in inherited_evidence {
+            evidence.canonical_id = replacement_id.clone();
+            if let Err(e) = self.add_memory_evidence(evidence) {
+                let _ = self
+                    .conn
+                    .execute_batch("ROLLBACK TO consolidate_by_ids; RELEASE consolidate_by_ids");
+                return Err(e);
+            }
         }
 
         for old_id in memory_ids {

@@ -704,12 +704,58 @@ impl SqliteStore {
                     }
                 }
 
-                // Update canonical concept
+                // Update canonical concept. Taking a duplicate's definition
+                // is a real definition change for the canonical: archive the
+                // old state in `concept_revisions`, advance `revision` /
+                // `updated_at` and clear the Cap A living summary exactly as
+                // `refine_concept` does, so no reader serves a summary of the
+                // discarded definition and a summary worker that started
+                // before the dedup fails its revision CAS instead of
+                // committing stale output. An unchanged definition keeps
+                // revision and summary (the CASE arms read the pre-update
+                // column value).
                 let sources_json = serde_json::to_string(&merged_sources).unwrap_or_default();
                 let labels_json = serde_json::to_string(&merged_labels).unwrap_or_default();
+                if best_def != canonical.definition {
+                    let rev_id = ulid::Ulid::new().to_string();
+                    let old_labels = serde_json::to_string(&canonical.labels).unwrap_or_default();
+                    let old_sources =
+                        serde_json::to_string(&canonical.source_memory_ids).unwrap_or_default();
+                    self.conn().execute(
+                        "INSERT INTO concept_revisions (id, concept_id, revision, definition, confidence, labels, source_memory_ids, episode_id, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        rusqlite::params![
+                            rev_id,
+                            canonical.id,
+                            canonical.revision,
+                            canonical.definition,
+                            canonical.confidence,
+                            old_labels,
+                            old_sources,
+                            canonical.last_episode_id,
+                            canonical.updated_at.to_rfc3339(),
+                        ],
+                    )?;
+                }
                 self.conn().execute(
-                    "UPDATE concepts SET source_memory_ids = ?1, labels = ?2, definition = ?3 WHERE id = ?4",
-                    rusqlite::params![sources_json, labels_json, best_def, canonical.id],
+                    "UPDATE concepts
+                     SET source_memory_ids = ?1,
+                         labels = ?2,
+                         definition = ?3,
+                         revision = CASE WHEN definition = ?3 THEN revision ELSE revision + 1 END,
+                         updated_at = CASE WHEN definition = ?3 THEN updated_at ELSE ?5 END,
+                         living_summary = CASE WHEN definition = ?3 THEN living_summary ELSE NULL END,
+                         living_summary_id = CASE WHEN definition = ?3 THEN living_summary_id ELSE NULL END,
+                         living_summary_updated_at = CASE WHEN definition = ?3 THEN living_summary_updated_at ELSE NULL END,
+                         living_summary_source_revision = CASE WHEN definition = ?3 THEN living_summary_source_revision ELSE NULL END
+                     WHERE id = ?4",
+                    rusqlite::params![
+                        sources_json,
+                        labels_json,
+                        best_def,
+                        canonical.id,
+                        Utc::now().to_rfc3339()
+                    ],
                 )?;
 
                 // Repoint links from dupes to canonical
@@ -729,6 +775,25 @@ impl SqliteStore {
                     self.conn().execute(
                         "UPDATE memories SET concept_ids = REPLACE(concept_ids, ?1, ?2) WHERE concept_ids LIKE ?3",
                         rusqlite::params![old_ref, new_ref, like_pat],
+                    )?;
+                    // Episodes reference concepts in a JSON array as well;
+                    // repoint the duplicate to the canonical and collapse the
+                    // double membership that creates when the episode already
+                    // listed the canonical (first occurrence keeps its slot).
+                    self.conn().execute(
+                        "UPDATE episodes
+                         SET concept_ids = (
+                            SELECT json_group_array(concept_id)
+                            FROM (
+                                SELECT CASE WHEN value = ?1 THEN ?2 ELSE value END AS concept_id,
+                                       MIN(key) AS first_key
+                                FROM json_each(episodes.concept_ids)
+                                GROUP BY concept_id
+                                ORDER BY first_key
+                            )
+                         )
+                         WHERE concept_ids LIKE ?3",
+                        rusqlite::params![dupe.id, canonical.id, like_pat],
                     )?;
                     // Delete self-referencing links created by repointing THIS dupe
                     self.conn().execute(
@@ -2205,6 +2270,180 @@ mod tests {
         );
         // Sources from both rows still merge into the survivor.
         assert_eq!(canonical.source_memory_ids.len(), 4);
+    }
+
+    /// A definition taken from a duplicate changes the canonical's
+    /// definition, so dedup must behave like `refine_concept`: archive the
+    /// old revision, bump `revision`, and clear the living summary that
+    /// described the discarded definition. A summary worker that read the
+    /// old revision then fails its CAS instead of committing stale text.
+    #[test]
+    fn test_dedup_concepts_definition_change_bumps_revision_and_clears_summary() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .create_memoir(make_memoir("arch", "Architecture"))
+            .unwrap();
+
+        let canonical_id = store
+            .add_concept(make_concept("arch", "Caching", "thin definition"))
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE concepts
+                 SET living_summary = 'summary of the thin definition',
+                     living_summary_id = 'ls-001',
+                     living_summary_updated_at = '2026-01-01T00:00:00Z',
+                     living_summary_source_revision = 1
+                 WHERE id = ?1",
+                rusqlite::params![canonical_id],
+            )
+            .unwrap();
+        let before = store.get_concept_by_id(&canonical_id).unwrap().unwrap();
+
+        let mut better = make_concept("arch", "caching", "well-supported definition");
+        better.source_memory_ids = vec!["m1".into(), "m2".into()];
+        store.add_concept(better).unwrap();
+
+        let (groups, removed) = store.dedup_concepts().unwrap();
+        assert_eq!((groups, removed), (1, 1));
+
+        let after = store.get_concept_by_id(&canonical_id).unwrap().unwrap();
+        assert_eq!(after.definition, "well-supported definition");
+        assert_eq!(after.revision, before.revision + 1);
+        assert!(after.updated_at > before.updated_at);
+        assert!(
+            after.living_summary.is_none(),
+            "stale summary must not survive"
+        );
+        assert!(after.living_summary_id.is_none());
+        assert!(after.living_summary_updated_at.is_none());
+        assert!(after.living_summary_source_revision.is_none());
+
+        let archived: (u32, String) = store
+            .conn()
+            .query_row(
+                "SELECT revision, definition FROM concept_revisions WHERE concept_id = ?1",
+                rusqlite::params![canonical_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(archived, (before.revision, "thin definition".to_string()));
+    }
+
+    /// When the canonical already carries the winning definition nothing
+    /// about it changed: revision and living summary stay.
+    #[test]
+    fn test_dedup_concepts_unchanged_definition_keeps_revision_and_summary() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .create_memoir(make_memoir("arch", "Architecture"))
+            .unwrap();
+
+        let mut entrenched = make_concept("arch", "Caching", "entrenched definition");
+        entrenched.source_memory_ids = vec!["m1".into(), "m2".into(), "m3".into()];
+        let canonical_id = store.add_concept(entrenched).unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE concepts
+                 SET living_summary = 'still valid',
+                     living_summary_id = 'ls-002',
+                     living_summary_updated_at = '2026-01-01T00:00:00Z',
+                     living_summary_source_revision = 1
+                 WHERE id = ?1",
+                rusqlite::params![canonical_id],
+            )
+            .unwrap();
+        let before = store.get_concept_by_id(&canonical_id).unwrap().unwrap();
+
+        let mut thin = make_concept("arch", "caching", "a thinly supported but much longer text");
+        thin.source_memory_ids = vec!["m4".into()];
+        store.add_concept(thin).unwrap();
+
+        store.dedup_concepts().unwrap();
+
+        let after = store.get_concept_by_id(&canonical_id).unwrap().unwrap();
+        assert_eq!(after.definition, "entrenched definition");
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.living_summary.as_deref(), Some("still valid"));
+        assert_eq!(after.living_summary_id.as_deref(), Some("ls-002"));
+        let archived: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM concept_revisions WHERE concept_id = ?1",
+                rusqlite::params![canonical_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(archived, 0);
+    }
+
+    /// Episodes reference concepts by id; a duplicate deleted by dedup must
+    /// be repointed to the canonical there too, or episode-based recall
+    /// silently loses that concept's source memories.
+    #[test]
+    fn test_dedup_concepts_repoints_episode_concept_ids() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .create_memoir(make_memoir("arch", "Architecture"))
+            .unwrap();
+        let canonical_id = store
+            .add_concept(make_concept("arch", "HNSW Index", "the index"))
+            .unwrap();
+        let dupe_id = store
+            .add_concept(make_concept("arch", "hnsw-index", "the index again"))
+            .unwrap();
+        let other_id = store
+            .add_concept(make_concept("arch", "SQLite Store", "the store"))
+            .unwrap();
+
+        let episode = |concept_ids: Vec<String>| Episode {
+            id: String::new(),
+            title: "session".to_string(),
+            outcome: String::new(),
+            decisions: vec![],
+            primary_topics: vec![],
+            tags: vec![],
+            involved_agents: vec![],
+            important_paths: vec![],
+            temporal_keywords: vec![],
+            source_session_id: None,
+            concept_ids,
+            memory_ids: vec![],
+            created_at: Utc::now(),
+        };
+        let only_dupe = store
+            .create_episode(episode(vec![dupe_id.clone()]))
+            .unwrap();
+        let both = store
+            .create_episode(episode(vec![
+                other_id.clone(),
+                dupe_id.clone(),
+                canonical_id.clone(),
+            ]))
+            .unwrap();
+        let untouched = store
+            .create_episode(episode(vec![other_id.clone()]))
+            .unwrap();
+
+        let (groups, removed) = store.dedup_concepts().unwrap();
+        assert_eq!((groups, removed), (1, 1));
+        assert!(store.get_concept_by_id(&dupe_id).unwrap().is_none());
+
+        assert_eq!(
+            store.get_episode(&only_dupe).unwrap().unwrap().concept_ids,
+            vec![canonical_id.clone()]
+        );
+        assert_eq!(
+            store.get_episode(&both).unwrap().unwrap().concept_ids,
+            vec![other_id.clone(), canonical_id.clone()],
+            "repointed membership is deduplicated and keeps its order"
+        );
+        assert_eq!(
+            store.get_episode(&untouched).unwrap().unwrap().concept_ids,
+            vec![other_id]
+        );
     }
 
     // ── v0.24 ARS — Concept Living Summary refresh trigger tests ──────────────

@@ -4794,6 +4794,72 @@ enabled = true
         assert_eq!(canonical.support_count, 3);
     }
 
+    /// Consolidating a canonical that already carries archived evidence
+    /// (A+B → C, then C+D → E) must keep A's and B's original rows under E:
+    /// deleting C cascades its `memory_evidence`, so without the carry-over
+    /// the original source text was lost on the second generation.
+    #[test]
+    fn consolidate_by_ids_atomic_keeps_evidence_inherited_from_source_canonicals() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("consolidate-nested-evidence.db");
+        let store = SqliteStore::new(&path, "text-embedding-3-large", 3).unwrap();
+
+        let first = test_memory("topic-a", "first", Importance::Medium);
+        let first_id = first.id.clone();
+        store.store(first).unwrap();
+        let first_created = store.get(&first_id).unwrap().created_at;
+        let second = test_memory("topic-a", "second", Importance::Medium);
+        let second_id = second.id.clone();
+        store.store(second).unwrap();
+
+        let merged_c = test_memory("topic-a", "merged-c", Importance::High);
+        let c_id = merged_c.id.clone();
+        store
+            .consolidate_by_ids_atomic(&[first_id.clone(), second_id.clone()], merged_c)
+            .unwrap();
+        assert_eq!(store.list_memory_evidence(&c_id, 10).unwrap().len(), 3);
+
+        let fourth = test_memory("topic-a", "fourth", Importance::Medium);
+        let fourth_id = fourth.id.clone();
+        store.store(fourth).unwrap();
+
+        let mut merged_e = test_memory("topic-a", "merged-e", Importance::High);
+        merged_e.related_ids = vec![c_id.clone(), "unrelated-keeper".to_string()];
+        let e_id = merged_e.id.clone();
+        store
+            .consolidate_by_ids_atomic(&[c_id.clone(), fourth_id.clone()], merged_e)
+            .unwrap();
+
+        let evidence = store.list_all_memory_evidence_oldest_first(&e_id).unwrap();
+        let summaries: Vec<&str> = evidence.iter().map(|row| row.summary.as_str()).collect();
+        for expected in ["first", "second", "merged-c", "fourth", "merged-e"] {
+            assert!(
+                summaries.contains(&expected),
+                "evidence for {expected} missing under E: {summaries:?}"
+            );
+        }
+        assert_eq!(evidence.len(), 5, "{summaries:?}");
+        let inherited_first = evidence
+            .iter()
+            .find(|row| row.summary == "first")
+            .expect("first survives two generations");
+        assert_eq!(inherited_first.content, "Content for first");
+        assert_eq!(inherited_first.source_topic, "topic-a");
+        assert_eq!(inherited_first.created_at, first_created);
+        assert!(
+            store.list_memory_evidence(&c_id, 10).unwrap().is_empty(),
+            "C's rows were moved, not duplicated"
+        );
+
+        let canonical = store.get(&e_id).unwrap();
+        assert_eq!(canonical.support_count, 5);
+        assert_eq!(
+            canonical.related_ids,
+            vec!["unrelated-keeper".to_string()],
+            "deleted sources are scrubbed from the replacement's related_ids"
+        );
+    }
+
     #[test]
     fn update_semantic_change_without_embedding_clears_stale_vector_row() {
         let tmp = tempfile::TempDir::new().unwrap();
