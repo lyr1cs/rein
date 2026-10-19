@@ -18,8 +18,25 @@ pub struct HnswIndex {
 }
 
 impl HnswIndex {
-    /// Open or create an HNSW index at the given path.
+    /// Open or create an HNSW index at the given path, for a caller that does
+    /// NOT hold the HNSW writer lock (doctor, recall's shared-lock read
+    /// path). A saving marker is treated as an interrupted save only when no
+    /// writer holds the lock; while a save is in progress the open fails
+    /// without touching the marker or the dirty state, so a doctor run that
+    /// overlaps a legitimate save neither forces a rebuild nor strips the
+    /// writer's interruption detection.
     pub fn open(path: &Path, dims: usize) -> ReinResult<Self> {
+        Self::open_impl(path, dims, false)
+    }
+
+    /// Open for a caller that holds the HNSW writer lock (`with_hnsw_lock`):
+    /// no save can be in progress, so a saving marker is an interrupted save
+    /// and is cleared with the index marked dirty.
+    pub fn open_locked(path: &Path, dims: usize) -> ReinResult<Self> {
+        Self::open_impl(path, dims, true)
+    }
+
+    fn open_impl(path: &Path, dims: usize, writer_lock_held: bool) -> ReinResult<Self> {
         let opts = IndexOptions {
             dimensions: dims,
             metric: MetricKind::Cos,
@@ -41,6 +58,11 @@ impl HnswIndex {
             // of `save` makes that state detectable.
             let saving = Self::saving_marker_path(path);
             if saving.exists() {
+                if !writer_lock_held && Self::writer_active(path) {
+                    return Err(ReinError::Config(
+                        "hnsw save in progress; retry later".to_string(),
+                    ));
+                }
                 Self::mark_dirty(path);
                 let _ = std::fs::remove_file(&saving);
                 return Err(ReinError::Config(
@@ -202,6 +224,43 @@ impl HnswIndex {
         path.with_extension("usearch.saving")
     }
 
+    /// The writer lock every HNSW mutator holds (`<base>.usearch.lock`,
+    /// `flock(LOCK_EX)` in `SqliteStore::with_hnsw_lock` and warmup's swap).
+    pub fn writer_lock_path(path: &Path) -> PathBuf {
+        path.with_extension("usearch.lock")
+    }
+
+    /// Whether some process currently holds the writer lock: a shared,
+    /// non-blocking `flock` probe (readers hold `LOCK_SH`, so only an
+    /// exclusive writer refuses it). Without `flock` the answer is unknown
+    /// and treated as "no writer", the pre-existing behavior.
+    fn writer_active(path: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let Ok(lock_file) = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(Self::writer_lock_path(path))
+            else {
+                return false;
+            };
+            let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+            if rc == 0 {
+                let _ = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN) };
+                return false;
+            }
+            std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            false
+        }
+    }
+
     /// Dimensions this index was created with.
     pub fn dims(&self) -> usize {
         self.dims
@@ -342,6 +401,61 @@ mod tests {
         assert!(err.contains("interrupted"), "{err}");
         assert!(HnswIndex::is_dirty(&path));
         assert!(!HnswIndex::saving_marker_path(&path).exists());
+    }
+
+    /// A marker seen while a writer holds the lock is a save in progress,
+    /// not a crash: an unlocked open must leave the marker and the dirty
+    /// state alone (codex review of the fix diff). A caller holding the
+    /// writer lock itself sees the marker as an interruption.
+    #[cfg(unix)]
+    #[test]
+    fn saving_marker_under_a_live_writer_is_not_an_interrupted_save() {
+        use std::os::unix::io::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_live_writer");
+        let mut index = HnswIndex::open(&path, 3).unwrap();
+        index.insert("mem1", &[1.0, 0.0, 0.0]).unwrap();
+        index.save().unwrap();
+        drop(index);
+        let _ = std::fs::remove_file(HnswIndex::dirty_marker_path(&path));
+
+        let writer = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(HnswIndex::writer_lock_path(&path))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(writer.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        std::fs::write(HnswIndex::saving_marker_path(&path), b"saving").unwrap();
+
+        let err = match HnswIndex::open(&path, 3) {
+            Ok(_) => panic!("open must not succeed mid-save"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("in progress"), "{err}");
+        assert!(
+            HnswIndex::saving_marker_path(&path).exists(),
+            "the writer's marker is left in place"
+        );
+        assert!(
+            !HnswIndex::is_dirty(&path),
+            "a healthy index is not marked dirty"
+        );
+
+        // The lock holder itself (with_hnsw_lock) treats the marker as a
+        // crash: nobody else can be saving.
+        let err = match HnswIndex::open_locked(&path, 3) {
+            Ok(_) => panic!("open_locked must fail on a marker"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("interrupted"), "{err}");
+        assert!(HnswIndex::is_dirty(&path));
+        assert!(!HnswIndex::saving_marker_path(&path).exists());
+        let _ = unsafe { libc::flock(writer.as_raw_fd(), libc::LOCK_UN) };
     }
 
     #[test]

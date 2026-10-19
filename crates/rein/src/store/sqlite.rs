@@ -2849,7 +2849,7 @@ impl SqliteStore {
             }
         }
 
-        let mut index = match crate::store::hnsw::HnswIndex::open(&hnsw_path, dims) {
+        let mut index = match crate::store::hnsw::HnswIndex::open_locked(&hnsw_path, dims) {
             Ok(index) => index,
             Err(e) => {
                 tracing::warn!("HNSW index open failed: {e}");
