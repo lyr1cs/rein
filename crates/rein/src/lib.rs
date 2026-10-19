@@ -49,6 +49,8 @@ pub mod proxy;
 pub mod search;
 pub mod service;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod stub_http;
 pub mod sync;
 pub mod types;
 pub mod vendors;
