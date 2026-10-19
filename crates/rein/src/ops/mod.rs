@@ -1181,8 +1181,17 @@ pub async fn ingest_session_report(
         schema_version: session.schema_version,
         artifact_kind: session.artifact_kind.clone(),
         session_id: session.session_id.clone(),
-        title: session.title.clone(),
-        summary: session.summary.clone(),
+        // Title and summary are operator/agent-supplied free text and are
+        // served back verbatim by the artifact endpoints: redact them like
+        // the transcript (2026-10 audit U11-01).
+        title: session
+            .title
+            .as_deref()
+            .map(crate::extract::hooks::parsing::redact_secrets),
+        summary: session
+            .summary
+            .as_deref()
+            .map(crate::extract::hooks::parsing::redact_secrets),
         source_agent: session
             .source_agent
             .clone()
@@ -1584,8 +1593,17 @@ pub fn queue_ingest_session(
         schema_version: session.schema_version,
         artifact_kind: session.artifact_kind.clone(),
         session_id: session.session_id.clone(),
-        title: session.title.clone(),
-        summary: session.summary.clone(),
+        // Title and summary are operator/agent-supplied free text and are
+        // served back verbatim by the artifact endpoints: redact them like
+        // the transcript (2026-10 audit U11-01).
+        title: session
+            .title
+            .as_deref()
+            .map(crate::extract::hooks::parsing::redact_secrets),
+        summary: session
+            .summary
+            .as_deref()
+            .map(crate::extract::hooks::parsing::redact_secrets),
         source_agent: session
             .source_agent
             .clone()
@@ -1602,6 +1620,9 @@ pub fn queue_ingest_session(
     };
     let artifact_id = store.store_session_artifact(artifact)?;
     let mut sanitized_session = session.clone();
+    sanitized_session.title = sanitized_session
+        .title
+        .map(|s| crate::extract::hooks::parsing::redact_secrets(&s));
     sanitized_session.summary = sanitized_session
         .summary
         .map(|s| crate::extract::hooks::parsing::redact_secrets(&s));
@@ -2310,15 +2331,36 @@ pub async fn run_upgrade(
                     if let Some(old) = best_match {
                         let sim = extract::similarity(&old.content, &new_mem.content);
                         if sim > 0.3 {
+                            // The extraction call took seconds; the row may
+                            // have been edited meanwhile. Verify under
+                            // BEGIN IMMEDIATE and build the enrichment on the
+                            // CURRENT row so a stale snapshot never rolls
+                            // back a committed edit (2026-10 audit U11-02).
+                            let conn = store.conn();
+                            if conn.execute_batch("BEGIN IMMEDIATE").is_err() {
+                                continue;
+                            }
+                            let fresh = store.get(&old.id).ok().filter(|fresh| {
+                                fresh.content == old.content && fresh.updated_at == old.updated_at
+                            });
+                            let Some(fresh) = fresh else {
+                                let _ = conn.execute_batch("ROLLBACK");
+                                report.preview_lines.push(format!(
+                                    "  skipped {}: changed while the LLM ran",
+                                    old.id
+                                ));
+                                continue;
+                            };
                             if new_mem.quality_confidence < 0.2 {
-                                let _ = store.conn().execute(
+                                let _ = conn.execute(
                                     "UPDATE memories SET status = 'deprecated' WHERE id = ?1",
                                     rusqlite::params![old.id],
                                 );
+                                let _ = conn.execute_batch("COMMIT");
                                 report.deprecated += 1;
                                 continue;
                             }
-                            let mut enriched = old.clone();
+                            let mut enriched = fresh;
                             enriched.topic = new_mem.topic.clone();
                             enriched.summary = new_mem.summary.clone();
                             enriched.keywords = new_mem.keywords.clone();
@@ -2328,8 +2370,14 @@ pub async fn run_upgrade(
                                 enriched.decay_lambda =
                                     config.decay.base_lambda * imp.decay_factor();
                             }
-                            if store.update(&enriched).is_ok() {
-                                report.enriched += 1;
+                            match store.update(&enriched) {
+                                Ok(()) => {
+                                    let _ = conn.execute_batch("COMMIT");
+                                    report.enriched += 1;
+                                }
+                                Err(_) => {
+                                    let _ = conn.execute_batch("ROLLBACK");
+                                }
                             }
                         }
                     }

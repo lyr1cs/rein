@@ -304,6 +304,88 @@ auto_memory_enabled = false
 }
 
 #[test]
+fn test_ingest_session_redacts_artifact_title_and_summary() {
+    // 2026-10 audit U11-01: title / summary are served back verbatim by the
+    // artifact endpoints, so they must be redacted like the transcript on
+    // both the synchronous and the queued ingest paths.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ingest-redact-meta.db");
+    let toml_str = format!(
+        r#"
+[database]
+path = "{}"
+
+[extract]
+provider = "none"
+
+[sync]
+supermemory_enabled = false
+auto_memory_enabled = false
+"#,
+        db_path.display()
+    );
+    let config = rein::config::ReinConfig::load_from_str(&toml_str).unwrap();
+    let session = rein::types::SessionIngest {
+        schema_version: 1,
+        artifact_kind: "session".to_string(),
+        session_id: Some("meta-redact".to_string()),
+        title: Some("deploy notes token=super-secret-value".to_string()),
+        started_at: None,
+        ended_at: None,
+        summary: Some("rotated api_key=sk-test-abcdefghijklmnopqrstuvwxyz123456".to_string()),
+        source_agent: None,
+        source_label: None,
+        compact_summary: None,
+        tool_outputs: vec![],
+        turns: vec![rein::types::SessionTurn {
+            role: "user".to_string(),
+            content: "Deploy completed after the key rotation.".to_string(),
+        }],
+    };
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _ = rt
+        .block_on(rein::ops::ingest_session_report(
+            &config,
+            &session,
+            Some("test-ingest"),
+            false,
+        ))
+        .unwrap();
+    rein::ops::queue_ingest_session(&config, &session, Some("test-ingest"), false).unwrap();
+
+    let store = config.open_store().unwrap();
+    let mut stmt = store
+        .conn()
+        .prepare("SELECT title, summary FROM session_artifacts")
+        .unwrap();
+    let rows: Vec<(Option<String>, Option<String>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+    assert_eq!(
+        rows.len(),
+        2,
+        "sync + queued paths each persist an artifact"
+    );
+    for (title, summary) in rows {
+        let title = title.unwrap_or_default();
+        let summary = summary.unwrap_or_default();
+        assert!(!title.contains("super-secret-value"), "{title}");
+        assert!(
+            !summary.contains("abcdefghijklmnopqrstuvwxyz123456"),
+            "{summary}"
+        );
+        assert!(title.contains("REDACTED"), "{title}");
+        assert!(summary.contains("REDACTED"), "{summary}");
+    }
+}
+
+#[test]
 fn test_recall_uses_supplied_request_id_for_feedback_event() {
     let store = SqliteStore::in_memory().unwrap();
     let memory = make_memory(
