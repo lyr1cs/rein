@@ -3513,7 +3513,11 @@ fn resolve_llm_for_impl(
         // existing v0.26.x slow-channel sections (`ars.*`,
         // `resummerize`, `async_memory`), "inherit" historically meant
         // "fall back to `[extract].provider`". Preserve that semantic
-        // for back-compat by walking `[extract]`.
+        // for back-compat by walking `[extract]`. `extract.intelligent_merge`
+        // is deliberately NOT in this group: its v0.26.x fallback is
+        // `[query_expansion]` (walked below, after level 3), and routing it
+        // through `[extract]` first disabled the merge classifier whenever
+        // extraction was `"none"` while expansion had a working provider.
         if matches!(
             sec,
             LlmSection::ExtractAsyncMemory
@@ -3521,7 +3525,6 @@ fn resolve_llm_for_impl(
                 | LlmSection::ArsConceptSummary
                 | LlmSection::ArsColdArchive
                 | LlmSection::Resummerize
-                | LlmSection::ExtractIntelligentMerge
         ) {
             // Synthesize a level-1 result by reading `[extract]` directly.
             let extract_explicit = section_explicit(cfg, LlmSection::Extract);
@@ -5047,6 +5050,40 @@ mod v15_provider_tests {
         assert_eq!(Provider::from_str("google"), Provider::Google);
         assert_eq!(Provider::from_str("none"), Provider::None);
         assert_eq!(Provider::from_str("bogus"), Provider::None);
+    }
+
+    #[test]
+    fn intelligent_merge_inherit_follows_query_expansion_not_extract() {
+        // No `[llm]`; extraction switched off; expansion on a local vendor.
+        let cfg = ReinConfig::load_from_str(
+            "[extract]\nprovider = \"none\"\n\
+             [query_expansion]\nprovider = \"omlx\"\n\
+             [query_expansion.omlx]\nmodel = \"qe-local\"\nendpoint = \"http://localhost:8000/v1\"\n\
+             [intelligent_merge]\nenabled = true\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_llm_for("extract.intelligent_merge").unwrap();
+        assert_eq!(r.provider, Provider::Omlx, "{r:?}");
+        assert_eq!(r.model, "qe-local");
+
+        // Extraction and expansion on different concrete providers: the
+        // documented fallback is expansion, not extraction.
+        let cfg = ReinConfig::load_from_str(
+            "[extract]\nprovider = \"google\"\n\
+             [extract.google]\nmodel = \"gemini-extract\"\n\
+             [query_expansion]\nprovider = \"omlx\"\n\
+             [query_expansion.omlx]\nmodel = \"qe-local\"\nendpoint = \"http://localhost:8000/v1\"\n\
+             [intelligent_merge]\nenabled = true\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_llm_for("extract.intelligent_merge").unwrap();
+        assert_eq!(r.provider, Provider::Omlx, "{r:?}");
+        assert_eq!(r.model, "qe-local");
+
+        // The other slow-channel sections keep their `[extract]` walk.
+        let r = cfg.resolve_llm_for("resummerize").unwrap();
+        assert_eq!(r.provider, Provider::Google, "{r:?}");
+        assert_eq!(r.model, "gemini-extract");
     }
 
     #[test]
