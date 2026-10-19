@@ -177,7 +177,7 @@ mod tests {
         assert_eq!(load_from(&path).unwrap()["OPENAI_API_KEY"], "sk-2");
         assert!(unset_key(&path, "OPENAI_API_KEY").unwrap());
         assert!(!unset_key(&path, "OPENAI_API_KEY").unwrap());
-        assert!(load_from(&path).unwrap().get("OPENAI_API_KEY").is_none());
+        assert!(!load_from(&path).unwrap().contains_key("OPENAI_API_KEY"));
         assert_eq!(load_from(&path).unwrap()["GEMINI_API_KEY"], "g-1");
     }
 

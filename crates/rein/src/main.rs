@@ -215,6 +215,7 @@ enum HookAction {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // CLI parse tree; built once
 enum ProvidersAction {
     /// Show every surface's provider/model, the keys they need, and the vector-index stamp
     Status {

@@ -697,10 +697,7 @@ pub fn handle_providers_vendors(json: bool) -> anyhow::Result<()> {
         println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(());
     }
-    println!(
-        "{:<12} {:<4} {:<4} {:<22} {}",
-        "vendor", "chat", "emb", "key env", "default endpoint"
-    );
+    println!("vendor       chat emb  key env                default endpoint");
     for p in rein::vendors::VENDOR_PRESETS {
         println!(
             "{:<12} {:<4} {:<4} {:<22} {}",
