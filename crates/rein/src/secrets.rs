@@ -105,14 +105,18 @@ pub fn render(map: &BTreeMap<String, String>) -> String {
     out
 }
 
-/// Write the map atomically with mode 0600 (directory created 0700 if missing).
+/// Write the map atomically with mode 0600. A missing parent directory is
+/// created 0700; an existing directory keeps its permissions (the file may
+/// live in a shared directory via `REIN_SECRETS_FILE`).
 pub fn write_to(path: &Path, map: &BTreeMap<String, String>) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        if !dir.exists() {
+            std::fs::create_dir_all(dir)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+            }
         }
     }
     let tmp = path.with_extension(format!("env.tmp-{}", std::process::id()));
@@ -165,6 +169,37 @@ pub fn unset_key(path: &Path, name: &str) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn write_keeps_existing_directory_permissions_and_creates_missing_ones_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut map = BTreeMap::new();
+        map.insert("OPENAI_API_KEY".to_string(), "sk-1".to_string());
+        write_to(&shared.join("secrets.env"), &map).unwrap();
+        assert_eq!(
+            std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::metadata(shared.join("secrets.env"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let fresh = dir.path().join("fresh").join("nested");
+        write_to(&fresh.join("secrets.env"), &map).unwrap();
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
 
     #[test]
     fn set_key_creates_updates_and_unset_removes() {

@@ -2949,7 +2949,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
             max_input_chars: None,
             table: "extract",
             google_model: nonempty(&cfg.extract.google.model),
-            google_api_key_env: Some("GEMINI_API_KEY"),
+            google_api_key_env: None, // inherited from [llm.google] (default GEMINI_API_KEY)
             google_endpoint: nonempty(&cfg.extract.google.endpoint),
             google_max_input_chars: Some(cfg.extract.google.max_input_chars),
             omlx_model: nonempty(&cfg.extract.omlx.model),
@@ -2978,7 +2978,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                 // `[extract.{provider}]` (matches the v0.26.x semantic
                 // implemented in `extract/llm.rs::create_memory_worker_extractor`).
                 google_model: nonempty(&cfg.extract.google.model),
-                google_api_key_env: Some("GEMINI_API_KEY"),
+                google_api_key_env: None, // inherited from [llm.google] (default GEMINI_API_KEY)
                 google_endpoint: nonempty(&cfg.extract.google.endpoint),
                 google_max_input_chars: Some(cfg.extract.google.max_input_chars),
                 omlx_model: nonempty(&cfg.extract.omlx.model),
@@ -3006,7 +3006,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                 max_input_chars: None,
                 table: "intelligent_merge",
                 google_model: nonempty(&cfg.intelligent_merge.google.model),
-                google_api_key_env: Some("GEMINI_API_KEY"),
+                google_api_key_env: None, // inherited from [llm.google] (default GEMINI_API_KEY)
                 google_endpoint: nonempty(&cfg.intelligent_merge.google.endpoint),
                 google_max_input_chars: None,
                 omlx_model: nonempty(&cfg.intelligent_merge.omlx.model),
@@ -3033,7 +3033,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
             max_input_chars: None,
             table: "query_expansion",
             google_model: nonempty(&cfg.query_expansion.google.model),
-            google_api_key_env: Some("GEMINI_API_KEY"),
+            google_api_key_env: None, // inherited from [llm.google] (default GEMINI_API_KEY)
             google_endpoint: nonempty(&cfg.query_expansion.google.endpoint),
             google_max_input_chars: None,
             omlx_model: nonempty(&cfg.query_expansion.omlx.model),
@@ -3058,7 +3058,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                 max_input_chars: None,
                 table: "query_expansion",
                 google_model: nonempty(&cfg.query_expansion.google.model),
-                google_api_key_env: Some("GEMINI_API_KEY"),
+                google_api_key_env: None, // inherited from [llm.google] (default GEMINI_API_KEY)
                 google_endpoint: nonempty(&cfg.query_expansion.google.endpoint),
                 google_max_input_chars: None,
                 omlx_model: nonempty(&cfg.query_expansion.omlx.model),
@@ -3086,7 +3086,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                 max_input_chars: None,
                 table: "extract",
                 google_model: nonempty(&cfg.extract.google.model),
-                google_api_key_env: Some("GEMINI_API_KEY"),
+                google_api_key_env: None, // inherited from [llm.google] (default GEMINI_API_KEY)
                 google_endpoint: nonempty(&cfg.extract.google.endpoint),
                 google_max_input_chars: Some(cfg.extract.google.max_input_chars),
                 omlx_model: nonempty(&cfg.extract.omlx.model),
@@ -3110,7 +3110,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                 max_input_chars: None,
                 table: "extract",
                 google_model: nonempty(&cfg.extract.google.model),
-                google_api_key_env: Some("GEMINI_API_KEY"),
+                google_api_key_env: None, // inherited from [llm.google] (default GEMINI_API_KEY)
                 google_endpoint: nonempty(&cfg.extract.google.endpoint),
                 google_max_input_chars: Some(cfg.extract.google.max_input_chars),
                 omlx_model: nonempty(&cfg.extract.omlx.model),
@@ -3137,13 +3137,8 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                 max_input_chars: j.max_input_chars,
                 table: "ars.llm_judge",
                 google_model: j.google.model.as_deref().and_then(nonempty),
-                google_api_key_env: Some(
-                    j.google
-                        .api_key_env
-                        .as_deref()
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or("GEMINI_API_KEY"),
-                ),
+                // Unset → inherit `[llm.google].api_key_env` (default GEMINI_API_KEY).
+                google_api_key_env: j.google.api_key_env.as_deref().and_then(nonempty),
                 google_endpoint: j.google.endpoint.as_deref().and_then(nonempty),
                 google_max_input_chars: j.google.max_input_chars,
                 omlx_model: j.omlx.model.as_deref().and_then(nonempty),
@@ -5052,6 +5047,61 @@ mod v15_provider_tests {
         assert_eq!(Provider::from_str("google"), Provider::Google);
         assert_eq!(Provider::from_str("none"), Provider::None);
         assert_eq!(Provider::from_str("bogus"), Provider::None);
+    }
+
+    #[test]
+    fn llm_google_api_key_env_is_inherited_by_explicit_google_sections() {
+        let cfg = ReinConfig::load_from_str(
+            r#"
+[llm]
+provider = "google"
+[llm.google]
+model = "gemini-3.6-flash"
+api_key_env = "CUSTOM_GEMINI_KEY"
+
+[extract]
+provider = "google"
+
+[ars.llm_judge]
+enabled = true
+provider = "google"
+"#,
+        )
+        .unwrap();
+        for section in [
+            "extract",
+            "ars.llm_judge",
+            "ars.llm_judge.nightly_cron",
+            "query_expansion",
+        ] {
+            let r = cfg.resolve_llm_for(section).unwrap();
+            assert_eq!(r.provider, Provider::Google, "{section}");
+            assert_eq!(
+                r.api_key_env.as_deref(),
+                Some("CUSTOM_GEMINI_KEY"),
+                "{section}"
+            );
+        }
+        // A judge-table override still wins over the global one.
+        let cfg = ReinConfig::load_from_str(
+            r#"
+[llm.google]
+api_key_env = "CUSTOM_GEMINI_KEY"
+[ars.llm_judge]
+enabled = true
+provider = "google"
+[ars.llm_judge.google]
+model = "gemini-3.6-flash"
+api_key_env = "JUDGE_KEY"
+"#,
+        )
+        .unwrap();
+        let r = cfg.resolve_llm_for("ars.llm_judge").unwrap();
+        assert_eq!(r.api_key_env.as_deref(), Some("JUDGE_KEY"));
+        // Nothing set anywhere: the compiled default survives.
+        let cfg = ReinConfig::load_from_str("[extract]\nprovider = \"google\"\n").unwrap();
+        let r = cfg.resolve_llm_for("extract").unwrap();
+        assert_eq!(r.api_key_env.as_deref(), Some("GEMINI_API_KEY"));
     }
 
     #[test]

@@ -716,6 +716,13 @@ pub fn handle_providers_vendors(json: bool) -> anyhow::Result<()> {
                 .unwrap_or("(set --endpoint)")
         );
     }
+    for p in rein::vendors::VENDOR_PRESETS {
+        if let (Some(chat), Some(emb)) = (p.chat_endpoint, p.embeddings_endpoint) {
+            if chat != emb {
+                println!("note: {} embeddings go to {} (chat: {})", p.name, emb, chat);
+            }
+        }
+    }
     println!("\nuse: rein providers set <surface> --provider <vendor> --model <model>   then   rein keys set <KEY_ENV>");
     Ok(())
 }

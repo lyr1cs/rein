@@ -190,11 +190,18 @@ export function useMemoirExport(name: string | null) {
   });
 }
 
+/**
+ * Provider wiring report. The probe variant calls every configured vendor,
+ * so it never refetches on its own: no focus / reconnect refetch, never stale.
+ * The AI Keys page runs probes as a one-shot action (see `Providers.tsx`).
+ */
 export function useProviders(probe = false) {
   return useQuery({
     queryKey: ['providers', probe],
     queryFn: () => apiGet<ProviderStatusReport>(`/api/providers${probe ? '?probe=true' : ''}`),
     refetchInterval: false,
-    staleTime: 1000,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+    staleTime: probe ? Infinity : 1000,
   });
 }

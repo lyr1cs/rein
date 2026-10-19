@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { apiPost } from '../api/client';
+import { apiGet, apiPost } from '../api/client';
 import type { ProviderStatusReport } from '../api/types';
 import { useProviders } from '../hooks/useApi';
 import FlowDiagram from './providers/FlowDiagram';
@@ -23,8 +23,11 @@ function describeError(error: unknown): string {
 }
 
 export default function Providers() {
-  const [probe, setProbe] = useState(false);
-  const { data, isLoading, error, refetch, isFetching } = useProviders(probe);
+  // Probing calls every vendor, so it is a one-shot action that writes into
+  // the plain query's cache instead of a query that could refetch by itself.
+  const { data, isLoading, error, refetch } = useProviders(false);
+  const [probing, setProbing] = useState(false);
+  const [probeError, setProbeError] = useState<string | null>(null);
   const queryClient = useQueryClient();
   const [selectedRole, setSelectedRole] = useState<string | null>(null);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
@@ -76,8 +79,16 @@ export default function Providers() {
   };
 
   const runProbe = async () => {
-    setProbe(true);
-    await queryClient.invalidateQueries({ queryKey: ['providers', true] });
+    setProbing(true);
+    setProbeError(null);
+    try {
+      const fresh = await apiGet<ProviderStatusReport>('/api/providers?probe=true');
+      queryClient.setQueryData(['providers', false], fresh);
+    } catch (err) {
+      setProbeError(describeError(err));
+    } finally {
+      setProbing(false);
+    }
   };
 
   if (isLoading) {
@@ -108,11 +119,13 @@ export default function Providers() {
         </div>
         <div className="flex items-center gap-2">
           <button type="button" onClick={() => refetch()} className="rounded-lg border border-[var(--border)] px-3 py-1.5 text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-primary)]">Refresh</button>
-          <button type="button" onClick={runProbe} disabled={isFetching} className="rounded-lg border border-[var(--accent)]/30 bg-[var(--accent)]/10 px-3 py-1.5 text-xs text-[var(--accent)] hover:bg-[var(--accent)]/15 disabled:opacity-50">
-            {isFetching && probe ? 'Testing…' : 'Test keys'}
+          <button type="button" onClick={runProbe} disabled={probing} className="rounded-lg border border-[var(--accent)]/30 bg-[var(--accent)]/10 px-3 py-1.5 text-xs text-[var(--accent)] hover:bg-[var(--accent)]/15 disabled:opacity-50">
+            {probing ? 'Testing…' : 'Test keys'}
           </button>
         </div>
       </div>
+
+      {probeError && <div className="rounded-lg border border-[var(--hot)]/20 bg-[var(--hot)]/10 px-3 py-2 text-xs text-[var(--hot)]">{probeError}</div>}
 
       <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-secondary)] p-4">
         <div className="mb-2 text-xs uppercase tracking-wider text-[var(--text-muted)]">How rein uses AI</div>
