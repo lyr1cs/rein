@@ -1071,16 +1071,36 @@ pub async fn llm_refine_merged_content(
     let Some(extractor) = create_extractor(config) else {
         return Ok(None);
     };
+    let budget = resolve_max_input_for_section_kind(config, "extract", &extractor);
+    refine_merged_with(&extractor, content, budget).await
+}
 
-    let input = content.chars().take(4000).collect::<String>();
-    let prepared = prepare_input_for_kind(config, &input, &extractor);
+/// `budget` is the provider's input cap in chars (0 = unlimited). A canonical
+/// that does not fit is left as merged: the synthesis replaces the whole
+/// memory, so sending only a head (the old path cut at 4,000 chars) dropped
+/// every fact past the cut from the canonical. The merged text stays
+/// searchable and the resummerize path handles over-cap canonicals.
+async fn refine_merged_with(
+    extractor: &ExtractorKind,
+    content: &str,
+    budget: usize,
+) -> ReinResult<Option<String>> {
+    let chars = content.chars().count();
+    if budget > 0 && chars > budget {
+        tracing::debug!(
+            chars,
+            budget,
+            "merge_refinement: canonical exceeds the provider input budget, leaving it as merged"
+        );
+        return Ok(None);
+    }
     // Prose mode — `MERGE_REFINEMENT_SYSTEM_PROMPT` explicitly instructs
     // "Return only the synthesized text, no JSON, no preamble". Using
     // `raw_with_prompt` here would force the backend into JSON mode and
     // wrap the synthesized canonical in a JSON envelope (same class of
     // bug the 2026-04-23 resummerize eval uncovered).
     let refined = extractor
-        .raw_text_with_prompt(MERGE_REFINEMENT_SYSTEM_PROMPT, &prepared)
+        .raw_text_with_prompt(MERGE_REFINEMENT_SYSTEM_PROMPT, content)
         .await?;
 
     let trimmed = refined.trim().to_string();
@@ -1278,14 +1298,18 @@ fn prepare_with_context(config: &ReinConfig, text: &str) -> String {
     }
 }
 
-/// Like `prepare_with_context` but for a specific extractor kind.
-fn prepare_with_context_for_kind(
+/// Like `prepare_with_context` but for a specific consumer section and
+/// extractor kind, so the truncation budget comes from the provider that
+/// will actually receive the text (the async worker may run a different
+/// provider, with a different `max_input_chars`, than `[extract]`).
+fn prepare_with_context_for_section_kind(
     config: &ReinConfig,
+    section: &str,
     text: &str,
     extractor: &ExtractorKind,
 ) -> String {
     let prefix = build_context_prefix_if_enabled(config, text);
-    let max_chars = resolve_max_input_for_kind(config, extractor);
+    let max_chars = resolve_max_input_for_section_kind(config, section, extractor);
     if max_chars > 0 {
         let headroom = max_chars.saturating_sub(prefix.chars().count());
         let truncated: String = text.chars().take(headroom).collect();
@@ -1471,7 +1495,8 @@ pub async fn extract_with_worker_preference(
     pattern_threshold: u32,
 ) -> Vec<ExtractedMemory> {
     if let Some(extractor) = create_memory_worker_extractor(config) {
-        let contextual_input = prepare_with_context_for_kind(config, text, &extractor);
+        let contextual_input =
+            prepare_with_context_for_section_kind(config, "extract.async_memory", text, &extractor);
         match extractor.extract(&contextual_input).await {
             Ok(memories) if !memories.is_empty() => return memories,
             Ok(_) => {}
@@ -1832,6 +1857,58 @@ pub fn strip_code_fences(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn refine_merged_skips_over_budget_canonicals_and_sends_the_whole_text() {
+        let content = format!(
+            "base fact\n[merged from a]\n{}\nunique tail fact",
+            "y".repeat(5_000)
+        );
+        let (mock, probe) = MockExtractor::with_fixed_response_and_probe("synthesized");
+        let ex = ExtractorKind::Mock(mock);
+        // Over budget: untouched, and the LLM is never called.
+        assert!(refine_merged_with(&ex, &content, 4_000)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(probe.last_text_prompt().is_none());
+        // Within budget (0 = unlimited): the complete canonical is sent, tail included.
+        assert_eq!(
+            refine_merged_with(&ex, &content, 0)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("synthesized")
+        );
+        let sent = probe.last_text_prompt().unwrap();
+        assert!(sent.ends_with("unique tail fact"), "tail was cut");
+        assert_eq!(sent.chars().count(), content.chars().count());
+    }
+
+    #[test]
+    fn quick_worker_budget_comes_from_the_async_memory_section() {
+        let cfg = ReinConfig::load_from_str(
+            "[extract]\nprovider = \"omlx\"\n\
+             [extract.omlx]\nmodel = \"local\"\nendpoint = \"http://localhost:8000/v1\"\nmax_input_chars = 16000\n\
+             [async_memory]\nprovider = \"google\"\n\
+             [extract.google]\nmodel = \"gemini-x\"\napi_key = \"AIzaSyTESTKEY00000000003f2a\"\nmax_input_chars = 100000\n",
+        )
+        .unwrap();
+        let worker = create_memory_worker_extractor(&cfg).expect("google worker");
+        assert!(matches!(worker, ExtractorKind::Gemini(_)));
+        // The main section's budget is the OMLX one …
+        assert_eq!(resolve_max_input_for_kind(&cfg, &worker), 16_000);
+        // … the worker's own section carries the Google budget.
+        assert_eq!(
+            resolve_max_input_for_section_kind(&cfg, "extract.async_memory", &worker),
+            100_000
+        );
+        let text = "z".repeat(20_000);
+        let prepared =
+            prepare_with_context_for_section_kind(&cfg, "extract.async_memory", &text, &worker);
+        assert_eq!(prepared.chars().count(), 20_000);
+    }
 
     #[test]
     fn test_parse_json_array() {

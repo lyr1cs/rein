@@ -129,6 +129,14 @@ struct RecentEventEntry {
     /// rows default to `false` (Quick), which only ever loosens suppression.
     #[serde(default)]
     is_full: bool,
+    /// 2026-10 audit U09-02: sha256 of the LAST 2000 normalized chars. Two
+    /// long events sharing the 2000-char preview but ending differently
+    /// (same diagnostic preamble, different conclusion, equal length) were
+    /// suppressed as duplicates because only the preview was compared. A
+    /// differing tail proves distinct content. `#[serde(default)]` → legacy
+    /// rows are "" and never block suppression.
+    #[serde(default)]
+    tail_fingerprint: String,
     /// v1.2 audit F2: char count of the FULL normalized event text. Lets the
     /// suppressor distinguish "same event re-captured" (suppress) from "the
     /// same growing document, now longer" (prefix EXTENSION — new content the
@@ -912,8 +920,27 @@ async fn process_merge_refinement_job(
 
     let refined = crate::extract::llm::llm_refine_merged_content(config, &memory.content).await?;
     if let Some(new_content) = refined {
-        if new_content != memory.content {
-            let mut updated = memory;
+        if new_content == memory.content {
+            return Ok(1);
+        }
+        // The synthesis took seconds. A merge, edit or supersession that
+        // landed meanwhile holds facts and metadata this synthesis never saw,
+        // and a whole-record update from the stale snapshot would erase them.
+        // Re-read and compare inside BEGIN IMMEDIATE (the same lost-update
+        // guard `rein_update` uses) so no writer can slip in between the
+        // check and the write; on a mismatch drop the response — the newer
+        // merge queued its own refinement.
+        let conn = store.conn();
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let applied = (|| -> anyhow::Result<bool> {
+            let Ok(fresh) = store.get(&job.winner_id) else {
+                return Ok(false);
+            };
+            if fresh.content != memory.content || fresh.updated_at != memory.updated_at {
+                return Ok(false);
+            }
+            // Carry every CURRENT field; only the synthesized text changes.
+            let mut updated = fresh;
             updated.content = new_content;
             updated.summary = updated
                 .content
@@ -922,7 +949,24 @@ async fn process_merge_refinement_job(
                 .collect();
             updated.updated_at = chrono::Utc::now();
             store.update(&updated)?;
-            tracing::info!("merge_refinement: synthesized memory {}", job.winner_id);
+            Ok(true)
+        })();
+        match applied {
+            Ok(true) => {
+                conn.execute_batch("COMMIT")?;
+                tracing::info!("merge_refinement: synthesized memory {}", job.winner_id);
+            }
+            Ok(false) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                tracing::debug!(
+                    "merge_refinement: winner {} changed during synthesis, skipping",
+                    job.winner_id
+                );
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
         }
     }
     Ok(1)
@@ -2152,8 +2196,18 @@ fn suppress_duplicate_event(
 
     let normalized = normalized_event_text(source, source_query, text);
     let normalized_len = normalized.chars().count();
-    let preview: String = normalized.chars().take(2000).collect();
+    const PREVIEW_CHARS: usize = 2000;
+    let preview: String = normalized.chars().take(PREVIEW_CHARS).collect();
     let fingerprint = sha256_hex(&preview);
+    let tail: String = normalized
+        .chars()
+        .rev()
+        .take(PREVIEW_CHARS)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let tail_fingerprint = sha256_hex(&tail);
     // Cross-agent exact-duplicate fingerprint: hash the RAW (already
     // secret-redacted) event text verbatim — NOT the lossy
     // `normalized_event_text`, which lowercases and strips punctuation /
@@ -2224,6 +2278,16 @@ fn suppress_duplicate_event(
                 saw_extension = true;
                 continue;
             }
+            // Both texts run past the preview and end differently: the
+            // preview cannot tell them apart, the full fingerprints already
+            // differ, so this is distinct content, not a re-capture.
+            if !item.tail_fingerprint.is_empty()
+                && item.normalized_len > PREVIEW_CHARS
+                && normalized_len > PREVIEW_CHARS
+                && item.tail_fingerprint != tail_fingerprint
+            {
+                continue;
+            }
             saw_duplicate = true;
             break;
         }
@@ -2240,6 +2304,7 @@ fn suppress_duplicate_event(
         fingerprint,
         full_fingerprint,
         is_full,
+        tail_fingerprint,
         normalized_len,
         preview,
         agent_label: agent_label.to_string(),
@@ -2434,6 +2499,36 @@ mod tests {
     /// Pre-fix, the extension was suppressed AND re-pushed a fresh-timestamp
     /// entry with the same prefix fingerprint, so a continuously-active
     /// session never ingested anything past the first capture.
+    #[test]
+    fn suppressor_keeps_distinct_tails_behind_a_shared_preview() {
+        let (config, _tmp) = isolated_config();
+        let preamble = "Diagnostics: service X returned 503 on every probe tonight.\n".repeat(60); // >> 2000-char preview
+        let a = "the certificate expired";
+        let b = "the balancer drained   "; // padded to the same length
+        assert_eq!(a.len(), b.len());
+        let first = format!("{preamble}Root cause: {a}.\n");
+        let second = format!("{preamble}Root cause: {b}.\n");
+        assert_eq!(
+            first.len(),
+            second.len(),
+            "equal length defeats the extension rule"
+        );
+        let v1 = suppress_duplicate_event(&config, "hook_stop", "main", false, true, None, &first)
+            .unwrap();
+        assert_eq!(v1, SuppressVerdict::New);
+        let v2 = suppress_duplicate_event(&config, "hook_stop", "main", false, true, None, &second)
+            .unwrap();
+        assert_eq!(
+            v2,
+            SuppressVerdict::New,
+            "a different conclusion is a different event"
+        );
+        // An exact re-send is still a duplicate.
+        let v3 = suppress_duplicate_event(&config, "hook_stop", "main", false, true, None, &second)
+            .unwrap();
+        assert_eq!(v3, SuppressVerdict::Duplicate);
+    }
+
     #[test]
     fn suppressor_classifies_prefix_extension_vs_duplicate() {
         let (config, _tmp) = isolated_config();
