@@ -702,14 +702,13 @@ pub fn dispatch_one(
     let (hit, reason) = match parse_judge_output(&raw) {
         Some(parsed) => parsed,
         None => {
+            let summary = unparseable_verdict_summary(&raw);
             tracing::warn!(
-                raw = %raw,
+                raw_chars = raw.chars().count(),
                 "judge worker: LLM output unparseable (expected `HIT: yes|no\\nWHY: ...`), dropping"
             );
             let _ = token.fail(store.conn());
-            return Ok(DispatchResult::Dropped(DropReason::LlmError(
-                "unparseable verdict".to_string(),
-            )));
+            return Ok(DispatchResult::Dropped(DropReason::LlmError(summary)));
         }
     };
 
@@ -1088,6 +1087,16 @@ pub fn call_judge_sync(
                 .await
         })
     }
+}
+
+/// Content-free description of a judge reply that did not parse. The reply
+/// quotes the judged text (the model often restates the memory it was asked
+/// about), so logs, drop reasons and errors carry only its length.
+pub(crate) fn unparseable_verdict_summary(raw: &str) -> String {
+    format!(
+        "unparseable verdict (expected `HIT: yes|no\\nWHY: ...`; {} chars)",
+        raw.chars().count()
+    )
 }
 
 /// Parse the strict-format judge output `HIT: yes|no\nWHY: <reason>`.
@@ -1844,6 +1853,20 @@ mod tests {
     fn parse_judge_output_rejects_missing_why() {
         let raw = "HIT: yes\n";
         assert!(parse_judge_output(raw).is_none());
+    }
+
+    /// Audit U17-01: a reply that fails to parse is described by length
+    /// only; the text (which quotes the judged memory) never reaches the
+    /// drop reason or the WARN line.
+    #[test]
+    fn unparseable_verdict_summary_never_echoes_the_reply() {
+        let raw = "I think it is a hit because the memory says SENTINEL-private-detail";
+        let summary = unparseable_verdict_summary(raw);
+        assert!(!summary.contains("SENTINEL"), "{summary}");
+        assert!(
+            summary.contains(&raw.chars().count().to_string()),
+            "{summary}"
+        );
     }
 
     #[test]

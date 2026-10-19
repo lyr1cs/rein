@@ -1346,30 +1346,22 @@ fn process_archive_entry(
 
     // codex R5 P2: defensive size check BEFORE cap reservation. Cron
     // archive lines from a pre-enqueue-cap version (or manually-injected
-    // archive entries) may exceed `JUDGE_MAX_INPUT_CHARS`, and the cron
-    // LLM call site (`call_cron_judge` → `call_judge_sync`) no longer
-    // truncates (R1 J7 fix). Without this guard, oversized cron lines
-    // would burn `daily_call_cap` AND send untruncated payloads to the
-    // cron judge model. Mirror `llm_judge_worker::dispatch_one`'s pre-
-    // reservation ceiling exactly, including the same const.
-    let combined_chars = entry
-        .sources
-        .iter()
-        .map(|s| s.chars().count())
-        .sum::<usize>()
-        + entry.candidate.chars().count();
-    if combined_chars > crate::ops::llm_judge_worker::JUDGE_MAX_INPUT_CHARS {
+    // archive entries) may exceed the judge cap, and the cron LLM call site
+    // (`call_cron_judge` → `call_judge_sync`) no longer truncates (R1 J7
+    // fix). Without this guard, oversized cron lines would burn
+    // `daily_call_cap` AND send untruncated payloads to the cron judge
+    // model. Mirror `llm_judge_worker::dispatch_one`'s pre-reservation
+    // ceiling exactly: the resolved cap, not a constant (audit U17-02).
+    if let Some((combined_chars, ceiling)) = cron_payload_over_ceiling(config, entry) {
         tracing::warn!(
             surface = ?entry.surface,
             id = %entry.id,
-            combined_chars = combined_chars,
-            ceiling = crate::ops::llm_judge_worker::JUDGE_MAX_INPUT_CHARS,
+            combined_chars,
+            ceiling,
             "cron judge: archive payload exceeds dispatch ceiling; dropped pre-reservation"
         );
         return ProcessOutcome::Dropped(format!(
-            "cron archive payload too large ({} chars > ceiling {})",
-            combined_chars,
-            crate::ops::llm_judge_worker::JUDGE_MAX_INPUT_CHARS
+            "cron archive payload too large ({combined_chars} chars > ceiling {ceiling})"
         ));
     }
 
@@ -1874,6 +1866,36 @@ fn lookup_runtime_verdict(
 /// Returns `(cron_hit, cron_reason, cron_judge_model)`. The third tuple
 /// element is the model identifier as resolved by `[ars.llm_judge.nightly_cron]`
 /// per Track 2 (§8) — placeholder string used by stub.
+/// Content-free error for a cron judge reply that did not parse: the reply
+/// quotes the archived synthesis and its sources, so only the length is
+/// reported (the message is logged at WARN as the entry's drop reason).
+fn cron_unparseable_error(raw: &str) -> String {
+    format!(
+        "cron judge output {}",
+        crate::ops::llm_judge_worker::unparseable_verdict_summary(raw)
+    )
+}
+
+/// Size check mirroring `llm_judge_worker::dispatch_one`: the same resolved
+/// judge cap and the same `judge_input_chars` accounting over the prompt the
+/// cron rebuilds (`sources` joined with newlines) plus the candidate. The
+/// producer truncated with that cap, so a payload it archived always fits;
+/// the fixed 16,384-character ceiling used before rejected every legitimately
+/// larger entry under a raised `[ars.llm_judge].max_input_chars`, and those
+/// syntheses never received an offline verdict. Returns `(chars, ceiling)`
+/// when the payload is over the ceiling.
+fn cron_payload_over_ceiling(
+    config: &ReinConfig,
+    entry: &CronArchiveEntry,
+) -> Option<(usize, usize)> {
+    let ceiling = crate::ops::llm_judge_worker::resolve_judge_max_input_chars(config);
+    let combined = crate::ops::llm_judge_worker::judge_input_chars(
+        &entry.sources.join("\n"),
+        &entry.candidate,
+    );
+    (combined > ceiling).then_some((combined, ceiling))
+}
+
 fn call_cron_judge(
     config: &ReinConfig,
     entry: &CronArchiveEntry,
@@ -1908,13 +1930,8 @@ fn call_cron_judge(
         &joined_sources,
         &entry.candidate,
     )?;
-    let (hit, reason) =
-        crate::ops::llm_judge_worker::parse_judge_output(&raw).ok_or_else(|| {
-            ReinError::Extract(format!(
-                "cron judge output unparseable (expected `HIT: yes|no\\nWHY: ...`): {}",
-                raw.chars().take(120).collect::<String>()
-            ))
-        })?;
+    let (hit, reason) = crate::ops::llm_judge_worker::parse_judge_output(&raw)
+        .ok_or_else(|| ReinError::Extract(cron_unparseable_error(&raw)))?;
     let model_id = match &extractor {
         crate::extract::llm::ExtractorKind::Gemini(g) => format!("gemini:{}", g.model),
         crate::extract::llm::ExtractorKind::Omlx(o) => format!("omlx:{}", o.model),
@@ -3533,6 +3550,44 @@ mod tests {
         // Releasing a non-existent claim is a no-op (best-effort
         // semantics — used inside `let _ = ...` patterns).
         release_cron_claim(&conn, &surface, "synth-never", "stamp-Z", "wrong-token").unwrap();
+    }
+
+    /// Audit U17-01: the cron's parse error never carries the reply text.
+    #[test]
+    fn cron_unparseable_error_never_echoes_the_reply() {
+        let err = cron_unparseable_error("Verdict: the synthesis quotes SENTINEL-source-text");
+        assert!(!err.contains("SENTINEL"), "{err}");
+        assert!(err.contains("unparseable"), "{err}");
+    }
+
+    /// Audit U17-02: the cron ceiling is the resolved judge cap, so an
+    /// archived entry the runtime judged under a raised cap reaches the
+    /// offline judge instead of being dropped on every pass.
+    #[test]
+    fn cron_ceiling_follows_the_configured_judge_cap() {
+        let entry = CronArchiveEntry {
+            surface: CronArchiveSurface::Synthesis,
+            id: "synth-long".to_string(),
+            concept_id: String::new(),
+            stamp_hash: "stamp".to_string(),
+            query: "q".to_string(),
+            sources: vec!["s".repeat(20_000)],
+            candidate: "c".repeat(1_000),
+            metadata: None,
+            minted_at: 0,
+        };
+        let default_config = crate::config::ReinConfig::default();
+        let (chars, ceiling) =
+            cron_payload_over_ceiling(&default_config, &entry).expect("over the default ceiling");
+        assert_eq!(ceiling, crate::ops::llm_judge_worker::JUDGE_MAX_INPUT_CHARS);
+        assert_eq!(
+            chars,
+            crate::ops::llm_judge_worker::judge_input_chars(&entry.sources[0], &entry.candidate)
+        );
+
+        let mut raised = crate::config::ReinConfig::default();
+        raised.ars.llm_judge.max_input_chars = Some(32_768);
+        assert_eq!(cron_payload_over_ceiling(&raised, &entry), None);
     }
 
     #[test]
