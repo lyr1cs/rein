@@ -529,6 +529,24 @@ fn apply_evidence_rerank_excluding(
     }
 }
 
+/// Filters re-asserted after canonical collapse. External (`sm:` / `auto:`)
+/// results carry no local topic / timestamp / tier semantics and keep the
+/// keyword check only, as before.
+fn passes_post_collapse_filters(
+    memory: &Memory,
+    topic: Option<&str>,
+    keyword: Option<&str>,
+    time_from: Option<chrono::DateTime<chrono::Utc>>,
+    time_to: Option<chrono::DateTime<chrono::Utc>>,
+    include_cold: bool,
+) -> bool {
+    if memory.id.starts_with("sm:") || memory.id.starts_with("auto:") {
+        return matches_external_filters(memory, None, keyword, None, None);
+    }
+    matches_external_filters(memory, topic, keyword, time_from, time_to)
+        && (include_cold || memory.tier != crate::store::tiering::MemoryTier::Cold)
+}
+
 fn matches_external_filters(
     memory: &Memory,
     topic: Option<&str>,
@@ -2424,21 +2442,16 @@ fn recall_temporal_with_execution_mode(
             )?;
         }
     }
-    // codex remediation R8 P2: re-assert the keyword filter on the COLLAPSED
-    // canonicals. The pre-take filter (audit F10) evaluates raw rows for slot
-    // economy, but a superseded predecessor can match the keyword while its
-    // live canonical tip does not — without this retain, recall would return
-    // a tip that violates the requested filter.
-    if let Some(kw) = keyword {
-        let kw_lower = kw.to_lowercase();
-        results.retain(|r| {
-            r.memory
-                .keywords
-                .iter()
-                .any(|k| k.to_lowercase().contains(&kw_lower))
-                || r.memory.content.to_lowercase().contains(&kw_lower)
-        });
-    }
+    // codex remediation R8 P2 (+ 2026-10 audit U07-01): re-assert EVERY
+    // request filter on the COLLAPSED canonicals. The pre-take filters
+    // evaluate raw rows for slot economy, but a superseded predecessor can
+    // match the keyword / topic / time range / tier while its live canonical
+    // tip does not — without this retain, recall would return a tip outside
+    // the requested topic or date range, or a Cold memory for a
+    // non-Exploratory query.
+    results.retain(|r| {
+        passes_post_collapse_filters(&r.memory, topic, keyword, time_from, time_to, include_cold)
+    });
     if let Some(case) = loo_case {
         apply_evidence_rerank_excluding(
             store,

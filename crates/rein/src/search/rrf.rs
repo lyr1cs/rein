@@ -15,7 +15,12 @@ pub fn reciprocal_rank_fusion(
         }
     }
     let mut merged: Vec<_> = scores.into_iter().collect();
-    merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Ties broken by id so a flat channel yields a deterministic order.
+    merged.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     merged
 }
 
@@ -47,13 +52,15 @@ pub fn convex_combination(
             // the remaining fusion weight still reaches it. But when ≥2 items
             // tie, the channel has no ranking signal of its own: blanketing
             // every tied item at 1.0 silently promotes the channel to "every
-            // candidate is perfect", which biases fusion. Drop the tied block
-            // from the channel instead (B5 #25) — lets the other channel rank
-            // on its own evidence rather than being overruled by a flat tie.
+            // candidate is perfect", which biases fusion (B5 #25). Keep the
+            // tied ids as CANDIDATES at 0.0 — no ranking influence, but they
+            // stay eligible; returning an empty list here erased valid hits
+            // whenever the other channel was empty (tied BM25 scores with no
+            // vector results produced no recall at all).
             if results.len() == 1 {
                 return results.iter().map(|(id, _)| (id.clone(), 1.0)).collect();
             }
-            return vec![];
+            return results.iter().map(|(id, _)| (id.clone(), 0.0)).collect();
         }
         results
             .iter()
@@ -73,7 +80,12 @@ pub fn convex_combination(
     }
 
     let mut merged: Vec<_> = scores.into_iter().collect();
-    merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Ties broken by id so a flat channel yields a deterministic order.
+    merged.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     merged
 }
 
@@ -167,6 +179,21 @@ mod tests {
             x_score > y_score,
             "alpha=0.9 should favor FTS (x={x_score}) over vec (y={y_score})"
         );
+    }
+
+    #[test]
+    fn test_cc_tied_channel_keeps_its_candidates() {
+        // Two equal BM25 scores and no vector hits: both ids must survive.
+        let fts = vec![("a".to_string(), 2.0), ("b".to_string(), 2.0)];
+        let result = convex_combination(&fts, &[], 0.5);
+        let ids: Vec<&str> = result.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b"]);
+        // With a vector channel present, the tie adds no ranking signal:
+        // the vector order decides.
+        let vec = vec![("b".to_string(), 9.0), ("a".to_string(), 1.0)];
+        let result = convex_combination(&fts, &vec, 0.5);
+        assert_eq!(result[0].0, "b");
+        assert_eq!(result.len(), 2);
     }
 
     #[test]

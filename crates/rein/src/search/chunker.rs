@@ -114,6 +114,17 @@ fn split_by_sentences(text: &str, max_chars: usize) -> Vec<String> {
     let mut current = String::new();
 
     for sentence in &sentences {
+        if sentence.len() > max_chars {
+            // One sentence over the budget (minified JSON, code, CJK prose
+            // with no ". " boundaries): hard-split it at char boundaries.
+            // Accepting it as `current` used to pass it through as a single
+            // oversized chunk, which the embedding batch then rejected.
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+            }
+            chunks.extend(hard_split(sentence, max_chars));
+            continue;
+        }
         if current.is_empty() {
             current = sentence.clone();
         } else if current.len() + sentence.len() < max_chars {
@@ -128,16 +139,25 @@ fn split_by_sentences(text: &str, max_chars: usize) -> Vec<String> {
         chunks.push(current);
     }
 
-    // If no chunks were produced (e.g., single very long sentence), force-split at char boundary
+    // If no chunks were produced (e.g., no sentence could be extracted), force-split at char boundary
     if chunks.is_empty() && !text.is_empty() {
-        let chars: Vec<char> = text.chars().collect();
-        for chunk_start in (0..chars.len()).step_by(max_chars) {
-            let end = (chunk_start + max_chars).min(chars.len());
-            chunks.push(chars[chunk_start..end].iter().collect());
-        }
+        chunks.extend(hard_split(text, max_chars));
     }
 
     chunks
+}
+
+/// Split at char boundaries into pieces of at most `max_chars` chars.
+fn hard_split(text: &str, max_chars: usize) -> Vec<String> {
+    let max_chars = max_chars.max(1);
+    let chars: Vec<char> = text.chars().collect();
+    (0..chars.len())
+        .step_by(max_chars)
+        .map(|start| {
+            let end = (start + max_chars).min(chars.len());
+            chars[start..end].iter().collect()
+        })
+        .collect()
 }
 
 /// Extract sentences from text, splitting on . ! ? followed by whitespace.
@@ -280,6 +300,23 @@ mod tests {
                 trimmed
             );
         }
+    }
+
+    #[test]
+    fn oversized_sentences_are_hard_split() {
+        // 3,000 chars without any ". " boundary: one "sentence".
+        let text = "x".repeat(3_000);
+        let chunks = semantic_chunk(&text, 128, 0); // 512-char budget
+        assert!(chunks.len() >= 6, "{}", chunks.len());
+        assert!(chunks.iter().all(|c| c.chars().count() <= 512));
+        assert_eq!(chunks.concat(), text);
+
+        // CJK prose uses 。 which the sentence splitter does not know.
+        let cjk = "这是一个没有英文句号的很长的段落。".repeat(150);
+        let chunks = semantic_chunk(&cjk, 128, 0);
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|c| c.chars().count() <= 512));
+        assert_eq!(chunks.concat(), cjk);
     }
 
     #[test]
