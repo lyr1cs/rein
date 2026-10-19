@@ -237,7 +237,7 @@ fn is_temporal(lower: &str) -> bool {
     ];
 
     for pat in TEMPORAL_EN {
-        if lower.contains(pat) {
+        if contains_phrase(lower, pat) {
             return true;
         }
     }
@@ -270,6 +270,30 @@ fn is_temporal(lower: &str) -> bool {
     false
 }
 
+/// `lower.contains(pat)` for English phrases, but only at word boundaries:
+/// identifiers such as `recent_files.rs` or words like `recentering` must not
+/// read as relative-time instructions (they used to inject a 30-day window
+/// and silently drop every older memory). Non-ASCII patterns keep plain
+/// substring matching.
+fn contains_phrase(lower: &str, pat: &str) -> bool {
+    if !pat.is_ascii() {
+        return lower.contains(pat);
+    }
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut start = 0;
+    while let Some(pos) = lower[start..].find(pat) {
+        let begin = start + pos;
+        let end = begin + pat.len();
+        let before_ok = !lower[..begin].chars().next_back().is_some_and(is_word);
+        let after_ok = !lower[end..].chars().next().is_some_and(is_word);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = begin + 1;
+    }
+    false
+}
+
 fn is_relative_temporal(lower: &str) -> bool {
     const RELATIVE: &[&str] = &[
         "last week",
@@ -284,20 +308,26 @@ fn is_relative_temporal(lower: &str) -> bool {
         "昨天",
         "最近",
     ];
-    RELATIVE.iter().any(|pat| lower.contains(pat))
+    RELATIVE.iter().any(|pat| contains_phrase(lower, pat))
 }
 
 fn extract_temporal_days(lower: &str) -> i64 {
-    if lower.contains("yesterday") || lower.contains("昨天") {
+    if contains_phrase(lower, "yesterday") || lower.contains("昨天") {
         return 1;
     }
-    if lower.contains("last week") || lower.contains("this week") || lower.contains("上周") {
+    if contains_phrase(lower, "last week")
+        || contains_phrase(lower, "this week")
+        || lower.contains("上周")
+    {
         return 7;
     }
-    if lower.contains("last month") || lower.contains("this month") || lower.contains("上个月") {
+    if contains_phrase(lower, "last month")
+        || contains_phrase(lower, "this month")
+        || lower.contains("上个月")
+    {
         return 30;
     }
-    if lower.contains("recently") || lower.contains("最近") {
+    if contains_phrase(lower, "recently") || lower.contains("最近") {
         return 14;
     }
     30 // default: look back 30 days
@@ -490,6 +520,34 @@ mod tests {
             classify("changes since 2026-03-20", false, false).query_type,
             QueryType::Temporal
         );
+    }
+
+    #[test]
+    fn identifiers_containing_temporal_words_are_not_temporal() {
+        // `recent_files.rs` / `recentering` contain "recent" but are not
+        // relative-time instructions; they used to force a 30-day window.
+        assert_ne!(
+            classify("recent_files.rs", false, false).query_type,
+            QueryType::Temporal
+        );
+        assert!(!classify("recent_files.rs", false, false).force_temporal);
+        assert_ne!(
+            classify("recentering algorithm notes", false, false).query_type,
+            QueryType::Temporal
+        );
+        // Real phrases still classify as temporal.
+        assert_eq!(
+            classify("recent changes to the API", false, false).query_type,
+            QueryType::Temporal
+        );
+        assert_eq!(
+            classify("what did we do recently?", false, false).query_type,
+            QueryType::Temporal
+        );
+        assert!(contains_phrase("show recent changes", "recent"));
+        assert!(!contains_phrase("recent_files", "recent"));
+        assert!(!contains_phrase("the recentering", "recent"));
+        assert!(contains_phrase("最近的变化", "最近"));
     }
 
     #[test]

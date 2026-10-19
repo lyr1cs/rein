@@ -237,15 +237,10 @@ pub fn rerank_with_llm(config: &ReinConfig, query: &str, candidates: &[(Memory, 
 
     let top_n = config.search.llm_reranker_top_n.min(candidates.len());
 
-    // Check in-memory cache (key = query + candidate IDs in input order — order matters
-    // because the cached score vector is positionally aligned with the candidate list)
-    let id_parts: Vec<&str> = candidates[..top_n]
-        .iter()
-        .map(|(m, _)| m.id.as_str())
-        .collect();
-    let mut key_parts: Vec<&str> = vec![query];
-    key_parts.extend(id_parts.iter());
-    let cache_k = crate::search::cache::cache_key(&key_parts);
+    // Check in-memory cache (key = query + candidate revisions in input order —
+    // order matters because the cached score vector is positionally aligned
+    // with the candidate list)
+    let cache_k = rerank_cache_key(query, &candidates[..top_n]);
     if let Ok(cache) = crate::search::cache::rerank_cache().lock() {
         if let Some(cached) = cache.get(&cache_k) {
             if cached.len() == top_n {
@@ -357,6 +352,20 @@ fn envelope_permuted_scores(llm_scores: &[f32], existing: &[f32]) -> Vec<f32> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Cache identity: the query plus, per candidate in input order, its id and
+/// revision stamp. The prompt is built from mutable topic / content, so a key
+/// on ids alone replayed pre-edit judgments for up to an hour after a memory
+/// changed (`updated_at` moves on every semantic edit).
+fn rerank_cache_key(query: &str, candidates: &[(Memory, f32)]) -> String {
+    let revisions: Vec<String> = candidates
+        .iter()
+        .map(|(m, _)| format!("{}@{}", m.id, m.updated_at.timestamp_millis()))
+        .collect();
+    let mut parts: Vec<&str> = vec![query];
+    parts.extend(revisions.iter().map(String::as_str));
+    crate::search::cache::cache_key(&parts)
+}
 
 fn format_candidates(candidates: &[(Memory, f32)]) -> String {
     candidates
@@ -592,6 +601,57 @@ mod tests {
     }
 
     // ── Score-envelope-preserving permutation ────────────────────────────────
+
+    #[test]
+    fn rerank_cache_key_changes_when_a_candidate_is_revised() {
+        use crate::types::{Importance, Memory, MemoryLayer, MemoryStatus, MemoryTier, Source};
+        let mem = |id: &str, updated_at: chrono::DateTime<chrono::Utc>| Memory {
+            id: id.to_string(),
+            layer: MemoryLayer::LTM,
+            topic: "t".to_string(),
+            summary: "s".to_string(),
+            content: "c".to_string(),
+            keywords: vec![],
+            importance: Importance::Medium,
+            source: Source::Manual,
+            strength: 1.0,
+            decay_lambda: 0.02,
+            access_count: 0,
+            superseded_by: None,
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: 1.0,
+            source_diversity: 1.0,
+            contradiction_score: 0.0,
+            related_ids: vec![],
+            concept_ids: vec![],
+            status: MemoryStatus::Active,
+            embedding: None,
+            tier: MemoryTier::Warm,
+            cluster_id: None,
+            archival_summary: None,
+            archival_summary_at: None,
+            archival_summary_version: None,
+            created_at: updated_at,
+            updated_at,
+            last_accessed: updated_at,
+        };
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(5);
+        let before = vec![(mem("a", t0), 0.5), (mem("b", t0), 0.4)];
+        let same = vec![(mem("a", t0), 0.9), (mem("b", t0), 0.1)];
+        let edited = vec![(mem("a", t1), 0.5), (mem("b", t0), 0.4)];
+        assert_eq!(rerank_cache_key("q", &before), rerank_cache_key("q", &same));
+        assert_ne!(
+            rerank_cache_key("q", &before),
+            rerank_cache_key("q", &edited)
+        );
+        assert_ne!(
+            rerank_cache_key("q", &before),
+            rerank_cache_key("other", &before)
+        );
+    }
 
     #[test]
     fn envelope_permutation_reorders_existing_scores() {

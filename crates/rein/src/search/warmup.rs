@@ -680,6 +680,42 @@ pub fn populate_hnsw(store: &SqliteStore, config: &ReinConfig) -> bool {
         }
     }
 
+    // 2026-10 audit U08-01: the durable `vec_memories` rows are the fallback
+    // source below. When the table is stamped for ANOTHER model (a migration
+    // that has not completed), rebuilding from them would publish an index in
+    // the old embedding space and clear the dirty marker — the same hazard
+    // `warmup_with_embedder` guards against, reached here directly from the
+    // recall-side dirty-index recovery. Leave the index dirty instead.
+    {
+        use rusqlite::OptionalExtension;
+        let stamped: Option<String> = store
+            .conn()
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?1",
+                rusqlite::params![crate::store::schema::VEC_ROWS_PROVENANCE_KEY],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        let current = format!("{model}:{dims}");
+        if let Some(stamp) = stamped.filter(|stamp| stamp != &current) {
+            tracing::warn!(
+                stamped = %stamp,
+                configured = %current,
+                "hnsw: vector table is stamped for another model; rebuild skipped and index \
+                 left dirty until the migration completes"
+            );
+            crate::store::hnsw::HnswIndex::mark_dirty(&hnsw_path);
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                let _ = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN) };
+            }
+            return false;
+        }
+    }
+
     // v0.30.2 B4: stage to `<base>_new.usearch` + `<base>_new.usearch.meta`
     // so the existing production index keeps serving until the new one is
     // fully written. The previous (destructive) sequence was
@@ -2619,6 +2655,16 @@ mod tests {
             (kept[0] - 0.9).abs() < 1e-6,
             "old-model rows survive untouched"
         );
+
+        // 2026-10 audit U08-01: the recall-side dirty recovery calls
+        // `populate_hnsw` directly; it must refuse the same way instead of
+        // rebuilding from old-model vectors and clearing the marker.
+        assert!(!populate_hnsw(&store, &config));
+        assert!(
+            crate::store::hnsw::HnswIndex::is_dirty(&hnsw_base),
+            "a direct rebuild must keep the index dirty while the table is stamped for another model"
+        );
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"sentinel-index");
     }
 
     /// Codex round-19 P1: the cache-only path pages the gap; cache hits are
