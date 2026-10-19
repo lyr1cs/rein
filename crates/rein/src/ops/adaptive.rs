@@ -4684,6 +4684,31 @@ fn peek_access_events(
 // Reranker weight learning from agent feedback
 // ===========================================================================
 
+/// Whether the `recall_complete` event answering `request_id` is already
+/// behind the reranker's recall cursor (`consumed_through`: the durable
+/// watermark or the consumer offset, whichever is higher), or never existed.
+/// Feedback for such a request can never be trained — its recall was
+/// evaluated in an earlier cycle, or no recall will ever appear for it — so
+/// it must not hold the access cursor. `false` means a recall exists and is
+/// still pending (typically behind the recall peek window): keep waiting.
+/// A read error keeps the feedback in place (the safe side).
+fn reranker_recall_is_settled(
+    conn: &rusqlite::Connection,
+    request_id: &str,
+    consumed_through: i64,
+) -> bool {
+    match conn.query_row(
+        "SELECT MIN(id) FROM feedback_events
+          WHERE event_type = 'recall_complete' AND request_id = ?1",
+        rusqlite::params![request_id],
+        |row| row.get::<_, Option<i64>>(0),
+    ) {
+        Ok(Some(recall_id)) => recall_id <= consumed_through,
+        Ok(None) => true,
+        Err(_) => false,
+    }
+}
+
 fn run_reranker_weight_learning(store: &SqliteStore) {
     // v0.25.2 (lifted v0.24.x backlog item): `save_weights` and
     // `commit_offset` are still two separate writes — but the
@@ -4722,6 +4747,17 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
     let mut weights = crate::search::rerank::load_weights(conn);
     let prior_access_water = weights.last_access_event_id;
     let prior_recall_water = weights.last_recall_event_id;
+    // Highest recall event the consumer has moved past, whether it was
+    // applied to a gradient (watermark) or evaluated without one, e.g.
+    // expired (offset only): behind this point a recall is never trained.
+    let recall_consumed_through: i64 = conn
+        .query_row(
+            "SELECT last_event_id FROM consumer_offsets WHERE consumer = 'reranker_weights_recall'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        .max(prior_recall_water);
 
     // Peek feedback events (RecallAccess with source=agent_feedback). Self-
     // contained peek+commit: this helper writes to the `metadata`
@@ -4959,10 +4995,12 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
 
     // The access cursor likewise advances through the contiguous prefix of
     // access events that are not a training signal, that answer a recall
-    // advanced above, or that are older than the expiry (their recall can
-    // never be trained). It stops at the first live feedback event whose
-    // recall has not been seen — typically one sitting behind the recall
-    // peek window — so that feedback is still there when its recall is.
+    // advanced above, that answer a recall already behind the recall cursor
+    // (a second feedback for a request learned in an earlier cycle) or one
+    // that never existed, or that are older than the expiry. It stops at the
+    // first live feedback event whose recall is still pending — typically
+    // one sitting behind the recall peek window — so that feedback is still
+    // there when its recall is.
     let mut access_prefix_last: Option<i64> = None;
     for event in &events {
         let is_signal = signal_events.iter().any(|signal| signal.id == event.id);
@@ -4970,7 +5008,10 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
             || expired(event)
             || advanced_recalls
                 .iter()
-                .any(|recall| correlates(event, recall));
+                .any(|recall| correlates(event, recall))
+            || event.request_id.as_deref().is_some_and(|request_id| {
+                reranker_recall_is_settled(conn, request_id, recall_consumed_through)
+            });
         if !consumable {
             break;
         }
@@ -9382,6 +9423,55 @@ mod tests {
         let weights = crate::search::rerank::load_weights(store.conn());
         assert!(weights.last_recall_event_id > last_stale_id);
         assert!(weights.last_access_event_id > last_stale_id);
+    }
+
+    /// Feedback for a request whose recall was learned in an earlier cycle
+    /// (a second thumb for the same request) and feedback for a request
+    /// with no recall at all are consumed, not held: holding them pinned the
+    /// access cursor for 24 h and every later feedback behind them was
+    /// unreachable (codex review of the fix diff).
+    #[test]
+    fn test_reranker_settled_or_orphan_feedback_does_not_block_the_access_cursor() {
+        let store = SqliteStore::in_memory().unwrap();
+        emit(
+            &store,
+            rerank_recall_event(
+                "req-a",
+                serde_json::json!([
+                    rerank_candidate("a-used", 0.9, 0.0),
+                    rerank_candidate("a-other", 0.1, 0.0)
+                ]),
+            ),
+        );
+        emit(&store, rerank_feedback_event("req-a", "a-used"));
+        run_reranker_weight_learning(&store);
+        let after_a = rerank_weights_tuple(&store);
+
+        // Late second feedback for the already-learned request, and feedback
+        // for a request that never produced a recall, both ahead of a fresh
+        // recall with its own feedback.
+        let late = emit(&store, rerank_feedback_event("req-a", "a-other"));
+        let orphan = emit(&store, rerank_feedback_event("req-never", "nothing"));
+        emit(
+            &store,
+            rerank_recall_event(
+                "req-b",
+                serde_json::json!([
+                    rerank_candidate("b-used", 0.9, 0.0),
+                    rerank_candidate("b-other", 0.1, 0.0)
+                ]),
+            ),
+        );
+        let b_feedback = emit(&store, rerank_feedback_event("req-b", "b-used"));
+        run_reranker_weight_learning(&store);
+        let after_b = rerank_weights_tuple(&store);
+        assert!(
+            after_b[0] > after_a[0],
+            "request B is learned behind the settled and orphan feedback: {after_a:?} -> {after_b:?}"
+        );
+        let weights = crate::search::rerank::load_weights(store.conn());
+        assert!(weights.last_access_event_id >= b_feedback);
+        assert!(weights.last_access_event_id > late && weights.last_access_event_id > orphan);
     }
 
     /// v0.25.2 — replay-safety: even if `commit_offset` fails after
