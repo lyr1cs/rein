@@ -79,6 +79,15 @@ fn format_recall_results_with_budget(
     }
 }
 
+fn omitted_note(omitted: usize) -> String {
+    format!(
+        "... {omitted} more results omitted to stay within the MCP output limit. Narrow the query or lower `limit` for the full set."
+    )
+}
+
+/// Join `entries` under a character budget. The omission note counts every
+/// entry that is not rendered, including the one that overflowed, and the
+/// rendered output never exceeds `max_chars`.
 fn join_entries_with_budget(
     entries: &[String],
     separator: &str,
@@ -88,7 +97,7 @@ fn join_entries_with_budget(
         return entries.join(separator);
     };
 
-    let mut rendered = Vec::new();
+    let mut rendered: Vec<String> = Vec::new();
     let mut used_chars = 0usize;
     let separator_chars = separator.chars().count();
 
@@ -99,35 +108,54 @@ fn join_entries_with_budget(
         } else {
             separator_chars
         };
-        let remaining = entries.len().saturating_sub(idx + 1);
-        let omitted_note = if remaining > 0 {
-            format!(
-                "\n\n... {} more results omitted to stay within the MCP output limit. Narrow the query or lower `limit` for the full set.",
-                remaining
-            )
+        let after = entries.len() - idx - 1;
+        // Reserve room for the note that would follow this entry if every
+        // later entry had to be omitted.
+        let note_reserve = if after > 0 {
+            separator_chars + omitted_note(after).chars().count()
         } else {
-            String::new()
+            0
         };
-        let omitted_note_chars = omitted_note.chars().count();
 
-        if used_chars + sep_chars + entry_chars + omitted_note_chars > max_chars {
-            if rendered.is_empty() {
-                let available = max_chars.saturating_sub(omitted_note_chars);
-                if available > 0 {
-                    rendered.push(truncate_chars(entry, available));
-                }
+        if used_chars + sep_chars + entry_chars + note_reserve <= max_chars {
+            used_chars += sep_chars + entry_chars;
+            rendered.push(entry.clone());
+            continue;
+        }
+
+        if rendered.is_empty() {
+            // Nothing fits in full: show a truncated first entry plus the note
+            // for everything after it.
+            let available = max_chars.saturating_sub(note_reserve);
+            if available > 0 {
+                rendered.push(truncate_chars(entry, available));
             }
-            if !omitted_note.is_empty() {
-                rendered.push(omitted_note.trim_start_matches('\n').to_string());
+            if after > 0 {
+                rendered.push(omitted_note(after));
             }
             break;
         }
 
-        if sep_chars > 0 {
-            used_chars += sep_chars;
+        // This entry and everything after it are omitted. The reservation
+        // made when the previous entry was accepted guarantees the note
+        // fits; the loop is a safety net for tiny budgets.
+        let mut omitted = entries.len() - idx;
+        loop {
+            let note = omitted_note(omitted);
+            if rendered.is_empty()
+                || used_chars + separator_chars + note.chars().count() <= max_chars
+            {
+                rendered.push(note);
+                break;
+            }
+            let popped = rendered.pop().expect("rendered is non-empty");
+            used_chars -= popped.chars().count();
+            if !rendered.is_empty() {
+                used_chars -= separator_chars;
+            }
+            omitted += 1;
         }
-        used_chars += entry_chars;
-        rendered.push(entry.clone());
+        break;
     }
 
     rendered.join(separator)
@@ -234,7 +262,32 @@ mod tests {
         let output = format_recall_results_mcp(&results, false);
 
         assert!(output.contains("more results omitted"));
-        assert!(output.chars().count() <= MAX_MCP_RECALL_OUTPUT_CHARS + 200);
+        assert!(output.chars().count() <= MAX_MCP_RECALL_OUTPUT_CHARS);
         assert!(!output.contains(&"x".repeat(500)));
+    }
+
+    #[test]
+    fn budget_note_counts_the_entry_that_overflowed() {
+        let entries: Vec<String> = (0..10).map(|_| "a".repeat(100)).collect();
+        // Five entries fit, with room reserved for the note that follows.
+        let max = 5 * 100 + 4 * 2 + 2 + omitted_note(5).chars().count();
+        let output = join_entries_with_budget(&entries, "\n\n", Some(max));
+        assert!(output.chars().count() <= max, "{}", output.chars().count());
+        assert_eq!(output.matches(&"a".repeat(100)).count(), 5);
+        assert!(output.ends_with(&omitted_note(5)), "{output}");
+    }
+
+    #[test]
+    fn last_entry_overflow_still_reports_one_omitted() {
+        let entries: Vec<String> = (0..3).map(|_| "b".repeat(300)).collect();
+        let max = 2 * 300 + 2 + 2 + omitted_note(1).chars().count() + 5;
+        let output = join_entries_with_budget(&entries, "\n\n", Some(max));
+        assert!(output.chars().count() <= max);
+        assert_eq!(output.matches(&"b".repeat(300)).count(), 2);
+        assert!(output.ends_with(&omitted_note(1)), "{output}");
+        // Everything fits: no note at all.
+        let output = join_entries_with_budget(&entries, "\n\n", Some(10_000));
+        assert!(!output.contains("omitted"));
+        assert_eq!(output.matches(&"b".repeat(300)).count(), 3);
     }
 }
