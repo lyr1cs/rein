@@ -33,6 +33,20 @@ impl HnswIndex {
         let meta_path = path.with_extension("usearch.meta");
 
         let (id_to_key, key_to_id, next_key) = if index_path.exists() {
+            // A save writes the index file and then the metadata file. A
+            // process that dies in between leaves a new index next to old
+            // metadata; when the vector count did not change (a replace) the
+            // cardinality check below cannot tell, and the replaced memory
+            // silently vanishes from search. The marker set for the duration
+            // of `save` makes that state detectable.
+            let saving = Self::saving_marker_path(path);
+            if saving.exists() {
+                Self::mark_dirty(path);
+                let _ = std::fs::remove_file(&saving);
+                return Err(ReinError::Config(
+                    "hnsw save was interrupted; rebuild required".to_string(),
+                ));
+            }
             index
                 .load(index_path.to_str().unwrap_or(""))
                 .map_err(|e| ReinError::Config(format!("hnsw load: {e}")))?;
@@ -161,18 +175,31 @@ impl HnswIndex {
     /// that succeed while `.dirty` exists should leave the marker alone
     /// so warmup still triggers the recovery rebuild.
     pub fn save(&self) -> ReinResult<()> {
+        let saving = Self::saving_marker_path(&self.path);
+        std::fs::write(&saving, b"saving")
+            .map_err(|e| ReinError::Config(format!("hnsw saving marker: {e}")))?;
+
         let index_path = self.path.with_extension("usearch");
         self.index
             .save(index_path.to_str().unwrap_or(""))
             .map_err(|e| ReinError::Config(format!("hnsw save: {e}")))?;
 
-        // Save metadata
+        // Save metadata (written to a sibling, then renamed into place).
         let meta_path = self.path.with_extension("usearch.meta");
+        let meta_tmp = self.path.with_extension("usearch.meta.tmp");
         let meta = serialize_meta(&self.id_to_key, self.next_key);
-        std::fs::write(&meta_path, meta)
+        std::fs::write(&meta_tmp, meta)
+            .map_err(|e| ReinError::Config(format!("hnsw meta save: {e}")))?;
+        std::fs::rename(&meta_tmp, &meta_path)
             .map_err(|e| ReinError::Config(format!("hnsw meta save: {e}")))?;
 
+        let _ = std::fs::remove_file(&saving);
         Ok(())
+    }
+
+    /// Present only while `save` is between its two file writes.
+    pub fn saving_marker_path(path: &Path) -> PathBuf {
+        path.with_extension("usearch.saving")
     }
 
     /// Dimensions this index was created with.
@@ -290,6 +317,31 @@ mod tests {
 
         let results = index.search(&[0.0, 1.0, 0.0], 1).unwrap();
         assert_eq!(results[0].0, "mem1");
+    }
+
+    #[test]
+    fn interrupted_save_is_detected_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test_interrupted");
+        let mut index = HnswIndex::open(&path, 3).unwrap();
+        index.insert("mem1", &[1.0, 0.0, 0.0]).unwrap();
+        index.insert("mem2", &[0.0, 1.0, 0.0]).unwrap();
+        index.save().unwrap();
+        assert!(!HnswIndex::saving_marker_path(&path).exists());
+        drop(index);
+        // A clean save reopens fine.
+        assert!(HnswIndex::open(&path, 3).is_ok());
+
+        // Crash between the index write and the metadata write: the marker
+        // is still there. Same cardinality, so only the marker can tell.
+        std::fs::write(HnswIndex::saving_marker_path(&path), b"saving").unwrap();
+        let err = match HnswIndex::open(&path, 3) {
+            Ok(_) => panic!("open must fail after an interrupted save"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("interrupted"), "{err}");
+        assert!(HnswIndex::is_dirty(&path));
+        assert!(!HnswIndex::saving_marker_path(&path).exists());
     }
 
     #[test]

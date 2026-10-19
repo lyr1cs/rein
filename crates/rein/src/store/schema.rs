@@ -375,6 +375,25 @@ fn add_column_idempotent(conn: &Connection, sql: &str) -> ReinResult<()> {
     }
 }
 
+/// Probe-then-add for ONE column. Grouped probes ("if the first column is
+/// missing, add all N") break when the process dies between two autocommit
+/// ALTERs: on retry the probe sees the first column and skips the rest for
+/// good, and the baseline stamp then hides the gap from every later open.
+fn ensure_table_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> ReinResult<()> {
+    let has: bool = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name=?1"),
+            rusqlite::params![column],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0;
+    if !has {
+        add_column_idempotent(conn, ddl)?;
+    }
+    Ok(())
+}
+
 /// Cross-process serialization for the open-time bring-up + forward migrations.
 ///
 /// `bring_up_to_baseline` can't be wrapped in a SQL transaction
@@ -898,10 +917,14 @@ fn bring_up_to_baseline(conn: &Connection, dims: usize) -> ReinResult<()> {
         > 0;
     if !has_valid_from {
         add_column_idempotent(conn, "ALTER TABLE concept_links ADD COLUMN valid_from TEXT")?;
-        add_column_idempotent(
-            conn,
-            "ALTER TABLE concept_links ADD COLUMN valid_until TEXT",
-        )?;
+    }
+    ensure_table_column(
+        conn,
+        "concept_links",
+        "valid_until",
+        "ALTER TABLE concept_links ADD COLUMN valid_until TEXT",
+    )?;
+    if !has_valid_from {
         // Backfill: existing links get valid_from = created_at
         conn.execute_batch(
             "UPDATE concept_links SET valid_from = created_at WHERE valid_from IS NULL",
@@ -934,18 +957,22 @@ fn bring_up_to_baseline(conn: &Connection, dims: usize) -> ReinResult<()> {
         .unwrap_or(0)
         > 0;
     if !has_living_summary {
-        // Split into per-column fail-loud ALTERs: a peer-race duplicate on the
-        // first column must not abort the batch and silently skip the rest.
         add_column_idempotent(conn, "ALTER TABLE concepts ADD COLUMN living_summary TEXT")?;
-        add_column_idempotent(
-            conn,
-            "ALTER TABLE concepts ADD COLUMN living_summary_updated_at TEXT",
-        )?;
-        add_column_idempotent(
-            conn,
-            "ALTER TABLE concepts ADD COLUMN living_summary_source_revision INTEGER",
-        )?;
     }
+    // Each column probed on its own: a crash between two ALTERs must not
+    // leave the group half-applied forever.
+    ensure_table_column(
+        conn,
+        "concepts",
+        "living_summary_updated_at",
+        "ALTER TABLE concepts ADD COLUMN living_summary_updated_at TEXT",
+    )?;
+    ensure_table_column(
+        conn,
+        "concepts",
+        "living_summary_source_revision",
+        "ALTER TABLE concepts ADD COLUMN living_summary_source_revision INTEGER",
+    )?;
 
     // Create concept_revisions table (revision history)
     conn.execute_batch(
@@ -985,9 +1012,12 @@ fn bring_up_to_baseline(conn: &Connection, dims: usize) -> ReinResult<()> {
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_episodes_created ON episodes(created_at);
-        CREATE INDEX IF NOT EXISTS idx_episodes_source_session ON episodes(source_session_id);
     ",
     )?;
+    // `idx_episodes_source_session` is created by `migrate_episode_columns`
+    // AFTER it has added `source_session_id`: on a pre-baseline database the
+    // `CREATE TABLE IF NOT EXISTS` above keeps the old column set, and an
+    // index on the missing column here failed every open.
 
     conn.execute_batch("
         CREATE TABLE IF NOT EXISTS session_artifacts (
@@ -1633,25 +1663,30 @@ fn migrate_cold_archive_summary(conn: &Connection) -> ReinResult<()> {
         .unwrap_or(0)
         > 0;
     if !has_archival_summary {
-        // Per-column fail-loud ALTERs (a peer-race duplicate on the first must
-        // not abort the rest).
         add_column_idempotent(
             conn,
             "ALTER TABLE memories ADD COLUMN archival_summary TEXT",
         )?;
-        add_column_idempotent(
-            conn,
-            "ALTER TABLE memories ADD COLUMN archival_summary_at INTEGER",
-        )?;
-        add_column_idempotent(
-            conn,
-            "ALTER TABLE memories ADD COLUMN archival_summary_version INTEGER",
-        )?;
-        add_column_idempotent(
-            conn,
-            "ALTER TABLE memories ADD COLUMN needs_archival_summary INTEGER NOT NULL DEFAULT 0",
-        )?;
     }
+    // Each column probed on its own (see `ensure_table_column`).
+    ensure_table_column(
+        conn,
+        "memories",
+        "archival_summary_at",
+        "ALTER TABLE memories ADD COLUMN archival_summary_at INTEGER",
+    )?;
+    ensure_table_column(
+        conn,
+        "memories",
+        "archival_summary_version",
+        "ALTER TABLE memories ADD COLUMN archival_summary_version INTEGER",
+    )?;
+    ensure_table_column(
+        conn,
+        "memories",
+        "needs_archival_summary",
+        "ALTER TABLE memories ADD COLUMN needs_archival_summary INTEGER NOT NULL DEFAULT 0",
+    )?;
     let has_in_progress: bool = conn
         .query_row(
             "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='in_progress_archival_summary_at'",
@@ -1665,11 +1700,13 @@ fn migrate_cold_archive_summary(conn: &Connection) -> ReinResult<()> {
             conn,
             "ALTER TABLE memories ADD COLUMN in_progress_archival_summary_at TEXT",
         )?;
-        add_column_idempotent(
-            conn,
-            "ALTER TABLE memories ADD COLUMN archival_claim_token TEXT",
-        )?;
     }
+    ensure_table_column(
+        conn,
+        "memories",
+        "archival_claim_token",
+        "ALTER TABLE memories ADD COLUMN archival_claim_token TEXT",
+    )?;
     // v0.27.5 R1: too-large backoff — `claim_batch` deprioritizes rows whose
     // last attempt returned `AttemptOutcome::TooLarge` so a permanently
     // oversized row doesn't starve newer eligible rows. Unix epoch seconds;
@@ -3163,6 +3200,67 @@ mod migration_tests {
             "a fresh DB must be stamped at the highest known version \
              (baseline bring-up + every forward migration applied)"
         );
+    }
+
+    #[test]
+    fn legacy_episodes_table_without_source_session_id_still_opens() {
+        init_sqlite_vec();
+        let file = tempfile::NamedTempFile::new().expect("tempfile");
+        let conn = Connection::open(file.path()).expect("open");
+        // The v0.4-era episodes table: no source_session_id (and none of the
+        // later JSON columns either).
+        conn.execute_batch(
+            "CREATE TABLE episodes (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                outcome TEXT NOT NULL DEFAULT '',
+                decisions TEXT NOT NULL DEFAULT '[]',
+                concept_ids TEXT NOT NULL DEFAULT '[]',
+                memory_ids TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL
+            );",
+        )
+        .expect("legacy episodes table");
+        init_schema(&conn, 4).expect("init schema must add the column before indexing it");
+        assert!(column_exists(&conn, "episodes", "source_session_id"));
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_episodes_source_session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1);
+    }
+
+    #[test]
+    fn half_applied_column_groups_are_completed_on_the_next_open() {
+        init_sqlite_vec();
+        let file = tempfile::NamedTempFile::new().expect("tempfile");
+        let conn = Connection::open(file.path()).expect("open");
+        init_schema(&conn, 4).expect("fresh schema");
+        // Simulate a crash that landed only the FIRST column of each group.
+        conn.execute_batch(
+            "ALTER TABLE memories DROP COLUMN archival_claim_token;
+             ALTER TABLE memories DROP COLUMN needs_archival_summary;
+             ALTER TABLE concepts DROP COLUMN living_summary_source_revision;
+             ALTER TABLE concept_links DROP COLUMN valid_until;
+             PRAGMA user_version = 0;",
+        )
+        .expect("drop second columns");
+        init_schema(&conn, 4).expect("reopen");
+        for (table, column) in [
+            ("memories", "archival_claim_token"),
+            ("memories", "needs_archival_summary"),
+            ("concepts", "living_summary_source_revision"),
+            ("concept_links", "valid_until"),
+        ] {
+            assert!(
+                column_exists(&conn, table, column),
+                "{table}.{column} must be re-added even though its group's probe column exists"
+            );
+        }
     }
 
     #[test]
