@@ -141,7 +141,19 @@ enum Commands {
         action: HookAction,
     },
     /// Show service status dashboard
+    #[command(alias = "status")]
     Dashboard,
+    /// Provider wiring and API-key status (masked keys); `status` is the default action
+    Providers {
+        /// Call each provider once to verify its key (same as `providers status --probe`)
+        #[arg(long)]
+        probe: bool,
+        /// Machine-readable JSON (same as `providers status --json`)
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        action: Option<ProvidersAction>,
+    },
     /// Manage GUI server
     Gui {
         #[arg(value_enum)]
@@ -195,6 +207,19 @@ enum HookAction {
     Prompt,
     /// Save session summary on conversation end (Stop)
     Stop,
+}
+
+#[derive(Subcommand)]
+enum ProvidersAction {
+    /// Show every surface's provider/model, the keys they need, and the vector-index stamp
+    Status {
+        /// Call each provider once to verify its key
+        #[arg(long)]
+        probe: bool,
+        /// Machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -353,6 +378,15 @@ async fn main() -> anyhow::Result<()> {
         // Commands::Cleanup removed — intercepted above via OpsCliEntry.
         // DedupLog migrated to #[op] inventory (dedup_log op); intercepted above via OpsCliEntry.
         Some(Commands::Dashboard) => commands::handle_dashboard(&config),
+        Some(Commands::Providers {
+            probe,
+            json,
+            action,
+        }) => match action.unwrap_or(ProvidersAction::Status { probe, json }) {
+            ProvidersAction::Status { probe, json } => {
+                commands::handle_providers_status(&config, probe, json).await?
+            }
+        },
         Some(Commands::Gui { action }) => match action {
             ServiceAction::On => commands::handle_gui_on()?,
             ServiceAction::Off => commands::handle_gui_off()?,

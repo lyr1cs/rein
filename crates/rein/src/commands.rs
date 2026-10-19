@@ -418,3 +418,17 @@ pub fn handle_proxy_off() -> anyhow::Result<()> {
     rein::service::stop_service("proxy")?;
     Ok(())
 }
+
+pub async fn handle_providers_status(
+    config: &ReinConfig,
+    probe: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let report = rein::ops::handlers::providers::status_report(config, probe).await;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", rein::ops::handlers::providers::render_human(&report));
+    }
+    Ok(())
+}

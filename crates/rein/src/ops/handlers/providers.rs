@@ -719,6 +719,175 @@ pub async fn probe(report: &mut ProviderStatusReport, cfg: &ReinConfig) {
     report.probed_at = Some(chrono::Utc::now().to_rfc3339());
 }
 
+use crate::ops::{IntoCliText, IntoJson, IntoMarkdown, OpsRuntime};
+use crate::types::ReinResult;
+use clap::Args;
+use rein_macros::op;
+
+#[derive(Args, Deserialize, JsonSchema, Debug, Clone, Default)]
+pub struct ProvidersParams {
+    /// Call each configured provider once to verify the key (5 s timeout each).
+    #[serde(default)]
+    #[arg(long)]
+    pub probe: bool,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ProvidersOutput {
+    #[serde(flatten)]
+    pub report: ProviderStatusReport,
+    #[serde(skip)]
+    pub json_cli: bool,
+}
+
+impl IntoJson for ProvidersOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(&self.report).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl IntoMarkdown for ProvidersOutput {
+    fn to_markdown(&self) -> String {
+        crate::ops::render::render_value_as_markdown(&self.to_json(), 0)
+    }
+}
+
+fn pad(s: &str, w: usize) -> String {
+    let n = s.chars().count();
+    if n >= w {
+        s.to_string()
+    } else {
+        format!("{s}{}", " ".repeat(w - n))
+    }
+}
+
+/// Human table for the CLI (`rein providers`).
+pub fn render_human(report: &ProviderStatusReport) -> String {
+    let mut out = String::new();
+    out.push_str("Surfaces\n");
+    out.push_str(&format!(
+        "  {} {} {} {} {}\n",
+        pad("surface", 28),
+        pad("role", 7),
+        pad("provider:model", 42),
+        pad("source", 28),
+        "status"
+    ));
+    for s in &report.surfaces {
+        let pm = if s.provider == "none" {
+            "—".to_string()
+        } else if s.model.is_empty() {
+            s.provider.clone()
+        } else {
+            format!("{}:{}", s.provider, s.model)
+        };
+        out.push_str(&format!(
+            "  {} {} {} {} {}\n",
+            pad(&s.surface, 28),
+            pad(&s.role, 7),
+            pad(&pm, 42),
+            pad(&s.source_table, 28),
+            s.status
+        ));
+    }
+    out.push_str("\nKeys\n");
+    out.push_str(&format!(
+        "  {} {} {} {} {}\n",
+        pad("credential", 36),
+        pad("source", 13),
+        pad("value", 16),
+        pad("probe", 22),
+        "used by"
+    ));
+    for c in &report.credentials {
+        let name = c.id.split_once(':').map(|(_, n)| n).unwrap_or(&c.id);
+        let value = c.masked.clone().unwrap_or_else(|| {
+            if c.present {
+                "set".into()
+            } else {
+                "missing".into()
+            }
+        });
+        let probe = match &c.probe {
+            Some(p) => match (&p.http_status, &p.detail) {
+                (Some(h), Some(d)) => format!("{} ({h}) {d}", p.status),
+                (Some(h), None) => format!("{} ({h}, {} ms)", p.status, p.latency_ms),
+                (None, Some(d)) => format!("{} {d}", p.status),
+                (None, None) => p.status.clone(),
+            },
+            None => "—".to_string(),
+        };
+        out.push_str(&format!(
+            "  {} {} {} {} {}\n",
+            pad(name, 36),
+            pad(&c.kind, 13),
+            pad(&value, 16),
+            pad(&probe, 22),
+            c.used_by.join(", ")
+        ));
+        if let Some(w) = &c.warning {
+            out.push_str(&format!("    ! {w}\n"));
+        }
+    }
+    if let Some(vi) = &report.vector_index {
+        let mark = if vi.matches {
+            "✓"
+        } else {
+            "✗ run `rein warmup --reembed-all`"
+        };
+        out.push_str(&format!(
+            "\nvector index: stamped {} / configured {} ({} rows) {mark}\n",
+            vi.stamped.as_deref().unwrap_or("none"),
+            vi.configured,
+            vi.rows
+        ));
+    }
+    if let Some(t) = &report.probed_at {
+        out.push_str(&format!("probed at {t}\n"));
+    }
+    out
+}
+
+impl IntoCliText for ProvidersOutput {
+    fn to_cli_text(&self) -> String {
+        if self.json_cli {
+            serde_json::to_string_pretty(&self.to_json()).unwrap_or_else(|e| format!("Error: {e}"))
+        } else {
+            render_human(&self.report)
+        }
+    }
+}
+
+/// Shared by the CLI subcommand (`rein providers`) and `rein keys list`.
+pub async fn status_report(config: &ReinConfig, do_probe: bool) -> ProviderStatusReport {
+    let mut report = match config.open_store() {
+        Ok(store) => collect(config, Some(&store)),
+        Err(_) => collect(config, None),
+    };
+    if do_probe {
+        probe(&mut report, config).await;
+    }
+    report
+}
+
+impl OpsRuntime {
+    #[op(
+        name = "providers",
+        category = "diagnostics",
+        description = "Provider wiring and credential status: which model each surface resolves to, where that comes from, which API key it needs (masked), optional live probe. Never returns plaintext secrets.",
+        rest(method = "GET", path = "/api/providers"),
+        auth = "read_token"
+    )]
+    pub async fn providers(&self, params: ProvidersParams) -> ReinResult<ProvidersOutput> {
+        let config = self.config.clone();
+        let report = status_report(&config, params.probe).await;
+        Ok(ProvidersOutput {
+            report,
+            json_cli: false,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1019,5 +1188,33 @@ mod tests {
             .find(|c| c.id == "env:OPENAI_API_KEY")
             .unwrap();
         assert_eq!(c.probe.as_ref().unwrap().status, "unreachable");
+    }
+
+    #[test]
+    fn cli_text_lists_surfaces_and_masked_keys_only() {
+        clear_env();
+        let mut cfg = ReinConfig::default();
+        cfg.secrets.insert(
+            "GEMINI_API_KEY".into(),
+            "AIzaSyTESTKEY00000000003f2a".into(),
+        );
+        let out = ProvidersOutput {
+            report: collect(&cfg, None),
+            json_cli: false,
+        };
+        let text = out.to_cli_text();
+        assert!(text.contains("embedding"));
+        assert!(text.contains("google:gemini-embedding-001"));
+        assert!(text.contains("GEMINI_API_KEY"));
+        assert!(text.contains("AIza••••3f2a"));
+        assert!(!text.contains("AIzaSyTESTKEY"));
+        assert!(text.contains("role"));
+        let json = ProvidersOutput {
+            report: collect(&cfg, None),
+            json_cli: true,
+        }
+        .to_cli_text();
+        assert!(json.contains("\"surfaces\""));
+        assert!(!json.contains("AIzaSyTESTKEY"));
     }
 }

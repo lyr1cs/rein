@@ -351,3 +351,30 @@ async fn health_rest_preserves_legacy_top_level_health_key() {
     assert!(v["indexes"]["hnsw"].is_object());
     assert!(v["status"].is_object());
 }
+
+#[test]
+fn providers_op_is_rest_only() {
+    // No inventory CLI name: `main()` would intercept `rein providers …` before
+    // clap and the `set` / `show` / `vendors` subcommands could never run.
+    let cli: Vec<_> = inventory::iter::<rein::ops::OpsCliEntry>()
+        .filter(|e| e.name == "providers")
+        .collect();
+    assert!(cli.is_empty());
+    let rest: Vec<_> = inventory::iter::<rein::ops::OpsRestEntry>()
+        .filter(|e| e.op_name == "providers")
+        .collect();
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].path_template, "/api/providers");
+    assert_eq!(rest[0].method, hyper::Method::GET);
+    assert!(matches!(
+        rest[0].auth_policy,
+        rein::ops::AuthPolicy::ReadToken
+    ));
+    let mcp: Vec<_> = inventory::iter::<rein::ops::OpsMcpEntry>()
+        .filter(|e| e.mcp_name == "rein_providers")
+        .collect();
+    assert!(
+        mcp.is_empty(),
+        "providers must not become an MCP tool (frozen 40-tool surface)"
+    );
+}
