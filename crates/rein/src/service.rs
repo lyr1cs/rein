@@ -360,7 +360,8 @@ pub fn print_dashboard(config: &crate::config::ReinConfig) {
     }
 
     // Memory stats
-    if let Ok(store) = config.open_store() {
+    let store = config.open_store().ok();
+    if let Some(store) = &store {
         if let Ok(stats) = store.stats() {
             println!("\nMemory");
             println!(
@@ -372,6 +373,66 @@ pub fn print_dashboard(config: &crate::config::ReinConfig) {
                 stats.concept_count, stats.topic_count, stats.memoir_count
             );
         }
+    }
+
+    // Providers + Keys — same data as `rein providers`, condensed.
+    let report = crate::ops::handlers::providers::collect(config, store.as_ref());
+    println!("\nProviders");
+    const SHOWN: [(&str, &str); 7] = [
+        ("embedding", "Embedding"),
+        ("extract", "Extract"),
+        ("query_expansion", "Expansion"),
+        ("search.llm_reranker", "Reranker"),
+        ("ars.llm_judge", "Judge"),
+        ("ars.recall_synthesis", "Synthesis"),
+        ("supermemory", "Supermemory"),
+    ];
+    for (name, label) in SHOWN {
+        let Some(s) = report.surfaces.iter().find(|s| s.surface == name) else {
+            continue;
+        };
+        let line = if s.status == "disabled" {
+            "disabled".to_string()
+        } else {
+            let pm = if s.model.is_empty() {
+                s.provider.clone()
+            } else {
+                format!("{}:{}", s.provider, s.model)
+            };
+            let extra = match (name, &report.vector_index) {
+                ("embedding", Some(vi)) => format!(
+                    " ({}d)  {}",
+                    config.embedding.dimensions,
+                    if vi.matches {
+                        "index ✓"
+                    } else {
+                        "index ✗ (rein warmup --reembed-all)"
+                    }
+                ),
+                ("embedding", None) => format!(" ({}d)", config.embedding.dimensions),
+                _ => String::new(),
+            };
+            let flag = if s.status == "missing_credential" {
+                "  \x1b[31mmissing key\x1b[0m"
+            } else {
+                ""
+            };
+            format!("{pm:<40} {}{extra}{flag}", s.source_table)
+        };
+        println!("  {label:<12} {line}");
+    }
+    println!("\nKeys");
+    for c in &report.credentials {
+        let name = c.id.split_once(':').map(|(_, n)| n).unwrap_or(&c.id);
+        let value = c
+            .masked
+            .clone()
+            .unwrap_or_else(|| "\x1b[31mmissing\x1b[0m".to_string());
+        println!(
+            "  {name:<24} {value:<16} {:<13} {}",
+            c.kind,
+            c.used_by.join(", ")
+        );
     }
 
     // Queue status — scan the DB-scoped queue subdir for memory_queue*.jsonl files

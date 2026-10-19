@@ -454,6 +454,12 @@ pub struct ConfigSnapshot {
     pub database_path: String,
     pub embedding_provider: String,
     pub embedding_dimensions: usize,
+    /// `<provider>:<model>` identity used for the vector provenance stamp.
+    pub embedding_model: String,
+    /// Masked key line for the embedding surface, e.g. `GEMINI_API_KEY (AIza••••3f2a, env)`.
+    pub embedding_key: String,
+    /// Masked key line for the extract surface.
+    pub extract_key: String,
     pub extract_provider: String,
     pub extract_model: String,
     pub compact_mode: bool,
@@ -475,6 +481,9 @@ impl IntoMarkdown for ConfigSnapshot {
              - Database path: {}\n\
              - Embedding provider: {}\n\
              - Embedding dimensions: {}\n\
+             - Embedding model: {}\n\
+             - Embedding key: {}\n\
+             - Extract key: {}\n\
              - Extract provider: {}\n\
              - Extract model: {}\n\
              - Compact mode: {}\n\
@@ -484,6 +493,9 @@ impl IntoMarkdown for ConfigSnapshot {
             self.database_path,
             self.embedding_provider,
             self.embedding_dimensions,
+            self.embedding_model,
+            self.embedding_key,
+            self.extract_key,
             self.extract_provider,
             self.extract_model,
             self.compact_mode,
@@ -502,6 +514,9 @@ impl IntoCliText for ConfigSnapshot {
             "Database path: {}\n\
              Embedding provider: {}\n\
              Embedding dimensions: {}\n\
+             Embedding model: {}\n\
+             Embedding key: {}\n\
+             Extract key: {}\n\
              Extract provider: {}\n\
              Extract model: {}\n\
              Compact mode: {}\n\
@@ -511,6 +526,9 @@ impl IntoCliText for ConfigSnapshot {
             self.database_path,
             self.embedding_provider,
             self.embedding_dimensions,
+            self.embedding_model,
+            self.embedding_key,
+            self.extract_key,
             self.extract_provider,
             self.extract_model,
             self.compact_mode,
@@ -534,10 +552,30 @@ impl OpsRuntime {
             crate::config::Provider::Omlx => cfg.extract.omlx.model.clone(),
             _ => cfg.extract.google.model.clone(),
         };
+        let report = crate::ops::handlers::providers::collect(cfg, None);
+        let key_line = |surface: &str| -> String {
+            let Some(s) = report.surfaces.iter().find(|s| s.surface == surface) else {
+                return "—".into();
+            };
+            let Some(id) = &s.credential else {
+                return "none needed".into();
+            };
+            let Some(c) = report.credentials.iter().find(|c| &c.id == id) else {
+                return id.clone();
+            };
+            let name = id.split_once(':').map(|(_, n)| n).unwrap_or(id);
+            match &c.masked {
+                Some(m) => format!("{name} ({m}, {})", c.kind),
+                None => format!("{name} (missing)"),
+            }
+        };
         Ok(ConfigSnapshot {
             database_path: cfg.resolve_db_path().display().to_string(),
             embedding_provider: cfg.embedding.provider.clone(),
             embedding_dimensions: cfg.embedding.dimensions,
+            embedding_model: cfg.embedding_model(),
+            embedding_key: key_line("embedding"),
+            extract_key: key_line("extract"),
             extract_provider: cfg.extract.provider.clone(),
             extract_model,
             compact_mode: cfg.server.compact,
@@ -545,6 +583,36 @@ impl OpsRuntime {
             decay_base_lambda: cfg.decay.base_lambda,
             dedup_similarity: cfg.search.dedup_similarity,
         })
+    }
+}
+
+#[cfg(test)]
+mod config_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn config_snapshot_shows_masked_keys_only() {
+        std::env::remove_var("GEMINI_API_KEY");
+        let mut cfg = crate::config::ReinConfig::default();
+        cfg.database.path = ":memory:".into();
+        cfg.secrets.insert(
+            "GEMINI_API_KEY".into(),
+            "AIzaSyTESTKEY00000000003f2a".into(),
+        );
+        let rt = OpsRuntime::for_cli(std::sync::Arc::new(cfg));
+        let snap = rt.config_snapshot().unwrap();
+        assert_eq!(snap.embedding_model, "google:gemini-embedding-001");
+        assert_eq!(
+            snap.embedding_key,
+            "GEMINI_API_KEY (AIza••••3f2a, secrets_file)"
+        );
+        assert_eq!(
+            snap.extract_key,
+            "GEMINI_API_KEY (AIza••••3f2a, secrets_file)"
+        );
+        let text = snap.to_cli_text();
+        assert!(text.contains("Embedding key: GEMINI_API_KEY (AIza••••3f2a"));
+        assert!(!text.contains("AIzaSyTESTKEY"));
     }
 }
 
