@@ -582,7 +582,7 @@ pub fn create_ars_extractor(config: &ReinConfig, section: &str) -> Option<Extrac
             crate::extract::llm::OmlxExtractor::new(
                 r.endpoint,
                 r.model,
-                config.extract.omlx.disable_thinking,
+                config.extract.omlx.disable_thinking.unwrap_or(true),
             ),
         )),
     }

@@ -274,7 +274,7 @@ fn create_expander(config: &ReinConfig) -> Option<ExpanderKind> {
         Provider::Omlx => Some(ExpanderKind::Omlx(OmlxExpander::new(
             r.endpoint,
             r.model,
-            config.query_expansion.omlx.disable_thinking,
+            config.query_expansion.omlx.disable_thinking.unwrap_or(true),
         ))),
         Provider::None => None,
     }

@@ -851,7 +851,7 @@ fn build_dedup_extractor() -> Option<ExtractorKind> {
             crate::extract::llm::OmlxExtractor::new(
                 r.endpoint,
                 r.model,
-                cfg.extract.omlx.disable_thinking,
+                cfg.extract.omlx.disable_thinking.unwrap_or(true),
             ),
         )),
     }

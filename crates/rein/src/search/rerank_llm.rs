@@ -206,7 +206,7 @@ fn create_reranker(config: &ReinConfig) -> Option<RerankerKind> {
         Provider::Omlx => Some(RerankerKind::Omlx(OmlxReranker::new(
             r.endpoint,
             r.model,
-            config.query_expansion.omlx.disable_thinking,
+            config.query_expansion.omlx.disable_thinking.unwrap_or(true),
         ))),
         Provider::None => None,
     }

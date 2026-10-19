@@ -303,9 +303,13 @@ fn build_classifier(config: &ReinConfig) -> Option<ClassifierKind> {
         }
         Provider::Omlx => {
             let disable_thinking = if used_dedicated {
-                config.intelligent_merge.omlx.disable_thinking
+                config
+                    .intelligent_merge
+                    .omlx
+                    .disable_thinking
+                    .unwrap_or(true)
             } else {
-                config.query_expansion.omlx.disable_thinking
+                config.query_expansion.omlx.disable_thinking.unwrap_or(true)
             };
             Some(ClassifierKind::Omlx(OmlxClassifier {
                 client: crate::search::cache::http_client_15s(),

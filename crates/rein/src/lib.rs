@@ -47,6 +47,7 @@ pub mod mcp;
 pub mod ops;
 pub mod proxy;
 pub mod search;
+pub mod secrets;
 pub mod service;
 pub mod store;
 #[cfg(test)]

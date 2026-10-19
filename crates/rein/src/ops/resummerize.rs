@@ -249,7 +249,7 @@ pub fn create_resummerize_extractor(config: &ReinConfig) -> Option<ExtractorKind
             crate::extract::llm::OmlxExtractor::new(
                 r.endpoint,
                 r.model,
-                config.extract.omlx.disable_thinking,
+                config.extract.omlx.disable_thinking.unwrap_or(true),
             ),
         )),
     }

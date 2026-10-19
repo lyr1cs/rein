@@ -891,7 +891,7 @@ pub fn create_extractor(config: &ReinConfig) -> Option<ExtractorKind> {
         Provider::Omlx => Some(ExtractorKind::Omlx(OmlxExtractor::new(
             r.endpoint,
             r.model,
-            config.extract.omlx.disable_thinking,
+            config.extract.omlx.disable_thinking.unwrap_or(true),
         ))),
         Provider::None => None,
     }
@@ -924,7 +924,7 @@ pub fn create_memory_worker_extractor(config: &ReinConfig) -> Option<ExtractorKi
         Provider::Omlx => Some(ExtractorKind::Omlx(OmlxExtractor::new(
             r.endpoint,
             r.model,
-            config.extract.omlx.disable_thinking,
+            config.extract.omlx.disable_thinking.unwrap_or(true),
         ))),
         Provider::None => None,
     }

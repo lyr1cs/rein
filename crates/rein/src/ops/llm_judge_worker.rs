@@ -209,7 +209,7 @@ pub(crate) fn structural_fingerprints_for_config(
             "omlx",
             &resolved.model,
             &resolved.endpoint,
-            if config.extract.omlx.disable_thinking {
+            if config.extract.omlx.disable_thinking.unwrap_or(true) {
                 "disable_thinking"
             } else {
                 "thinking_enabled"
@@ -1671,7 +1671,7 @@ mod tests {
         config.llm.provider = "omlx".to_string();
         config.llm.omlx.model = Some("judge-model-a".to_string());
         config.llm.omlx.endpoint = Some("http://127.0.0.1:9999/v1".to_string());
-        config.extract.omlx.disable_thinking = true;
+        config.extract.omlx.disable_thinking = Some(true);
         let extractor =
             crate::ops::concept_summary::create_ars_extractor(&config, "ars.llm_judge").unwrap();
         let (resolved, _) =

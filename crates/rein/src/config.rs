@@ -17,9 +17,9 @@ pub enum Provider {
 impl Provider {
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
-            "google" => Provider::Google,
-            "omlx" => Provider::Omlx,
+            "google" | "gemini" => Provider::Google,
             "none" => Provider::None,
+            other if crate::vendors::vendor_preset(other).is_some() => Provider::Omlx,
             other => {
                 tracing::warn!("unknown provider '{other}', falling back to None");
                 Provider::None
@@ -73,6 +73,10 @@ fn default_config_version() -> u32 {
 #[serde(deny_unknown_fields)]
 #[derive(Default)]
 pub struct ReinConfig {
+    /// Keys read from `~/.rein/secrets.env` (see `crate::secrets`). Process
+    /// env wins over this map in `secret()`. Never part of the TOML.
+    #[serde(skip)]
+    pub secrets: std::collections::BTreeMap<String, String>,
     /// Config schema version (see [`CURRENT_CONFIG_VERSION`]). Absent in any
     /// pre-1.0 config → deserializes to the current version; the derived
     /// `Default` leaves it `0` (unversioned baseline). A value newer than this
@@ -237,6 +241,27 @@ impl Default for DedupConfig {
 
 /// Config for the LLM-driven intelligent-merge classifier (opt-in).
 ///
+/// An API key held in memory. `Debug` never prints the value so a stray
+/// `{:?}` on a config or resolved struct cannot leak it into logs.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretString(****)")
+    }
+}
+
 /// When `enabled = true`, store_with_dedup consults an LLM on gray-zone
 /// similarity cases and chooses among ignore / update / merge / create_new
 /// instead of the mechanical jaccard/containment threshold.
@@ -283,9 +308,8 @@ impl IntelligentMergeConfig {
     /// this returns Provider::None.
     pub fn resolved_provider(&self) -> Provider {
         match self.provider.to_lowercase().as_str() {
-            "google" | "gemini" => Provider::Google,
-            "omlx" | "local" => Provider::Omlx,
-            _ => Provider::None,
+            "none" | "inherit" | "" => Provider::None,
+            other => Provider::from_str(other),
         }
     }
 }
@@ -338,10 +362,12 @@ impl ResummerizeConfig {
     /// everything else matches the same provider names used elsewhere.
     pub fn resolved_provider(&self, fallback_extract_provider: Provider) -> Provider {
         match self.llm_backend.to_lowercase().as_str() {
-            "google" | "gemini" => Provider::Google,
-            "omlx" | "local" => Provider::Omlx,
             "none" => Provider::None,
-            _ => fallback_extract_provider, // "inherit" or unknown → fall back
+            "inherit" | "" => fallback_extract_provider,
+            other => match Provider::from_str(other) {
+                Provider::None => fallback_extract_provider, // unknown → fall back
+                provider => provider,
+            },
         }
     }
 }
@@ -491,10 +517,12 @@ impl Default for ArsConfig {
 impl ArsConfig {
     pub fn resolved_provider(&self, fallback_extract_provider: Provider) -> Provider {
         match self.llm_backend.to_lowercase().as_str() {
-            "google" | "gemini" => Provider::Google,
-            "omlx" | "local" => Provider::Omlx,
             "none" => Provider::None,
-            _ => fallback_extract_provider,
+            "inherit" | "" => fallback_extract_provider,
+            other => match Provider::from_str(other) {
+                Provider::None => fallback_extract_provider,
+                provider => provider,
+            },
         }
     }
 }
@@ -580,6 +608,16 @@ pub struct ArsLlmJudgeConfig {
     /// this flag is set.
     #[serde(default)]
     pub enabled: bool,
+    /// LLM provider for the judge (runtime + nightly cron): "inherit" (default,
+    /// walks to `[llm]`) | "google" | "omlx" | any vendor preset | "none".
+    #[serde(default = "default_judge_provider")]
+    pub provider: String,
+    /// `[ars.llm_judge.google]` — judge-only Google overrides.
+    #[serde(default)]
+    pub google: LlmProviderTable,
+    /// `[ars.llm_judge.openai]` (alias `omlx`) — judge-only OpenAI-compatible overrides.
+    #[serde(default)]
+    pub omlx: LlmProviderTable,
     /// Judge Cap B (synthesis) outputs. Default `true` once master is on.
     #[serde(default = "default_true")]
     pub synthesis_enabled: bool,
@@ -686,10 +724,17 @@ fn default_judge_cron_sample_rate() -> f64 {
     0.2
 }
 
+fn default_judge_provider() -> String {
+    "inherit".to_string()
+}
+
 impl Default for ArsLlmJudgeConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            provider: default_judge_provider(),
+            google: LlmProviderTable::default(),
+            omlx: LlmProviderTable::default(),
             synthesis_enabled: true,
             concept_summary_enabled: true,
             recall_ranking_enabled: false,
@@ -778,6 +823,12 @@ pub struct LlmProviderTable {
     /// back to a 16K safety limit.
     #[serde(default)]
     pub max_input_chars: Option<usize>,
+    /// OpenAI-compatible tables only: "bearer" | "x-api-key" | "api-key".
+    #[serde(default)]
+    pub auth_header: Option<String>,
+    /// OpenAI-compatible tables only: prepend `/no_think` to system prompts.
+    #[serde(default)]
+    pub disable_thinking: Option<bool>,
 }
 
 /// Source level a `ResolvedLlmConfig` came from — surfaced for
@@ -839,14 +890,16 @@ pub struct DatabaseConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmbeddingConfig {
-    /// Embedding backend: `"google"` (default), `"omlx"`, or `"none"` (disables embedding).
+    /// Embedding backend: `"google"` (default), `"none"`, or any OpenAI-compatible
+    /// vendor name (`"omlx"`, `"openai"`, `"perplexity"`, … — see `crate::vendors`).
     pub provider: String,
     /// Embedding vector length (default 3072). Must match the vector index dimensionality.
     pub dimensions: usize,
     /// `[embedding.google]` — Gemini embedding settings (used when `provider = "google"`).
     pub google: GoogleEmbeddingConfig,
-    /// `[embedding.omlx]` — local OpenAI-compatible embedding settings (used when `provider = "omlx"`).
-    pub omlx: OmlxEmbeddingConfig,
+    /// `[embedding.omlx]` (alias `[embedding.openai]`) — OpenAI-compatible
+    /// embedding settings for every vendor name.
+    pub omlx: OpenAiCompatibleEmbeddingConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -858,6 +911,9 @@ pub struct GoogleEmbeddingConfig {
     /// Google embedder is disabled (no embeddings produced).
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Env var read for the key at load time. Default `GEMINI_API_KEY`.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
     /// API endpoint override (for proxies in China, etc.)
     /// Default: "https://generativelanguage.googleapis.com"
     #[serde(default = "default_google_endpoint")]
@@ -870,12 +926,37 @@ fn default_google_endpoint() -> String {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OmlxEmbeddingConfig {
-    /// OpenAI-compatible embedding endpoint. Default: "http://localhost:8000/v1".
+pub struct OpenAiCompatibleEmbeddingConfig {
+    /// OpenAI-compatible base URL (`/embeddings` is appended). Default
+    /// "http://localhost:8000/v1"; for a named vendor the compiled localhost
+    /// default is replaced by the vendor's endpoint unless set explicitly.
     pub endpoint: String,
-    /// OMLX embedding model name sent to the endpoint. Default: "default".
+    /// Model name. Default: "default".
     #[serde(default = "default_omlx_model")]
     pub model: String,
+    /// Env var holding the API key; unset → vendor default.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// "bearer" (default) | "x-api-key" | "api-key".
+    #[serde(default)]
+    pub auth_header: Option<String>,
+    /// Send the requested vector size (`[embedding].dimensions`) in the
+    /// vendor's dimensions field (Matryoshka models). Default false.
+    #[serde(default)]
+    pub send_dimensions: bool,
+    /// Value sent in the vendor's input-type field for query embeddings
+    /// (e.g. Voyage "query", Jina "retrieval.query"). Unset → not sent.
+    #[serde(default)]
+    pub query_input_type: Option<String>,
+    /// Same for document embeddings (e.g. Voyage "document").
+    #[serde(default)]
+    pub document_input_type: Option<String>,
+    /// Response encoding: "float" | "base64_int8". Unset → vendor default.
+    #[serde(default)]
+    pub encoding: Option<String>,
+    /// Max texts per request; `embed_batch` chunks to this. Unset → vendor default.
+    #[serde(default)]
+    pub max_batch: Option<usize>,
 }
 
 fn default_omlx_model() -> String {
@@ -1411,17 +1492,27 @@ pub struct GoogleExtractConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OmlxExtractConfig {
-    /// OpenAI-compatible base URL for the local model. Default: "http://localhost:11434/v1".
+    /// OpenAI-compatible base URL. Default: "http://localhost:11434/v1". For a
+    /// named vendor (`provider = "openai"` …) the compiled localhost default
+    /// is replaced by the vendor's endpoint unless you set this explicitly.
     pub endpoint: String,
-    /// Local model name passed to the OpenAI-compatible endpoint. Default: "default".
+    /// Model name passed to the endpoint. Default: "default".
     #[serde(default = "default_omlx_extract_model")]
     pub model: String,
-    /// Max input characters for local models (default 16000, suitable for 7B-13B models).
+    /// Max input characters (default 16000).
     #[serde(default = "default_omlx_max_input_chars")]
     pub max_input_chars: usize,
-    /// Prepend /no_think to system prompts (for Qwen3 thinking mode). Default: true.
-    #[serde(default = "default_true")]
-    pub disable_thinking: bool,
+    /// Prepend /no_think to system prompts (Qwen3 thinking mode). Unset →
+    /// vendor default (`omlx` true, every hosted vendor false).
+    #[serde(default)]
+    pub disable_thinking: Option<bool>,
+    /// Env var holding the API key. Unset → vendor default (`OPENAI_API_KEY`
+    /// for openai, none for omlx/ollama/…).
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// "bearer" (default) | "x-api-key" | "api-key".
+    #[serde(default)]
+    pub auth_header: Option<String>,
 }
 
 fn default_omlx_max_input_chars() -> usize {
@@ -1482,15 +1573,24 @@ fn default_expand_google_model() -> String {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OmlxExpandConfig {
-    /// OpenAI-compatible base URL for the local expansion model. Default: "http://localhost:8000/v1".
+    /// OpenAI-compatible base URL. Default: "http://localhost:8000/v1"; for a
+    /// named vendor the compiled localhost default is replaced by the vendor's
+    /// endpoint unless set explicitly.
     #[serde(default = "default_omlx_expand_endpoint")]
     pub endpoint: String,
-    /// Local model name passed to the OpenAI-compatible endpoint. Default: "default".
+    /// Model name passed to the endpoint. Default: "default".
     #[serde(default = "default_omlx_model")]
     pub model: String,
-    /// Prepend /no_think to system prompts (for Qwen3 thinking mode). Default: true.
-    #[serde(default = "default_true")]
-    pub disable_thinking: bool,
+    /// Prepend /no_think to system prompts (Qwen3 thinking mode). Unset →
+    /// vendor default (`omlx` true, every hosted vendor false).
+    #[serde(default)]
+    pub disable_thinking: Option<bool>,
+    /// Env var holding the API key. Unset → vendor default.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// "bearer" (default) | "x-api-key" | "api-key".
+    #[serde(default)]
+    pub auth_header: Option<String>,
 }
 
 fn default_omlx_expand_endpoint() -> String {
@@ -1519,7 +1619,7 @@ impl Default for EmbeddingConfig {
             provider: "google".to_string(),
             dimensions: 3072,
             google: GoogleEmbeddingConfig::default(),
-            omlx: OmlxEmbeddingConfig::default(),
+            omlx: OpenAiCompatibleEmbeddingConfig::default(),
         }
     }
 }
@@ -1529,16 +1629,24 @@ impl Default for GoogleEmbeddingConfig {
         Self {
             model: "gemini-embedding-001".to_string(),
             api_key: None,
+            api_key_env: None,
             endpoint: default_google_endpoint(),
         }
     }
 }
 
-impl Default for OmlxEmbeddingConfig {
+impl Default for OpenAiCompatibleEmbeddingConfig {
     fn default() -> Self {
         Self {
             endpoint: "http://localhost:8000/v1".to_string(),
             model: "default".to_string(),
+            api_key_env: None,
+            auth_header: None,
+            send_dimensions: false,
+            query_input_type: None,
+            document_input_type: None,
+            encoding: None,
+            max_batch: None,
         }
     }
 }
@@ -1838,7 +1946,9 @@ impl Default for OmlxExtractConfig {
             endpoint: "http://localhost:11434/v1".to_string(),
             model: "default".to_string(),
             max_input_chars: default_omlx_max_input_chars(),
-            disable_thinking: true,
+            disable_thinking: None,
+            api_key_env: None,
+            auth_header: None,
         }
     }
 }
@@ -1869,7 +1979,9 @@ impl Default for OmlxExpandConfig {
         Self {
             endpoint: default_omlx_expand_endpoint(),
             model: "default".to_string(),
-            disable_thinking: true,
+            disable_thinking: None,
+            api_key_env: None,
+            auth_header: None,
         }
     }
 }
@@ -1877,6 +1989,61 @@ impl Default for OmlxExpandConfig {
 // ---------------------------------------------------------------------------
 // Loading
 // ---------------------------------------------------------------------------
+
+/// `[embedding.google].api_key` comes from `api_key_env` (default
+/// `GEMINI_API_KEY`). Separate from the extract / expansion copies so the
+/// embedding key can live in its own variable.
+fn apply_embedding_key_env(config: &mut ReinConfig) {
+    let env_name = config
+        .embedding
+        .google
+        .api_key_env
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "GEMINI_API_KEY".to_string());
+    if let Some(key) = config.secret(&env_name) {
+        config.embedding.google.api_key = Some(key);
+    }
+}
+
+/// Sections whose `omlx` sub-table may be spelled `openai` in a user file.
+const OPENAI_ALIAS_SECTIONS: &[&[&str]] = &[
+    &["embedding"],
+    &["extract"],
+    &["query_expansion"],
+    &["intelligent_merge"],
+    &["llm"],
+    &["ars", "llm_judge"],
+];
+
+/// `[section.openai]` is an alias of `[section.omlx]`. Rename it before the
+/// deep-merge so the merged table never carries both keys (serde would see a
+/// duplicate field). Both spellings in one file are an error.
+fn descend_mut<'a>(root: &'a mut toml::Value, path: &[&str]) -> Option<&'a mut toml::Value> {
+    let mut cur = root;
+    for part in path {
+        cur = cur.get_mut(*part)?;
+    }
+    Some(cur)
+}
+
+fn normalize_openai_alias(mut user_val: toml::Value) -> anyhow::Result<toml::Value> {
+    for path in OPENAI_ALIAS_SECTIONS {
+        let Some(table) = descend_mut(&mut user_val, path).and_then(|v| v.as_table_mut()) else {
+            continue;
+        };
+        if let Some(openai) = table.remove("openai") {
+            if table.contains_key("omlx") {
+                anyhow::bail!(
+                    "duplicate field: [{}] has both `openai` and `omlx` tables (they are aliases)",
+                    path.join(".")
+                );
+            }
+            table.insert("omlx".to_string(), openai);
+        }
+    }
+    Ok(user_val)
+}
 
 fn nonempty_env(key: &str) -> Option<String> {
     std::env::var(key)
@@ -1935,6 +2102,13 @@ impl ReinConfig {
     /// 3. Compiled-in defaults
     pub fn load() -> anyhow::Result<Self> {
         let mut config = Self::default();
+        let secrets = match crate::secrets::load_default() {
+            Ok(map) => map,
+            Err(e) => {
+                eprintln!("rein: WARNING — secrets file not loaded: {e}");
+                Default::default()
+            }
+        };
 
         // Determine config file path
         let config_path = std::env::var("REIN_CONFIG")
@@ -1946,26 +2120,25 @@ impl ReinConfig {
             let contents = std::fs::read_to_string(&config_path)?;
             config = merge_toml(config, &contents)?;
         }
+        config.secrets = secrets;
 
         // Environment variable overrides
         if let Some(db) = nonempty_env("REIN_DB") {
             config.database.path = db;
         }
-        if let Some(key) = nonempty_env("GEMINI_API_KEY") {
-            config.embedding.google.api_key = Some(key);
-        }
-        if let Some(key) = nonempty_env("SUPERMEMORY_CC_API_KEY") {
+        apply_embedding_key_env(&mut config);
+        if let Some(key) = config.secret("SUPERMEMORY_CC_API_KEY") {
             config.sync.api_key = Some(key);
         }
         // Reuse GEMINI_API_KEY for extract if not set separately
         if config.extract.google.api_key.is_none() {
-            if let Some(key) = nonempty_env("GEMINI_API_KEY") {
+            if let Some(key) = config.secret("GEMINI_API_KEY") {
                 config.extract.google.api_key = Some(key);
             }
         }
         // Reuse GEMINI_API_KEY for query expansion if not set separately
         if config.query_expansion.google.api_key.is_none() {
-            if let Some(key) = nonempty_env("GEMINI_API_KEY") {
+            if let Some(key) = config.secret("GEMINI_API_KEY") {
                 config.query_expansion.google.api_key = Some(key);
             }
         }
@@ -2026,9 +2199,61 @@ impl ReinConfig {
     }
 
     /// The embedding model name (for cache keying and model-change detection).
+    /// Look up an API key by env-var name: non-blank process env first, then
+    /// the secrets file. Blank values count as unset.
+    pub fn secret(&self, env_name: &str) -> Option<String> {
+        if let Some(v) = nonempty_env(env_name) {
+            return Some(v);
+        }
+        self.secrets
+            .get(env_name)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    }
+
+    /// Canonical lowercase provider name for `[embedding]` (`"local"` → `"omlx"`).
+    pub fn embedding_provider_name(&self) -> String {
+        match self.embedding_provider() {
+            Provider::Google => "google".to_string(),
+            Provider::None => "none".to_string(),
+            Provider::Omlx => crate::vendors::canonical_vendor_name(&self.embedding.provider),
+        }
+    }
+
+    /// True when the OpenAI-compatible embedder sends a query/document role,
+    /// i.e. query vectors must not share a cache entry with document vectors.
+    pub fn embedding_is_asymmetric(&self) -> bool {
+        self.embedding_provider() == Provider::Omlx
+            && (self.embedding.omlx.query_input_type.is_some()
+                || self.embedding.omlx.document_input_type.is_some())
+    }
+
+    /// `EmbedCache` key for *query* vectors (document vectors keep `embedding_model()`).
+    pub fn embedding_query_cache_key(&self) -> String {
+        let model = self.embedding_model();
+        if self.embedding_is_asymmetric() {
+            format!("{model}#query")
+        } else {
+            model
+        }
+    }
+
+    pub fn judge_runtime_active(&self) -> bool {
+        self.ars.llm_judge.enabled
+            && (self.ars.llm_judge.synthesis_enabled || self.ars.llm_judge.concept_summary_enabled)
+    }
+
+    pub fn judge_nightly_active(&self) -> bool {
+        self.ars.llm_judge.enabled && self.ars.llm_judge.nightly_cron.enabled
+    }
+
     pub fn embedding_model(&self) -> String {
         match self.embedding_provider() {
-            Provider::Omlx => format!("omlx:{}", self.embedding.omlx.model),
+            Provider::Omlx => format!(
+                "{}:{}",
+                self.embedding_provider_name(),
+                self.embedding.omlx.model
+            ),
             Provider::Google => format!("google:{}", self.embedding.google.model),
             Provider::None => "none".to_string(),
         }
@@ -2064,6 +2289,45 @@ impl ReinConfig {
             &self.resummerize.llm_backend,
         )?;
         validate_provider_name_or_inherit("ars.llm_backend", &self.ars.llm_backend)?;
+        if !matches!(
+            self.intelligent_merge.provider.to_lowercase().as_str(),
+            "none" | ""
+        ) {
+            validate_provider_name_or_inherit(
+                "intelligent_merge.provider",
+                &self.intelligent_merge.provider,
+            )?;
+        }
+        validate_provider_name_or_inherit("ars.llm_judge.provider", &self.ars.llm_judge.provider)?;
+        if !self.llm.provider.trim().is_empty() {
+            validate_provider_name("llm.provider", &self.llm.provider)?;
+        }
+        validate_vendor_capability("embedding.provider", &self.embedding.provider, false)?;
+        for (field, value) in [
+            ("extract.provider", self.extract.provider.as_str()),
+            (
+                "query_expansion.provider",
+                self.query_expansion.provider.as_str(),
+            ),
+            ("search.llm_reranker", self.search.llm_reranker.as_str()),
+            ("async_memory.provider", self.async_memory.provider.as_str()),
+            (
+                "resummerize.llm_backend",
+                self.resummerize.llm_backend.as_str(),
+            ),
+            ("ars.llm_backend", self.ars.llm_backend.as_str()),
+            (
+                "intelligent_merge.provider",
+                self.intelligent_merge.provider.as_str(),
+            ),
+            ("llm.provider", self.llm.provider.as_str()),
+            (
+                "ars.llm_judge.provider",
+                self.ars.llm_judge.provider.as_str(),
+            ),
+        ] {
+            validate_vendor_capability(field, value, true)?;
+        }
 
         if self.database.path.trim().is_empty() {
             anyhow::bail!("database.path must not be empty");
@@ -2442,20 +2706,44 @@ pub fn pool_metrics_for_path(
     Ok(pool.metrics())
 }
 
+fn provider_name_is_known(value: &str) -> bool {
+    matches!(value, "google" | "gemini" | "omlx" | "none")
+        || crate::vendors::vendor_preset(value).is_some()
+}
+
 fn validate_provider_name(field: &str, value: &str) -> anyhow::Result<()> {
-    match value.to_lowercase().as_str() {
-        "google" | "omlx" | "none" => Ok(()),
-        _ => anyhow::bail!("invalid {field}='{value}'. Expected one of: google, omlx, none"),
+    if provider_name_is_known(&value.to_lowercase()) {
+        return Ok(());
     }
+    anyhow::bail!(
+        "invalid {field}='{value}'. Expected google, none, or an OpenAI-compatible vendor: {}",
+        crate::vendors::vendor_names().join(", ")
+    )
 }
 
 fn validate_provider_name_or_inherit(field: &str, value: &str) -> anyhow::Result<()> {
-    match value.to_lowercase().as_str() {
-        "inherit" | "google" | "omlx" | "none" => Ok(()),
-        _ => {
-            anyhow::bail!("invalid {field}='{value}'. Expected one of: inherit, google, omlx, none")
-        }
+    if value.eq_ignore_ascii_case("inherit") {
+        return Ok(());
     }
+    validate_provider_name(field, value)
+}
+
+/// A vendor preset chosen for a surface it cannot serve is a config error,
+/// not a runtime 404.
+fn validate_vendor_capability(field: &str, value: &str, needs_chat: bool) -> anyhow::Result<()> {
+    let Some(preset) = crate::vendors::vendor_preset(value) else {
+        return Ok(());
+    };
+    if needs_chat && !preset.chat {
+        anyhow::bail!("{field} = \"{value}\": {} has no chat API", preset.name);
+    }
+    if !needs_chat && !preset.embeddings {
+        anyhow::bail!(
+            "{field} = \"{value}\": {} has no embeddings API",
+            preset.name
+        );
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2828,7 +3116,7 @@ fn nonempty(s: &str) -> Option<&str> {
 fn pick_provider(name: &str) -> Option<Provider> {
     match name.to_lowercase().as_str() {
         "google" | "gemini" => Some(Provider::Google),
-        "omlx" | "local" => Some(Provider::Omlx),
+        other if crate::vendors::vendor_preset(other).is_some() => Some(Provider::Omlx),
         _ => None,
     }
 }
@@ -3281,8 +3569,9 @@ fn merge_toml(base: ReinConfig, toml_str: &str) -> anyhow::Result<ReinConfig> {
     let default_toml = toml::to_string(&serde_to_value(&base)?)?;
     let mut base_val: toml::Value = toml::from_str(&default_toml)?;
 
-    // Parse the user file
+    // Parse the user file and fold `[x.openai]` into `[x.omlx]`
     let user_val: toml::Value = toml::from_str(toml_str)?;
+    let user_val = normalize_openai_alias(user_val)?;
 
     // Deep-merge user over base
     deep_merge(&mut base_val, &user_val);
@@ -4592,5 +4881,185 @@ api_key = "test-sync-key"
                 .is_ok(),
             "fallback store must remain usable"
         );
+    }
+}
+
+#[cfg(test)]
+mod v15_provider_tests {
+    use super::*;
+
+    #[test]
+    fn provider_from_str_maps_every_vendor_preset_to_omlx() {
+        for name in crate::vendors::vendor_names() {
+            assert_eq!(Provider::from_str(name), Provider::Omlx, "{name}");
+        }
+        assert_eq!(Provider::from_str("google"), Provider::Google);
+        assert_eq!(Provider::from_str("none"), Provider::None);
+        assert_eq!(Provider::from_str("bogus"), Provider::None);
+    }
+
+    #[test]
+    fn openai_alias_table_is_accepted_everywhere() {
+        let cfg = ReinConfig::load_from_str(
+            r#"
+[embedding]
+provider = "openai"
+dimensions = 3072
+[embedding.openai]
+model = "text-embedding-3-large"
+send_dimensions = true
+
+[extract]
+provider = "openai"
+[extract.openai]
+model = "gpt-5-mini"
+api_key_env = "MY_OPENAI_KEY"
+
+[query_expansion]
+provider = "deepseek"
+[query_expansion.openai]
+model = "deepseek-chat"
+
+[intelligent_merge]
+enabled = true
+provider = "openai"
+[intelligent_merge.openai]
+model = "gpt-5-mini"
+
+[llm]
+provider = "openrouter"
+[llm.openai]
+model = "anthropic/claude-sonnet-4.5"
+
+[ars.llm_judge]
+enabled = true
+provider = "openai"
+[ars.llm_judge.openai]
+model = "gpt-5"
+auth_header = "x-api-key"
+"#,
+        )
+        .expect("alias tables load");
+        assert_eq!(cfg.embedding.omlx.model, "text-embedding-3-large");
+        assert!(cfg.embedding.omlx.send_dimensions);
+        assert_eq!(
+            cfg.extract.omlx.api_key_env.as_deref(),
+            Some("MY_OPENAI_KEY")
+        );
+        assert_eq!(cfg.query_expansion.omlx.model, "deepseek-chat");
+        assert_eq!(cfg.intelligent_merge.omlx.model, "gpt-5-mini");
+        assert_eq!(
+            cfg.llm.omlx.model.as_deref(),
+            Some("anthropic/claude-sonnet-4.5")
+        );
+        assert_eq!(cfg.ars.llm_judge.provider, "openai");
+        assert_eq!(cfg.ars.llm_judge.omlx.model.as_deref(), Some("gpt-5"));
+        assert_eq!(
+            cfg.ars.llm_judge.omlx.auth_header.as_deref(),
+            Some("x-api-key")
+        );
+    }
+
+    #[test]
+    fn writing_both_omlx_and_openai_tables_is_a_duplicate_field_error() {
+        let err = ReinConfig::load_from_str(
+            "[extract]\nprovider = \"omlx\"\n[extract.omlx]\nmodel = \"a\"\n[extract.openai]\nmodel = \"b\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("duplicate field"), "{err}");
+    }
+
+    #[test]
+    fn vendor_without_embeddings_is_rejected_for_embedding() {
+        let err =
+            ReinConfig::load_from_str("[embedding]\nprovider = \"deepseek\"\ndimensions = 1024\n")
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("deepseek has no embeddings API"), "{err}");
+    }
+
+    #[test]
+    fn vendor_without_chat_is_rejected_for_llm_sections() {
+        let err = ReinConfig::load_from_str("[extract]\nprovider = \"voyage\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("voyage has no chat API"), "{err}");
+        let err = ReinConfig::load_from_str("[ars.llm_judge]\nprovider = \"jina\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ars.llm_judge.provider"), "{err}");
+    }
+
+    #[test]
+    fn judge_provider_accepts_inherit_google_omlx_vendor_none() {
+        for p in ["inherit", "google", "omlx", "openai", "none"] {
+            let toml = format!("[ars.llm_judge]\nprovider = \"{p}\"\n");
+            ReinConfig::load_from_str(&toml).unwrap_or_else(|e| panic!("{p}: {e}"));
+        }
+        let err = ReinConfig::load_from_str("[ars.llm_judge]\nprovider = \"nope\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ars.llm_judge.provider"), "{err}");
+    }
+
+    #[test]
+    fn disable_thinking_is_optional_now() {
+        let cfg = ReinConfig::load_from_str("[extract.omlx]\nmodel = \"q\"\n").unwrap();
+        assert_eq!(cfg.extract.omlx.disable_thinking, None);
+        let cfg = ReinConfig::load_from_str("[extract.omlx]\ndisable_thinking = false\n").unwrap();
+        assert_eq!(cfg.extract.omlx.disable_thinking, Some(false));
+    }
+
+    #[test]
+    fn embedding_google_api_key_env_is_honoured_at_load() {
+        let mut cfg = ReinConfig::default();
+        cfg.embedding.google.api_key_env = Some("REIN_TEST_EMBED_KEY_X".into());
+        cfg.secrets
+            .insert("REIN_TEST_EMBED_KEY_X".into(), "k-embed".into());
+        apply_embedding_key_env(&mut cfg);
+        assert_eq!(cfg.embedding.google.api_key.as_deref(), Some("k-embed"));
+    }
+
+    #[test]
+    fn secret_prefers_process_env_over_secrets_file() {
+        let mut cfg = ReinConfig::default();
+        cfg.secrets
+            .insert("REIN_TEST_SECRET_A".into(), "from-file".into());
+        std::env::remove_var("REIN_TEST_SECRET_A");
+        assert_eq!(
+            cfg.secret("REIN_TEST_SECRET_A").as_deref(),
+            Some("from-file")
+        );
+        std::env::set_var("REIN_TEST_SECRET_A", "from-env");
+        assert_eq!(
+            cfg.secret("REIN_TEST_SECRET_A").as_deref(),
+            Some("from-env")
+        );
+        std::env::set_var("REIN_TEST_SECRET_A", "   ");
+        assert_eq!(
+            cfg.secret("REIN_TEST_SECRET_A").as_deref(),
+            Some("from-file")
+        );
+        std::env::remove_var("REIN_TEST_SECRET_A");
+        assert_eq!(cfg.secret("REIN_TEST_SECRET_MISSING"), None);
+    }
+
+    #[test]
+    fn secret_string_debug_never_prints_the_value() {
+        let s = SecretString::new("sk-very-secret".to_string());
+        assert_eq!(format!("{s:?}"), "SecretString(****)");
+        assert_eq!(s.expose(), "sk-very-secret");
+    }
+
+    #[test]
+    fn judge_active_helpers_live_on_config() {
+        let mut cfg = ReinConfig::default();
+        assert!(!cfg.judge_runtime_active());
+        cfg.ars.llm_judge.enabled = true;
+        assert!(cfg.judge_runtime_active());
+        assert!(!cfg.judge_nightly_active());
+        cfg.ars.llm_judge.nightly_cron.enabled = true;
+        assert!(cfg.judge_nightly_active());
     }
 }

@@ -1492,15 +1492,6 @@ fn check_query_expansion_provider(config: &ReinConfig) -> DoctorCheck {
 const RETIRED_GEMINI_FLASH_LITE_PREVIEW_MODEL: &str = "gemini-3.1-flash-lite-preview";
 const STABLE_GEMINI_FLASH_LITE_MODEL: &str = "gemini-3.1-flash-lite";
 
-fn judge_runtime_active(config: &ReinConfig) -> bool {
-    config.ars.llm_judge.enabled
-        && (config.ars.llm_judge.synthesis_enabled || config.ars.llm_judge.concept_summary_enabled)
-}
-
-fn judge_nightly_active(config: &ReinConfig) -> bool {
-    config.ars.llm_judge.enabled && config.ars.llm_judge.nightly_cron.enabled
-}
-
 /// Warn when an enabled LLM consumer resolves to the retired preview model.
 /// Resolution is authoritative: inherited sections are reported under the
 /// consumer that will actually call the model, while disabled opt-in sections
@@ -1528,8 +1519,8 @@ fn check_retired_llm_models(config: &ReinConfig) -> DoctorCheck {
         ("ars.concept_summary", config.ars.concept_summary_enabled),
         ("ars.cold_archive", config.ars.cold_archive_enabled),
         ("resummerize", config.resummerize.enabled),
-        ("ars.llm_judge", judge_runtime_active(config)),
-        ("ars.llm_judge.nightly_cron", judge_nightly_active(config)),
+        ("ars.llm_judge", config.judge_runtime_active()),
+        ("ars.llm_judge.nightly_cron", config.judge_nightly_active()),
     ];
     let mut retired_sections = sections
         .into_iter()
@@ -1578,12 +1569,12 @@ fn check_judge_llm_provider(config: &ReinConfig) -> DoctorCheck {
         (
             "ars.llm_judge runtime",
             "ars.llm_judge",
-            judge_runtime_active(config),
+            config.judge_runtime_active(),
         ),
         (
             "ars.llm_judge.nightly_cron",
             "ars.llm_judge.nightly_cron",
-            judge_nightly_active(config),
+            config.judge_nightly_active(),
         ),
     ];
     let missing = consumers
