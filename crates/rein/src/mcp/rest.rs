@@ -10,7 +10,7 @@ use serde_json::json;
 
 use crate::config::ReinConfig;
 
-type BoxedResponse = Response<BoxBody<Bytes, std::convert::Infallible>>;
+pub type BoxedResponse = Response<BoxBody<Bytes, std::convert::Infallible>>;
 const HTTP_SESSION_COOKIE: &str = "rein_http_token";
 
 /// Default cap on REST request body size. Overridable via
@@ -103,6 +103,20 @@ fn json_response(status: StatusCode, body: serde_json::Value) -> BoxedResponse {
                     .boxed(),
             )
         })
+}
+
+/// Like `json_response` but forbids any cache from keeping the body (secrets).
+fn json_response_no_store(status: StatusCode, body: serde_json::Value) -> BoxedResponse {
+    let mut resp = json_response(status, body);
+    resp.headers_mut().insert(
+        hyper::header::CACHE_CONTROL,
+        hyper::header::HeaderValue::from_static("no-store"),
+    );
+    resp.headers_mut().insert(
+        hyper::header::PRAGMA,
+        hyper::header::HeaderValue::from_static("no-cache"),
+    );
+    resp
 }
 
 fn error_response(status: StatusCode, msg: &str) -> BoxedResponse {
@@ -574,6 +588,9 @@ async fn handle_api<B>(
     // threaded in so the H3 auth gate can inspect headers before dispatch.
     // H5 (Phase 2.2): body bytes are threaded in for POST/PUT/PATCH/DELETE ops
     // that declare a params struct; GET ops still read from query string.
+    // Literal routes below may still need the body after the inventory
+    // dispatcher consumed it (`Bytes` clones are refcounted).
+    let literal_body = body.clone();
     if let Some(resp) = try_dispatch_inventory_rest(req, method, path, uri, body, config).await {
         return resp;
     }
@@ -615,6 +632,13 @@ async fn handle_api<B>(
         // Phase 2.2 as the first `auth = "mutation_marker"` real consumer;
         // H5 JSON body carries the `network` flag. GUI/curl clients must
         // send body instead of `?fix=true` query string.
+        (&Method::POST, "/api/providers/reveal") => match require_mutation_marker(req) {
+            Ok(()) => match require_owner_token(req) {
+                Ok(()) => api_providers_reveal(config, literal_body.as_deref()),
+                Err(response) => response,
+            },
+            Err(response) => response,
+        },
         (&Method::POST, "/api/session") => match require_mutation_marker(req) {
             Ok(()) => match require_owner_token(req) {
                 Ok(()) => api_create_session(config),
@@ -1021,6 +1045,38 @@ async fn try_dispatch_inventory_rest<B>(
 // api_doctor migrated to #[op(rest = POST /api/doctor)] in Phase 2.2
 // (see ops/handlers/diagnostics.rs::doctor_fix). Legacy callers that sent
 // query-string flags now send a JSON body.
+
+/// Owner-only: return one plaintext key for the GUI eye toggle. Gated by the
+/// mutation marker + owner credential in `handle_api`; `no-store` so no cache
+/// keeps the body; only the credential id is logged.
+fn api_providers_reveal(config: &ReinConfig, body: Option<&[u8]>) -> BoxedResponse {
+    let parsed: serde_json::Value = match body.map(serde_json::from_slice) {
+        Some(Ok(v)) => v,
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "expected JSON body {\"credential\": \"...\"}",
+            )
+        }
+    };
+    let Some(id) = parsed.get("credential").and_then(|v| v.as_str()) else {
+        return error_response(StatusCode::BAD_REQUEST, "missing credential id");
+    };
+    let report = crate::ops::handlers::providers::collect(config, None);
+    let Some(cred) = report.credentials.iter().find(|c| c.id == id && c.present) else {
+        return error_response(StatusCode::NOT_FOUND, "unknown or absent credential");
+    };
+    let value = match cred.kind.as_str() {
+        "env" | "secrets_file" => id.strip_prefix("env:").and_then(|name| config.secret(name)),
+        "config_file" => crate::ops::handlers::providers::config_file_key_value(config, id),
+        _ => None,
+    };
+    let Some(value) = value else {
+        return error_response(StatusCode::NOT_FOUND, "credential has no value");
+    };
+    tracing::info!(credential = %id, "provider credential revealed to owner");
+    json_response_no_store(StatusCode::OK, json!({ "id": id, "value": value }))
+}
 
 fn api_create_session(config: &ReinConfig) -> BoxedResponse {
     let token = std::env::var("REIN_HTTP_TOKEN")
