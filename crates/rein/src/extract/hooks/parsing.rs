@@ -581,7 +581,11 @@ pub fn extract_hook_session_ingest(input: &str) -> Option<crate::types::SessionI
 
     if let Some(path) = json.get("transcript_path").and_then(|v| v.as_str()) {
         let reader = open_transcript_reader(path, "extract_hook_session_ingest")?;
-        let mut turns = Vec::new();
+        // Keep the NEWEST turns within the budget. Stopping at the first 500
+        // turns / 500 KB read from the top meant every later Stop firing on a
+        // long session re-submitted the same oldest prefix and the newest
+        // decisions never reached extraction.
+        let mut turns = std::collections::VecDeque::new();
         const MAX_HOOK_TURNS: usize = 500;
         const MAX_HOOK_CHARS: usize = 500_000;
         let mut total_chars = 0usize;
@@ -596,12 +600,15 @@ pub fn extract_hook_session_ingest(input: &str) -> Option<crate::types::SessionI
                 continue;
             };
             total_chars += content.len();
-            turns.push(crate::types::SessionTurn {
+            turns.push_back(crate::types::SessionTurn {
                 role: role.to_string(),
                 content,
             });
-            if turns.len() >= MAX_HOOK_TURNS || total_chars >= MAX_HOOK_CHARS {
-                break;
+            while turns.len() > 1 && (turns.len() > MAX_HOOK_TURNS || total_chars > MAX_HOOK_CHARS)
+            {
+                if let Some(oldest) = turns.pop_front() {
+                    total_chars = total_chars.saturating_sub(oldest.content.len());
+                }
             }
         }
         return Some(crate::types::SessionIngest {
@@ -616,7 +623,7 @@ pub fn extract_hook_session_ingest(input: &str) -> Option<crate::types::SessionI
             source_label: Some("hook_stop".to_string()),
             compact_summary: None,
             tool_outputs: vec![],
-            turns,
+            turns: turns.into_iter().collect(),
         });
     }
 
@@ -769,6 +776,33 @@ mod tests {
     /// v1.2 audit F1 (High): real Claude Code transcripts use `"user"` (not
     /// `"human"`) for user turns. Both must parse; tool_result-only user
     /// entries must stay excluded; legacy `"human"` keeps working.
+    #[test]
+    fn long_transcripts_keep_the_newest_turns() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("long.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        for i in 0..650 {
+            writeln!(
+                file,
+                r#"{{"type":"user","message":{{"content":[{{"type":"text","text":"turn {i}"}}]}}}}"#
+            )
+            .unwrap();
+        }
+        writeln!(
+            file,
+            r#"{{"type":"user","message":{{"content":[{{"type":"text","text":"final decision: ship on Friday"}}]}}}}"#
+        )
+        .unwrap();
+        let payload = serde_json::json!({ "transcript_path": path }).to_string();
+        let session = extract_hook_session_ingest(&payload).expect("session");
+        assert_eq!(session.turns.len(), 500);
+        assert_eq!(
+            session.turns.last().map(|t| t.content.as_str()),
+            Some("final decision: ship on Friday")
+        );
+        assert_eq!(session.turns[0].content, "turn 151");
+    }
+
     #[test]
     fn transcript_turns_accept_user_and_human_types() {
         let dir = tempdir().unwrap();

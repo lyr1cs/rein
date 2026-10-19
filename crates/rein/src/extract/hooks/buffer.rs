@@ -485,14 +485,13 @@ pub fn store_episode_concept(
         };
         store.create_memoir(memoir)?;
     }
+    // Full ULID: its first six characters are timestamp bits only, so two
+    // episodes stored in the same minute collided on the UNIQUE
+    // (memoir_id, name) constraint and the second concept was never written.
     let date = format!(
         "{}-{}",
         chrono::Utc::now().format("%Y-%m-%d-%H%M"),
         ulid::Ulid::new()
-            .to_string()
-            .chars()
-            .take(6)
-            .collect::<String>()
     );
     let definition = if episode.decisions.is_empty() {
         format!("{}\nOutcome: {}", episode.title, episode.outcome)
@@ -539,6 +538,26 @@ mod tests {
 
     const LONG_LINE: &str = "error[E0308]: mismatched types in crates/rein/src/store/sqlite.rs:42";
     const SHORT_LINE: &str = "cargo test";
+
+    #[test]
+    fn episode_concepts_stored_in_the_same_minute_get_distinct_names() {
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+        let episode = crate::extract::llm::EpisodeSummary {
+            title: "Fixed the flaky test".to_string(),
+            outcome: "green".to_string(),
+            decisions: vec![],
+        };
+        store_episode_concept(&store, &episode).unwrap();
+        store_episode_concept(&store, &episode).unwrap();
+        let n: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM concepts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            n, 2,
+            "the second episode must not collide on (memoir_id, name)"
+        );
+    }
 
     #[test]
     fn ledger_roundtrip_records_items_and_long_lines_only() {
