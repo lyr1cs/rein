@@ -607,6 +607,11 @@ pub enum RecallFusionScopeHealthCode {
     HoldoutNotShip,
     /// A judge drift alert blocks automatic recall fusion.
     JudgeDrift,
+    /// The synthesis judge that attests promotion is not trusted right now
+    /// (no provider resolves, an enforced structural failure, or drift), so
+    /// online recall refuses dynamic fusion; the report says so instead of
+    /// projecting an activation recall does not perform.
+    JudgeUntrusted,
 }
 
 impl RecallFusionScopeHealthCode {
@@ -1533,6 +1538,58 @@ fn simplex_matches(left: A12FusionSimplex, right: A12FusionSimplex) -> bool {
     .all(|(left, right)| same_f64(left, right))
 }
 
+/// Config half of the online judge veto: an enabled synthesis judge that
+/// resolves to no provider can never attest a promotion. Store-free, so the
+/// offline activation report applies it too.
+pub(crate) fn judge_provider_backs_live_recall_fusion(config: &crate::config::ReinConfig) -> bool {
+    if !config.ars.llm_judge.enabled || !config.ars.llm_judge.synthesis_enabled {
+        return true;
+    }
+    match config.resolve_llm_for("ars.llm_judge") {
+        Ok(resolved) => resolved.provider != crate::config::Provider::None,
+        Err(_) => false,
+    }
+}
+
+/// A sealed A12/policy adoption cannot outlive the current judge trust state.
+/// Judge-backed synthesis promotion is checked on every recall so provider
+/// removal and enforced structural failures fail closed without waiting for
+/// the slower policy refresh loop. The store-aware activation report applies
+/// the same decision so doctor, Trust and the release gate never report an
+/// activation that online recall refuses.
+pub(crate) fn judge_allows_live_recall_fusion(
+    conn: &rusqlite::Connection,
+    config: &crate::config::ReinConfig,
+    state: &AdaptiveState,
+    now_millis: i64,
+) -> bool {
+    if !config.ars.llm_judge.enabled || !config.ars.llm_judge.synthesis_enabled {
+        return true;
+    }
+    if !judge_provider_backs_live_recall_fusion(config) {
+        return false;
+    }
+
+    let now = now_millis.div_euclid(1_000);
+    let structural = crate::ops::ars_tuning::resolve_judge_structural_trust(
+        conn,
+        config,
+        crate::store::adaptive::JudgeSurface::Synthesis,
+        now,
+    );
+    let decision = crate::ops::ars_tuning::judge_trust_decision_at(
+        state.judge_calibration_state.as_ref(),
+        crate::store::adaptive::JudgeSurface::Synthesis,
+        structural,
+        crate::judge::contract::JudgeTrustAction::PromoteRecallFusion,
+        now,
+    );
+    decision.action_allowed && !decision.blocks_release
+}
+
+const JUDGE_UNTRUSTED_REASON: &str =
+    "online recall refuses dynamic fusion while the synthesis judge is untrusted (no provider, enforced structural failure, or drift)";
+
 fn runtime_disabled(
     scope_key: Option<String>,
     basis: ArsRecallFusionEvidenceBasis,
@@ -1895,7 +1952,23 @@ fn recall_fusion_activation_scope_report(
     let resolution = if policy.status
         == crate::store::ars_parameter_policy::ArsParameterPolicyLoadStatus::Loaded
     {
+        // Online recall vetoes every sealed adoption while the synthesis
+        // judge is untrusted (`judge_allows_live_recall_fusion`), before it
+        // even consults the resolver. The store-aware report applies the full
+        // decision; the offline report can only apply its config half.
+        let judge_vetoed = match live_store {
+            Some(store) => {
+                !judge_allows_live_recall_fusion(store.conn(), config, adaptive, now_millis)
+            }
+            None => !judge_provider_backs_live_recall_fusion(config),
+        };
         match runtime_scope_parts(scope) {
+            Some(_) if judge_vetoed => runtime_disabled(
+                Some(policy_key.clone()),
+                evidence.map_or(ArsRecallFusionEvidenceBasis::Static, |value| value.basis),
+                RecallFusionScopeHealthCode::JudgeUntrusted,
+                JUDGE_UNTRUSTED_REASON,
+            ),
             Some((query_type, cluster_id)) => match live_store {
                 Some(store) => resolve_runtime_recall_fusion_live(
                     store,
@@ -3527,6 +3600,116 @@ mod tests {
             0,
             "store-aware activation reports must use the O(1) live resolver"
         );
+    }
+
+    /// Report/recall parity (audit U16-01): with an enabled synthesis judge
+    /// that resolves to no provider, online recall refuses dynamic fusion,
+    /// so the activation report must say inactive with zero adoption and no
+    /// effective simplex instead of projecting the sealed canary as active.
+    #[test]
+    fn activation_report_applies_the_online_judge_veto() {
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+        let config = runtime_config();
+        let mut calibration = a12_loaded(
+            A12CalibrationScope::Global,
+            [0.35, 0.35, 0.10, 0.08, 0.07, 0.05],
+            20,
+            20,
+            A12CalibrationVerdict::Ship,
+        );
+        seal_current_live_inputs(&store, &config, &mut calibration);
+        let state = AdaptiveState {
+            version: 5,
+            ..Default::default()
+        };
+        let evidence = resolve_recall_fusion_evidence(
+            &state,
+            &calibration,
+            10,
+            0.02,
+            1_700_000_075_000,
+            &gate(ArsRecallGateStatus::Ship),
+        );
+        let policy = canary_policy(
+            state.version,
+            0.0,
+            HashMap::from([("recall_fusion:global".to_string(), 0.25)]),
+            evidence,
+        );
+        let policy_load = crate::store::ars_parameter_policy::ArsParameterPolicyLoad {
+            policy,
+            status: crate::store::ars_parameter_policy::ArsParameterPolicyLoadStatus::Loaded,
+            error: None,
+        };
+        let run = recall_fusion_calibration_run_attestation(&calibration);
+        let global_scope = |report: &RecallFusionActivationReport| {
+            report
+                .scopes
+                .iter()
+                .find(|scope| scope.scope == "global")
+                .cloned()
+                .expect("global scope reported")
+        };
+
+        let healthy = global_scope(&recall_fusion_activation_report_live(
+            &store,
+            &config,
+            &state,
+            &policy_load,
+            &calibration,
+            &gate(ArsRecallGateStatus::Ship),
+            run.as_ref(),
+            1_700_000_075_000,
+        ));
+        assert!(healthy.active, "{}", healthy.reason);
+        assert_eq!(healthy.adoption_weight, 0.25);
+
+        // Judge enabled for synthesis promotion, but `[ars.llm_judge]`
+        // resolves to no provider: the configuration online recall vetoes.
+        let mut judge_config = config.clone();
+        judge_config.ars.llm_judge.enabled = true;
+        judge_config.ars.llm_judge.synthesis_enabled = true;
+        assert!(!judge_allows_live_recall_fusion(
+            store.conn(),
+            &judge_config,
+            &state,
+            1_700_000_075_000
+        ));
+
+        let vetoed = global_scope(&recall_fusion_activation_report_live(
+            &store,
+            &judge_config,
+            &state,
+            &policy_load,
+            &calibration,
+            &gate(ArsRecallGateStatus::Ship),
+            run.as_ref(),
+            1_700_000_075_000,
+        ));
+        assert!(!vetoed.active, "{}", vetoed.reason);
+        assert_eq!(
+            vetoed.health_code,
+            RecallFusionScopeHealthCode::JudgeUntrusted
+        );
+        assert_eq!(vetoed.adoption_weight, 0.0);
+        assert!(vetoed.effective_simplex.is_none());
+
+        // The offline report applies the config half of the same veto.
+        let offline = global_scope(&recall_fusion_activation_report(
+            &judge_config,
+            &state,
+            &policy_load,
+            &calibration,
+            &gate(ArsRecallGateStatus::Ship),
+            run.as_ref(),
+            1_700_000_075_000,
+        ));
+        assert!(!offline.active);
+        assert_eq!(
+            offline.health_code,
+            RecallFusionScopeHealthCode::JudgeUntrusted
+        );
+        assert_eq!(offline.adoption_weight, 0.0);
     }
 
     #[test]

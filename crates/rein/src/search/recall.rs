@@ -291,7 +291,8 @@ fn resolve_dynamic_fusion_for_recall(
     f64,
 ) {
     let conn = store.conn();
-    if !judge_allows_live_recall_fusion(conn, config, state, now_millis) {
+    if !crate::ops::a12_activation::judge_allows_live_recall_fusion(conn, config, state, now_millis)
+    {
         return (None, 0.0);
     }
 
@@ -321,43 +322,6 @@ fn resolve_dynamic_fusion_for_recall(
             },
         );
     (weights, resolution.adoption_weight)
-}
-
-/// A sealed A12/policy adoption cannot outlive the current judge trust state.
-/// Judge-backed synthesis promotion is checked on every recall so provider
-/// removal and enforced structural failures fail closed without waiting for
-/// the slower policy refresh loop.
-fn judge_allows_live_recall_fusion(
-    conn: &rusqlite::Connection,
-    config: &ReinConfig,
-    state: &crate::store::adaptive::AdaptiveState,
-    now_millis: i64,
-) -> bool {
-    if !config.ars.llm_judge.enabled || !config.ars.llm_judge.synthesis_enabled {
-        return true;
-    }
-    let Ok(resolved) = config.resolve_llm_for("ars.llm_judge") else {
-        return false;
-    };
-    if resolved.provider == crate::config::Provider::None {
-        return false;
-    }
-
-    let now = now_millis.div_euclid(1_000);
-    let structural = crate::ops::ars_tuning::resolve_judge_structural_trust(
-        conn,
-        config,
-        crate::store::adaptive::JudgeSurface::Synthesis,
-        now,
-    );
-    let decision = crate::ops::ars_tuning::judge_trust_decision_at(
-        state.judge_calibration_state.as_ref(),
-        crate::store::adaptive::JudgeSurface::Synthesis,
-        structural,
-        crate::judge::contract::JudgeTrustAction::PromoteRecallFusion,
-        now,
-    );
-    decision.action_allowed && !decision.blocks_release
 }
 
 /// A resolved canonical is "live" iff it is neither superseded nor deprecated —
