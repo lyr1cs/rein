@@ -17,6 +17,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+# shellcheck source=lib/cargo-artifact.sh
+. "$REPO_ROOT/scripts/lib/cargo-artifact.sh"
 
 # Build hygiene: normalize the absolute filesystem paths Rust's
 # `file!()` macro expands into release binaries (panic locations,
@@ -77,13 +79,24 @@ trap 'rm -rf "$STAGE"' EXIT
 echo "==> Building Neural Wiki GUI assets (npm ci + npm run build)"
 ( cd crates/rein/gui && npm ci && npm run build )
 
-echo "==> Building rein v$VERSION (release, --features gui)"
-cargo build -p rein --release --locked --features gui
+# The package is Apple Silicon only, so the build target is named
+# explicitly rather than left to the host default or a stray
+# `CARGO_BUILD_TARGET`. The executable is then taken from Cargo's own
+# artifact report instead of `target/release/rein`: with a target
+# directory or build-target override that path is not where this build
+# lands, and an old binary left there would have been staged under the
+# current version number (audit U22-01).
+BUILD_TARGET="aarch64-apple-darwin"
+echo "==> Building rein v$VERSION (release, --features gui, --target $BUILD_TARGET)"
+BINARY="$(cargo build -p rein --release --locked --features gui \
+  --target "$BUILD_TARGET" --message-format=json-render-diagnostics \
+  | cargo_executable rein)"
 
-if [ ! -f target/release/rein ]; then
-  echo "error: target/release/rein not produced by cargo build" >&2
+if [ -z "$BINARY" ] || [ ! -f "$BINARY" ]; then
+  echo "error: cargo build did not report a 'rein' executable (got '${BINARY:-<none>}')" >&2
   exit 1
 fi
+echo "==> Built $BINARY"
 
 echo "==> Staging .mcpb contents in $STAGE"
 cp dxt/manifest.json "$STAGE/manifest.json"
@@ -91,7 +104,7 @@ if [ -f dxt/icon.png ]; then
   cp dxt/icon.png "$STAGE/icon.png"
 fi
 mkdir -p "$STAGE/server"
-cp target/release/rein "$STAGE/server/rein-darwin-arm64"
+cp "$BINARY" "$STAGE/server/rein-darwin-arm64"
 chmod +x "$STAGE/server/rein-darwin-arm64"
 
 # Sync the manifest version with Cargo.toml (single source of truth).

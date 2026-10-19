@@ -57,10 +57,18 @@ uploaded to the GitHub Release page).
    `crates/rein/src/mcp/rest.rs` reads `gui/dist/` at compile time when
    `--features gui` is on, and `gui/dist/` is `.gitignore`d so a clean
    checkout has nothing to embed.
-4. Runs `cargo build -p rein --release --locked --features gui`.
+4. Runs `cargo build -p rein --release --locked --features gui --target
+   aarch64-apple-darwin --message-format=json-render-diagnostics` and takes
+   the executable path from Cargo's `compiler-artifact` report
+   (`scripts/lib/cargo-artifact.sh`). The script never assumes
+   `target/release/rein`: with `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET` or
+   a `.cargo/config.toml` override that path is not where the build lands,
+   and a stale binary left there would be packaged under the current
+   version. `scripts/tests/build-dxt-artifact-selection.sh` covers the
+   selection.
 5. Stages a temporary directory:
    - copies `dxt/manifest.json` (and `dxt/icon.png` if present)
-   - copies `target/release/rein` to `server/rein-darwin-arm64`
+   - copies the reported executable to `server/rein-darwin-arm64`
    - patches the manifest's `version` field with `jq` so manifest and
      `Cargo.toml` never drift
 6. Runs `jq -e .` on the staged manifest to validate JSON.
