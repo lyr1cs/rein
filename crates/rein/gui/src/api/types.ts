@@ -606,3 +606,49 @@ export interface Turn {
   role: string;
   text: string;
 }
+
+export type ProviderRole = 'embed' | 'write' | 'search' | 'answer' | 'judge' | 'cloud';
+
+export interface ProviderSurface {
+  surface: string;
+  role: ProviderRole | string;
+  enabled: boolean;
+  provider: string;
+  model: string;
+  endpoint: string;
+  source_level: string;
+  source_table: string;
+  credential: string | null;
+  status: 'ready' | 'missing_credential' | 'disabled' | string;
+}
+
+export interface ProviderProbe {
+  status: 'ok' | 'unauthorized' | 'unreachable' | 'dimension_mismatch' | 'error' | string;
+  http_status: number | null;
+  latency_ms: number;
+  detail: string | null;
+}
+
+export interface ProviderCredential {
+  id: string;
+  kind: 'env' | 'secrets_file' | 'config_file' | 'endpoint' | string;
+  present: boolean;
+  masked: string | null;
+  used_by: string[];
+  warning: string | null;
+  probe: ProviderProbe | null;
+}
+
+export interface VectorIndexStatus {
+  stamped: string | null;
+  configured: string;
+  matches: boolean;
+  rows: number;
+}
+
+export interface ProviderStatusReport {
+  surfaces: ProviderSurface[];
+  credentials: ProviderCredential[];
+  vector_index: VectorIndexStatus | null;
+  probed_at: string | null;
+}

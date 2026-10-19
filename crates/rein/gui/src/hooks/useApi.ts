@@ -12,6 +12,7 @@ import type {
   Episode,
   Artifact,
   MemoryDetailResponse,
+  ProviderStatusReport,
 } from '../api/types';
 import { getPollingIntervalMs } from '../utils/polling';
 
@@ -186,5 +187,14 @@ export function useMemoirExport(name: string | null) {
       ),
     enabled: name !== null && name !== '',
     refetchInterval: () => getPollingInterval(),
+  });
+}
+
+export function useProviders(probe = false) {
+  return useQuery({
+    queryKey: ['providers', probe],
+    queryFn: () => apiGet<ProviderStatusReport>(`/api/providers${probe ? '?probe=true' : ''}`),
+    refetchInterval: false,
+    staleTime: 1000,
   });
 }
