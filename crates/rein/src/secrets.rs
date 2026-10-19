@@ -133,9 +133,69 @@ pub fn write_to(path: &Path, map: &BTreeMap<String, String>) -> io::Result<()> {
     Ok(())
 }
 
+/// Upsert one key. Rejects invalid names and blank values before touching the file.
+pub fn set_key(path: &Path, name: &str, value: &str) -> Result<(), String> {
+    if !valid_name(name) {
+        return Err(format!(
+            "invalid key name '{name}': use UPPER_SNAKE_CASE (e.g. OPENAI_API_KEY)"
+        ));
+    }
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("value is empty".to_string());
+    }
+    if value.chars().any(|c| c == '\n' || c == '\r') {
+        return Err("value must be a single line".to_string());
+    }
+    let mut map = load_from(path)?;
+    map.insert(name.to_string(), value.to_string());
+    write_to(path, &map).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Remove one key; `Ok(false)` when it was not there (or the file is missing).
+pub fn unset_key(path: &Path, name: &str) -> Result<bool, String> {
+    let mut map = load_from(path)?;
+    if map.remove(name).is_none() {
+        return Ok(false);
+    }
+    write_to(path, &map).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_key_creates_updates_and_unset_removes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub").join("secrets.env");
+        set_key(&path, "OPENAI_API_KEY", "sk-1").unwrap();
+        set_key(&path, "GEMINI_API_KEY", "g-1").unwrap();
+        assert_eq!(load_from(&path).unwrap()["OPENAI_API_KEY"], "sk-1");
+        set_key(&path, "OPENAI_API_KEY", "sk-2").unwrap();
+        assert_eq!(load_from(&path).unwrap()["OPENAI_API_KEY"], "sk-2");
+        assert!(unset_key(&path, "OPENAI_API_KEY").unwrap());
+        assert!(!unset_key(&path, "OPENAI_API_KEY").unwrap());
+        assert!(load_from(&path).unwrap().get("OPENAI_API_KEY").is_none());
+        assert_eq!(load_from(&path).unwrap()["GEMINI_API_KEY"], "g-1");
+    }
+
+    #[test]
+    fn set_key_rejects_bad_names_and_blank_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.env");
+        assert!(set_key(&path, "lowercase", "x").is_err());
+        assert!(set_key(&path, "HAS-DASH", "x").is_err());
+        assert!(set_key(&path, "OK_NAME", "   ").is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn unset_on_missing_file_is_false_not_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!unset_key(&dir.path().join("none.env"), "A").unwrap());
+    }
 
     #[test]
     fn parse_handles_comments_quotes_and_blank_lines() {
