@@ -8,7 +8,7 @@ export interface RoleCopy {
   what: string;
   runs: string;
   without: string;
-  /** CLI commands to repoint this role; `{vendor}` / `{model}` / `{key}` / `{dims}` are placeholders. */
+  /** CLI commands to repoint this role; `{vendor}` / `{model}` / `{key}` / `{dims}` / `{table}` are placeholders ({table} = google or openai sub-table). */
   cli: string[];
   toml: string;
 }
@@ -26,7 +26,7 @@ export const ROLE_COPY: Record<ProviderRole, RoleCopy> = {
       'rein keys set {key}',
       'rein warmup --reembed-all',
     ],
-    toml: '[embedding]\nprovider = "{vendor}"\ndimensions = {dims}\n\n[embedding.openai]\nmodel = "{model}"',
+    toml: '[embedding]\nprovider = "{vendor}"\ndimensions = {dims}\n\n[embedding.{table}]\nmodel = "{model}"',
   },
   write: {
     title: 'Write memories',
@@ -35,7 +35,7 @@ export const ROLE_COPY: Record<ProviderRole, RoleCopy> = {
     runs: 'On every hook / proxy capture, in the async worker, on merge gray zones, and when a canonical hits its size cap.',
     without: 'Falls back to rule-based extraction; no LLM merge decisions; recompression stays off.',
     cli: ['rein providers set extract --provider {vendor} --model {model}', 'rein keys set {key}'],
-    toml: '[extract]\nprovider = "{vendor}"\n\n[extract.openai]\nmodel = "{model}"',
+    toml: '[extract]\nprovider = "{vendor}"\n\n[extract.{table}]\nmodel = "{model}"',
   },
   search: {
     title: 'Sharpen search',
@@ -48,7 +48,7 @@ export const ROLE_COPY: Record<ProviderRole, RoleCopy> = {
       'rein providers set reranker --provider {vendor}',
       'rein keys set {key}',
     ],
-    toml: '[query_expansion]\nprovider = "{vendor}"\n\n[query_expansion.openai]\nmodel = "{model}"\n\n[search]\nllm_reranker = "{vendor}"',
+    toml: '[query_expansion]\nprovider = "{vendor}"\n\n[query_expansion.{table}]\nmodel = "{model}"\n\n[search]\nllm_reranker = "{vendor}"',
   },
   answer: {
     title: 'Answer & summarize',
@@ -61,7 +61,7 @@ export const ROLE_COPY: Record<ProviderRole, RoleCopy> = {
       'rein providers set llm --provider {vendor} --model {model}',
       'rein keys set {key}',
     ],
-    toml: '[ars]\nllm_backend = "{vendor}"\n\n[llm]\nprovider = "{vendor}"\n\n[llm.openai]\nmodel = "{model}"',
+    toml: '[ars]\nllm_backend = "{vendor}"\n\n[llm]\nprovider = "{vendor}"\n\n[llm.{table}]\nmodel = "{model}"',
   },
   judge: {
     title: 'Grade & learn',
@@ -70,10 +70,10 @@ export const ROLE_COPY: Record<ProviderRole, RoleCopy> = {
     runs: 'In the adaptive tick (every 15 minutes) and the nightly calibration.',
     without: 'No judge events; calibration stalls at zero pairs.',
     cli: ['rein providers set judge --provider {vendor} --model {model}', 'rein keys set {key}'],
-    toml: '[ars.llm_judge]\nprovider = "{vendor}"\n\n[ars.llm_judge.openai]\nmodel = "{model}"',
+    toml: '[ars.llm_judge]\nprovider = "{vendor}"\n\n[ars.llm_judge.{table}]\nmodel = "{model}"',
   },
   cloud: {
-    title: 'Cross-check in the cloud',
+    title: 'Cloud cross-check',
     icon: '☁️',
     what: 'Optional second opinion from Supermemory to cross-validate recall.',
     runs: 'On recall, when enabled.',

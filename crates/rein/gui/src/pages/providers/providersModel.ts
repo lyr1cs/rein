@@ -102,7 +102,7 @@ export function flowLayout(width: number): FlowLayout {
       ['answer', 'role', 'Answer & summarize'],
       ['out', 'data', 'Answer'],
       ['judge', 'role', 'Grade & learn'],
-      ['cloud', 'role', 'Cross-check in the cloud'],
+      ['cloud', 'role', 'Cloud cross-check'],
     ];
     let y = 0;
     for (const [id, kind, label] of order) {
@@ -134,7 +134,7 @@ export function flowLayout(width: number): FlowLayout {
   add('recall', 'data', 'Recall', cx(2, DATA_W), lane2 + (ROLE_H - DATA_H) / 2);
   add('answer', 'role', 'Answer & summarize', cx(3, ROLE_W), lane2);
   add('out', 'data', 'Answer', cx(4, DATA_W), lane2 + (ROLE_H - DATA_H) / 2);
-  add('cloud', 'role', 'Cross-check in the cloud', cx(1, ROLE_W), lane3);
+  add('cloud', 'role', 'Cloud cross-check', cx(1, ROLE_W), lane3);
   add('judge', 'role', 'Grade & learn', cx(3, ROLE_W), lane3);
   edges.push({ from: 'sessions', to: 'write' }, { from: 'write', to: 'store' }, { from: 'store', to: 'embed' });
   edges.push({ from: 'question', to: 'search' }, { from: 'search', to: 'recall' }, { from: 'recall', to: 'answer' }, { from: 'answer', to: 'out' });

@@ -19,17 +19,27 @@ interface Props {
   onSelectKey: (credentialId: string) => void;
 }
 
-function fill(template: string, rep?: ProviderSurface) {
+function fill(template: string, rep: ProviderSurface | undefined, dims: string) {
   const key = rep?.credential ? credentialName(rep.credential) : '{key}';
+  const vendor = rep?.provider && rep.provider !== 'none' ? rep.provider : '{vendor}';
   return template
-    .replace(/\{vendor\}/g, rep?.provider && rep.provider !== 'none' ? rep.provider : '{vendor}')
+    .replace(/\{vendor\}/g, vendor)
+    .replace(/\{table\}/g, vendor === 'google' ? 'google' : 'openai')
     .replace(/\{model\}/g, rep?.model || '{model}')
+    .replace(/\{dims\}/g, dims)
     .replace(/\{key\}/g, key);
+}
+
+/** Dimensions of the configured embedding model, read from the `provider:model:dims` stamp. */
+function configuredDims(report: ProviderStatusReport): string {
+  const tail = report.vector_index?.configured.split(':').pop();
+  return tail && /^\d+$/.test(tail) ? tail : '{dims}';
 }
 
 export default function RoleCard({ role, surfaces, status, report, highlighted, onSelectKey }: Props) {
   const copy = ROLE_COPY[role];
   const rep = representative(surfaces);
+  const dims = configuredDims(report);
   const [open, setOpen] = useState(false);
   return (
     <div id={`role-${role}`} className={`rounded-xl border bg-[var(--bg-secondary)] p-5 space-y-3 ${highlighted ? 'border-[var(--accent)]' : 'border-[var(--border)]'}`}>
@@ -68,9 +78,9 @@ export default function RoleCard({ role, surfaces, status, report, highlighted, 
       </button>
       {open && (
         <div className="space-y-2">
-          <pre className="overflow-x-auto rounded-md border border-[var(--border)] bg-[var(--bg-primary)] px-3 py-2 text-[11px] text-[var(--text-secondary)]">{copy.cli.map((c) => fill(c, rep)).join('\n')}</pre>
+          <pre className="overflow-x-auto rounded-md border border-[var(--border)] bg-[var(--bg-primary)] px-3 py-2 text-[11px] text-[var(--text-secondary)]">{copy.cli.map((c) => fill(c, rep, dims)).join('\n')}</pre>
           <div className="text-[10px] uppercase tracking-wider text-[var(--text-muted)]">equivalent config.toml</div>
-          <pre className="overflow-x-auto rounded-md border border-[var(--border)] bg-[var(--bg-primary)] px-3 py-2 text-[11px] text-[var(--text-secondary)]">{fill(copy.toml, rep)}</pre>
+          <pre className="overflow-x-auto rounded-md border border-[var(--border)] bg-[var(--bg-primary)] px-3 py-2 text-[11px] text-[var(--text-secondary)]">{fill(copy.toml, rep, dims)}</pre>
         </div>
       )}
     </div>
