@@ -1647,6 +1647,88 @@ fn touch_worker_marker(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Doctor repair (audit U19-01): move abandoned inflight jobs back onto their
+/// queues, but only for queues whose worker is not running. Each queue's
+/// single-drainer lock is tried without blocking; a held lock means the
+/// inflight file belongs to a live worker mid-batch and is left alone (that
+/// worker recovers its own file on its next claim, and copying it back here
+/// would run every job in it twice). The memory queue's recovery additionally
+/// runs under the enqueue lock, the same claim-phase protocol as
+/// `drain_memory_queue_locked`. Returns `(queue, jobs recovered)` for each
+/// queue that had something to recover.
+pub fn recover_idle_inflight_queues(config: &ReinConfig) -> Vec<(&'static str, usize)> {
+    let queues: [(
+        &'static str,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        Option<std::path::PathBuf>,
+    ); 4] = [
+        (
+            "memory",
+            queue_path(config),
+            inflight_path(config),
+            drain_lock_path(config),
+            Some(lock_path(config)),
+        ),
+        (
+            "cleanup",
+            cleanup_queue_path(config),
+            cleanup_inflight_path(config),
+            cleanup_lock_path(config),
+            None,
+        ),
+        (
+            "dedup",
+            dedup_queue_path(config),
+            dedup_inflight_path(config),
+            dedup_lock_path(config),
+            None,
+        ),
+        (
+            "merge_refinement",
+            merge_refinement_queue_path(config),
+            merge_refinement_inflight_path(config),
+            merge_refinement_lock_path(config),
+            None,
+        ),
+    ];
+    let mut recovered = Vec::new();
+    for (name, queue, inflight, drain_lock, enqueue_lock) in queues {
+        let outcome = with_advisory_lock(&drain_lock, false, || {
+            let pending = count_queue_lines(&inflight);
+            match &enqueue_lock {
+                Some(lock) => {
+                    with_advisory_lock(lock, true, || recover_inflight(&queue, &inflight))?
+                }
+                None => recover_inflight(&queue, &inflight)?,
+            }
+            Ok(pending)
+        });
+        match outcome {
+            Ok(count) if count > 0 => recovered.push((name, count)),
+            Ok(_) => {}
+            Err(e) => tracing::debug!(
+                queue = name,
+                error = %e,
+                "inflight recovery skipped: worker lock is held or unavailable"
+            ),
+        }
+    }
+    recovered
+}
+
+fn count_queue_lines(path: &std::path::Path) -> usize {
+    std::fs::read_to_string(path)
+        .map(|content| {
+            content
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 fn recover_inflight(path: &std::path::Path, inflight: &std::path::Path) -> anyhow::Result<()> {
     // Read inflight file directly — if it doesn't exist, read_to_string returns Err
     // and we return Ok. No TOCTOU race between exists() and read().
@@ -2424,6 +2506,74 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn queue_test_config(dir: &tempfile::TempDir) -> ReinConfig {
+        let mut config = ReinConfig::default();
+        config.hooks.buffer_dir = dir.path().join("buffers").display().to_string();
+        config.database.path = dir.path().join("memories.db").display().to_string();
+        config
+    }
+
+    #[test]
+    fn recover_idle_inflight_queues_moves_jobs_back_when_no_worker_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = queue_test_config(&dir);
+        let inflight = inflight_path(&config);
+        std::fs::create_dir_all(inflight.parent().unwrap()).unwrap();
+        std::fs::write(&inflight, "{\"job\":1}\n{\"job\":2}\n").unwrap();
+        let dedup_inflight = dedup_inflight_path(&config);
+        std::fs::write(&dedup_inflight, "{\"job\":3}\n").unwrap();
+
+        let recovered = recover_idle_inflight_queues(&config);
+        assert_eq!(recovered, vec![("memory", 2), ("dedup", 1)]);
+        assert!(!inflight.exists());
+        assert!(!dedup_inflight.exists());
+        let queue_text = std::fs::read_to_string(queue_path(&config)).unwrap();
+        assert!(queue_text.contains("{\"job\":1}"));
+        assert!(queue_text.contains("{\"job\":2}"));
+        assert_eq!(
+            std::fs::read_to_string(dedup_queue_path(&config)).unwrap(),
+            "{\"job\":3}\n"
+        );
+        assert!(recover_idle_inflight_queues(&config).is_empty());
+    }
+
+    /// Audit U19-01: while a worker holds its drain lock the inflight file
+    /// is that worker's claimed batch; doctor must leave both files alone or
+    /// every job in the batch runs twice.
+    #[cfg(unix)]
+    #[test]
+    fn recover_idle_inflight_queues_skips_a_queue_whose_worker_is_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = queue_test_config(&dir);
+        let inflight = inflight_path(&config);
+        std::fs::create_dir_all(inflight.parent().unwrap()).unwrap();
+        std::fs::write(&inflight, "{\"job\":1}\n").unwrap();
+        let queue = queue_path(&config);
+        std::fs::write(&queue, "{\"job\":2}\n").unwrap();
+
+        let worker_lock = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(drain_lock_path(&config))
+            .unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&worker_lock);
+        assert_eq!(unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) }, 0);
+
+        assert!(recover_idle_inflight_queues(&config).is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&inflight).unwrap(),
+            "{\"job\":1}\n",
+            "the running worker's batch is untouched"
+        );
+        assert_eq!(std::fs::read_to_string(&queue).unwrap(), "{\"job\":2}\n");
+
+        let _ = unsafe { libc::flock(fd, libc::LOCK_UN) };
+        drop(worker_lock);
+        assert_eq!(recover_idle_inflight_queues(&config), vec![("memory", 1)]);
+    }
 
     #[test]
     fn normalize_event_text_collapses_punctuation() {

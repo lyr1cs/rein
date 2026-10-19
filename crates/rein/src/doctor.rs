@@ -7,7 +7,6 @@ use serde::Serialize;
 
 use crate::config::{Provider, ReinConfig};
 use crate::embed;
-use crate::extract::hooks::buffer;
 use crate::extract::hooks::queue::{collect_queue_diagnostics, QueueGroupDiagnostics};
 use crate::search::warmup;
 use crate::store::hnsw::HnswIndex;
@@ -2915,9 +2914,32 @@ fn apply_local_fixes(config: &ReinConfig, store: &SqliteStore) -> Vec<String> {
     let hnsw_base = store.db_path().with_extension("");
     let hnsw_path = hnsw_base.with_extension("usearch");
     let hnsw_meta = hnsw_base.with_extension("usearch.meta");
-    if !hnsw_path.exists() || !hnsw_meta.exists() || HnswIndex::is_dirty(&hnsw_base) {
+    let files_present = hnsw_path.exists() && hnsw_meta.exists();
+    // Membership decides as well (audit U19-03): a clean, self-consistent
+    // index that lacks entries for live vectors is what the `hnsw` diagnostic
+    // reports and tells the operator to repair here, so the repair cannot
+    // key on the file set and dirty marker alone.
+    let missing_live = if files_present && !HnswIndex::is_dirty(&hnsw_base) {
+        match (
+            live_vector_ids(store),
+            HnswIndex::open(&hnsw_base, store.dims),
+        ) {
+            (Ok(ids), Ok(index)) => ids.iter().filter(|id| !index.contains(id)).count(),
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    if !files_present || HnswIndex::is_dirty(&hnsw_base) || missing_live > 0 {
         warmup::populate_hnsw(store, config);
-        fixes.push(format!("triggered HNSW rebuild at {}", hnsw_path.display()));
+        if missing_live > 0 {
+            fixes.push(format!(
+                "triggered HNSW rebuild at {} ({missing_live} live vectors were missing)",
+                hnsw_path.display()
+            ));
+        } else {
+            fixes.push(format!("triggered HNSW rebuild at {}", hnsw_path.display()));
+        }
     }
 
     // v0.28.7+ audit L5 — corrupt policy row recovery. When
@@ -3068,64 +3090,14 @@ fn apply_local_fixes(config: &ReinConfig, store: &SqliteStore) -> Vec<String> {
     fixes
 }
 
+/// Inflight recovery is the queue module's job: it takes each worker's
+/// drain lock (non-blocking) so a batch a live worker is processing is never
+/// copied back and run twice (audit U19-01).
 fn apply_queue_fixes(config: &ReinConfig) -> Vec<String> {
-    let mut fixes = Vec::new();
-    for (queue_name, prefix) in [
-        ("memory", "memory_queue"),
-        ("cleanup", "cleanup_queue"),
-        ("dedup", "dedup_queue"),
-    ] {
-        let queue = queue_scoped_path(config, prefix);
-        let inflight = queue_scoped_path(config, &format!("{prefix}_inflight"));
-        if let Ok(Some(recovered)) = recover_inflight_file(&queue, &inflight) {
-            fixes.push(format!("recovered {recovered} {queue_name} inflight jobs"));
-        }
-    }
-    fixes
-}
-
-fn queue_scoped_path(config: &ReinConfig, prefix: &str) -> std::path::PathBuf {
-    let base = buffer::resolve_buffer_dir(config);
-    let db_tag = {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        config.resolve_db_path().hash(&mut h);
-        format!("{:016x}", h.finish())
-    };
-    let queue_dir = base.join("queue").join(db_tag);
-    let _ = std::fs::create_dir_all(&queue_dir);
-    queue_dir.join(format!("{prefix}.jsonl"))
-}
-
-fn recover_inflight_file(
-    queue_path: &std::path::Path,
-    inflight_path: &std::path::Path,
-) -> anyhow::Result<Option<usize>> {
-    let content = match std::fs::read_to_string(inflight_path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-
-    let recovered = content
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .count();
-    if recovered > 0 {
-        if let Some(parent) = queue_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(queue_path)?;
-        file.write_all(content.as_bytes())?;
-        if !content.ends_with('\n') {
-            file.write_all(b"\n")?;
-        }
-    }
-    let _ = std::fs::remove_file(inflight_path);
-    Ok(Some(recovered))
+    crate::extract::hooks::queue::recover_idle_inflight_queues(config)
+        .into_iter()
+        .map(|(queue_name, recovered)| format!("recovered {recovered} {queue_name} inflight jobs"))
+        .collect()
 }
 
 // ── v0.27.x judge checks ───────────────────────────────────────────────────
@@ -4776,19 +4748,50 @@ provider = "inherit"
         assert_eq!(metrics, Some((12, 1, 5)));
     }
 
+    /// Audit U19-03: a clean, self-consistent HNSW index that lacks an
+    /// entry for a live vector is exactly what the `hnsw` diagnostic tells
+    /// the operator to repair with `--fix`; the repair must rebuild it.
     #[test]
-    fn test_recover_inflight_file_moves_jobs_back_to_queue() {
-        let dir = tempfile::tempdir().unwrap();
-        let queue = dir.path().join("memory_queue.jsonl");
-        let inflight = dir.path().join("memory_queue_inflight.jsonl");
-        std::fs::write(&inflight, "{\"job\":1}\n{\"job\":2}\n").unwrap();
+    fn fix_rebuilds_a_clean_hnsw_index_that_misses_live_vectors() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = temp_config(&tempdir);
+        let store = config.open_store().unwrap();
+        let mut ids = Vec::new();
+        for (n, summary) in ["first memory", "second memory"].iter().enumerate() {
+            let mut memory = test_memory("doctor", summary, "doctor content");
+            let mut vector = vec![0.0f32; config.embedding.dimensions];
+            vector[n] = 1.0;
+            memory.embedding = Some(vector);
+            ids.push(memory.id.clone());
+            store.store(memory).unwrap();
+        }
+        assert!(warmup::populate_hnsw(&store, &config));
 
-        let recovered = recover_inflight_file(&queue, &inflight).unwrap();
-        assert_eq!(recovered, Some(2));
-        assert!(!inflight.exists());
-        let queue_text = std::fs::read_to_string(&queue).unwrap();
-        assert!(queue_text.contains("{\"job\":1}"));
-        assert!(queue_text.contains("{\"job\":2}"));
+        let hnsw_base = store.db_path().with_extension("");
+        let mut index = HnswIndex::open(&hnsw_base, store.dims).unwrap();
+        assert!(index.contains(&ids[0]) && index.contains(&ids[1]));
+        index.delete(&ids[1]).unwrap();
+        index.save().unwrap();
+        drop(index);
+        assert!(!HnswIndex::is_dirty(&hnsw_base));
+        assert!(!HnswIndex::open(&hnsw_base, store.dims)
+            .unwrap()
+            .contains(&ids[1]));
+
+        let fixes = apply_local_fixes(&config, &store);
+        assert!(
+            fixes.iter().any(|fix| fix.contains("HNSW rebuild")),
+            "{fixes:?}"
+        );
+        let rebuilt = HnswIndex::open(&hnsw_base, store.dims).unwrap();
+        assert!(rebuilt.contains(&ids[0]));
+        assert!(rebuilt.contains(&ids[1]));
+
+        let again = apply_local_fixes(&config, &store);
+        assert!(
+            !again.iter().any(|fix| fix.contains("HNSW rebuild")),
+            "a complete index is not rebuilt: {again:?}"
+        );
     }
 
     #[tokio::test]

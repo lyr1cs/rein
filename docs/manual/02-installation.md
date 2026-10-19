@@ -149,9 +149,13 @@ rein init
 ```
 
 Rein scans existing config files for Claude Code, Claude Desktop, Cursor,
-Windsurf, VS Code, Gemini, Codex, and OpenCode. JSON clients receive an
-`mcpServers.rein` entry that runs `rein serve`. Codex uses TOML; the official
-Codex MCP server table shape is:
+Windsurf, VS Code, Gemini, Codex, and OpenCode. Claude Code, Claude Desktop,
+Cursor, Windsurf and Gemini receive an `mcpServers.rein` entry that runs
+`rein serve`. VS Code's user `mcp.json` receives `servers.rein` with
+`"type": "stdio"`, and OpenCode's `opencode.json` receives `mcp.rein` with
+`"type": "local"` and `"command": ["rein", "serve"]`, the shapes those two
+clients actually read. Codex uses TOML; the official Codex MCP server table
+shape is:
 
 ```toml
 [mcp_servers.rein]

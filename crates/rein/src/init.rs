@@ -296,10 +296,11 @@ pub fn auto_configure(dry_run: bool) -> anyhow::Result<()> {
             if dry_run {
                 println!("[dry-run] Would configure {name} at {}", path.display());
             } else {
-                let result = if *name == "Codex" {
-                    configure_codex_client(path)
-                } else {
-                    configure_client(path, format)
+                let result = match *name {
+                    "Codex" => configure_codex_client(path),
+                    "VS Code" => configure_vscode_client(path),
+                    "OpenCode" => configure_opencode_client(path),
+                    _ => configure_client(path, format),
                 };
                 match result {
                     Ok(()) => println!("Configured {name}"),
@@ -434,7 +435,55 @@ fn strip_jsonc(s: &str) -> String {
     out
 }
 
+/// Claude Desktop / Claude Code / Cursor / Windsurf / Gemini: the
+/// `mcpServers.<name>` map with `command` + `args`.
 fn configure_json_client(path: &Path) -> anyhow::Result<()> {
+    configure_json_server_entry(
+        path,
+        "mcpServers",
+        serde_json::json!({
+            "command": "rein",
+            "args": ["serve"]
+        }),
+    )
+}
+
+/// VS Code's user `mcp.json` (audit U19-02): servers live under `servers`,
+/// each with an explicit transport `type`. A `mcpServers` entry there is
+/// ignored by VS Code.
+fn configure_vscode_client(path: &Path) -> anyhow::Result<()> {
+    configure_json_server_entry(
+        path,
+        "servers",
+        serde_json::json!({
+            "type": "stdio",
+            "command": "rein",
+            "args": ["serve"]
+        }),
+    )
+}
+
+/// OpenCode's `opencode.json` (audit U19-02): servers live under `mcp`, a
+/// local server has `type = "local"` and its command as one array.
+fn configure_opencode_client(path: &Path) -> anyhow::Result<()> {
+    configure_json_server_entry(
+        path,
+        "mcp",
+        serde_json::json!({
+            "type": "local",
+            "command": ["rein", "serve"],
+            "enabled": true
+        }),
+    )
+}
+
+/// Insert `rein` into the client's server map at `servers_key`, creating
+/// the map when absent and leaving every other entry untouched.
+fn configure_json_server_entry(
+    path: &Path,
+    servers_key: &str,
+    entry: serde_json::Value,
+) -> anyhow::Result<()> {
     let content = std::fs::read_to_string(path)?;
     // Create a backup before modifying
     let backup = path.with_extension("json.bak");
@@ -446,25 +495,19 @@ fn configure_json_client(path: &Path) -> anyhow::Result<()> {
     let servers = root
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("config is not a JSON object"))?
-        .entry("mcpServers")
+        .entry(servers_key)
         .or_insert_with(|| serde_json::json!({}));
 
     let servers_obj = servers
         .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("mcpServers is not a JSON object"))?;
+        .ok_or_else(|| anyhow::anyhow!("{servers_key} is not a JSON object"))?;
 
     if servers_obj.contains_key("rein") {
         println!("  (rein already configured, skipping)");
         return Ok(());
     }
 
-    servers_obj.insert(
-        "rein".to_string(),
-        serde_json::json!({
-            "command": "rein",
-            "args": ["serve"]
-        }),
-    );
+    servers_obj.insert("rein".to_string(), entry);
 
     let formatted = serde_json::to_string_pretty(&root)?;
     // Atomic write: ~/.claude.json corruption breaks Claude Code launch entirely
@@ -1497,6 +1540,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Audit U19-02: VS Code reads `servers.<name>` with a transport
+    /// `type`; a `mcpServers` entry in its user `mcp.json` registers nothing.
+    #[test]
+    fn vscode_init_writes_servers_entry_with_stdio_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("mcp.json");
+        std::fs::write(
+            &target,
+            r#"{"servers": {"other": {"type": "stdio", "command": "other"}}, "inputs": []}"#,
+        )
+        .unwrap();
+
+        configure_vscode_client(&target).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(
+            parsed["servers"]["rein"],
+            serde_json::json!({"type": "stdio", "command": "rein", "args": ["serve"]})
+        );
+        assert_eq!(parsed["servers"]["other"]["command"], "other");
+        assert_eq!(parsed["inputs"], serde_json::json!([]));
+        assert!(parsed.get("mcpServers").is_none());
+
+        configure_vscode_client(&target).unwrap();
+        let again: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(again, parsed, "second run is a no-op");
+    }
+
+    /// Audit U19-02: OpenCode reads `mcp.<name>` with `type = "local"` and
+    /// the command as one array; `mcpServers` is not a key it knows.
+    #[test]
+    fn opencode_init_writes_mcp_entry_with_local_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("opencode.json");
+        std::fs::write(
+            &target,
+            r#"{"$schema": "https://opencode.ai/config.json", "mcp": {"other": {"type": "remote", "url": "https://example.invalid"}}}"#,
+        )
+        .unwrap();
+
+        configure_opencode_client(&target).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(
+            parsed["mcp"]["rein"],
+            serde_json::json!({"type": "local", "command": ["rein", "serve"], "enabled": true})
+        );
+        assert_eq!(parsed["mcp"]["other"]["type"], "remote");
+        assert_eq!(parsed["$schema"], "https://opencode.ai/config.json");
+        assert!(parsed.get("mcpServers").is_none());
+
+        // A file without the map yet gets one created.
+        let fresh = dir.path().join("fresh.json");
+        std::fs::write(&fresh, "{}").unwrap();
+        configure_opencode_client(&fresh).unwrap();
+        let created: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&fresh).unwrap()).unwrap();
+        assert_eq!(created["mcp"]["rein"]["type"], "local");
     }
 
     #[test]
