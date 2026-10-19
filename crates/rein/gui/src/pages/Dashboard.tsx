@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { useStats, useRecent, useActivity } from '../hooks/useApi';
+import ProvidersSummaryCard from '../components/ProvidersSummaryCard';
 import {
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
 } from 'recharts';
@@ -113,6 +114,8 @@ export default function Dashboard() {
         <StatCard label="Memoirs" value={stats.memoir_count} color="var(--concept)" />
         <StatCard label="Links" value={stats.link_count} color="var(--text-secondary)" />
       </div>
+
+      <ProvidersSummaryCard />
 
       {/* Recent memories */}
       <h2 className="text-sm font-semibold text-[var(--text-muted)] uppercase tracking-wider mb-3">Recent Memories</h2>

@@ -12,6 +12,7 @@ const NAV_ITEMS = [
   { path: '/artifacts', icon: '\u{1F4C4}', label: 'Artifacts' },
   { path: '/provenance', icon: '\u{1F50F}', label: 'Provenance' },
   { path: '/synthesis-lab', icon: '\u{1F9EA}', label: 'Synthesis Lab' },
+  { path: '/providers', icon: '\u{1F511}', label: 'AI Keys' },
   { path: '/connectors', icon: '\u{1F517}', label: 'Connectors' },
 ];
 

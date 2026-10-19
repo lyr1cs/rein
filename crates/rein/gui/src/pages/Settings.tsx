@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { apiPost } from '../api/client';
+import EyeToggle from '../components/EyeToggle';
 import { useDoctor, useServerVersion } from '../hooks/useApi';
 import type { DoctorCheck, DoctorReport } from '../api/types';
 
@@ -198,13 +199,12 @@ export default function Settings() {
               placeholder="Enter your REIN_HTTP_TOKEN..."
               className="w-full bg-[var(--bg-primary)] border border-[var(--border)] rounded-lg pl-4 pr-12 py-2 text-sm text-[var(--text-primary)] placeholder-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)] transition-colors font-mono"
             />
-            <button
-              onClick={() => setShowToken(!showToken)}
-              className="absolute right-2 top-1/2 -translate-y-1/2 px-2 py-1 text-xs text-[var(--text-muted)] hover:text-[var(--text-secondary)] transition-colors rounded"
-              type="button"
-            >
-              {showToken ? 'Hide' : 'Show'}
-            </button>
+            <EyeToggle
+              shown={showToken}
+              onToggle={() => setShowToken(!showToken)}
+              label="token"
+              className="absolute right-2 top-1/2 -translate-y-1/2"
+            />
           </div>
           <div className="flex items-center gap-2">
             <button
