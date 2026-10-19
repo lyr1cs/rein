@@ -1369,7 +1369,8 @@ fn check_embedding_provider(config: &ReinConfig) -> DoctorCheck {
             DoctorCategory::Configuration,
             "embedding_provider",
             format!(
-                "omlx:{} at {} ({}d)",
+                "{}:{} at {} ({}d)",
+                config.embedding_provider_name(),
                 config.embedding.omlx.model,
                 config.embedding.omlx.endpoint,
                 config.embedding.dimensions
