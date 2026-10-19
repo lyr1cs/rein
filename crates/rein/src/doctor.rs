@@ -115,6 +115,7 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
     checks.push(check_retired_llm_models(config));
     checks.push(check_judge_llm_provider(config));
     checks.push(check_supermemory(config));
+    checks.push(check_secrets_file());
     checks.push(check_http_auth(config));
     checks.push(check_auth_policy_consistency(config));
     checks.push(check_oauth_provider(config));
@@ -1348,146 +1349,132 @@ fn codex_event_has_command(event_hooks: Option<&serde_json::Value>, command: &st
         .any(|handler| handler.get("command").and_then(|value| value.as_str()) == Some(command))
 }
 
+fn surface_status(
+    config: &ReinConfig,
+    name: &str,
+) -> Option<crate::ops::handlers::providers::SurfaceStatus> {
+    crate::ops::handlers::providers::collect(config, None)
+        .surfaces
+        .into_iter()
+        .find(|s| s.surface == name)
+}
+
+fn credential_env_name(s: &crate::ops::handlers::providers::SurfaceStatus) -> String {
+    s.credential
+        .as_deref()
+        .and_then(|id| id.strip_prefix("env:"))
+        .unwrap_or("GEMINI_API_KEY")
+        .to_string()
+}
+
 fn check_embedding_provider(config: &ReinConfig) -> DoctorCheck {
-    match config.embedding_provider() {
-        Provider::Google => match config.embedding.google.api_key.as_ref() {
-            Some(_) => ok_in(
-                DoctorCategory::Configuration,
-                "embedding_provider",
-                format!(
-                    "google:{} configured ({}d)",
-                    config.embedding.google.model, config.embedding.dimensions
-                ),
-            ),
-            None => warn_in(
-                DoctorCategory::Configuration,
-                "embedding_provider",
-                "google configured but GEMINI_API_KEY is missing; vector embedding is disabled",
-            ),
-        },
-        Provider::Omlx => ok_in(
+    let Some(s) = surface_status(config, "embedding") else {
+        return ok_in(
+            DoctorCategory::Configuration,
+            "embedding_provider",
+            "disabled",
+        );
+    };
+    let dims = config.embedding.dimensions;
+    match (s.provider.as_str(), s.status.as_str()) {
+        ("none", _) | (_, "disabled") => ok_in(
+            DoctorCategory::Configuration,
+            "embedding_provider",
+            "disabled",
+        ),
+        ("google", "ready") => ok_in(
+            DoctorCategory::Configuration,
+            "embedding_provider",
+            format!("google:{} configured ({dims}d)", s.model),
+        ),
+        ("google", _) => warn_in(
             DoctorCategory::Configuration,
             "embedding_provider",
             format!(
-                "{}:{} at {} ({}d)",
-                config.embedding_provider_name(),
-                config.embedding.omlx.model,
-                config.embedding.omlx.endpoint,
-                config.embedding.dimensions
+                "google configured but {} is missing; vector embedding is disabled",
+                credential_env_name(&s)
             ),
         ),
-        Provider::None => ok_in(
+        (_, "ready") => ok_in(
             DoctorCategory::Configuration,
             "embedding_provider",
-            "disabled",
+            format!("{}:{} at {} ({dims}d)", s.provider, s.model, s.endpoint),
+        ),
+        (_, _) => warn_in(
+            DoctorCategory::Configuration,
+            "embedding_provider",
+            format!(
+                "{} configured but {} is missing; vector embedding is disabled",
+                s.provider,
+                credential_env_name(&s)
+            ),
         ),
     }
 }
 
-/// Codex R5 P3 helper — return true if the Google API key is reachable
-/// via either the resolver's `api_key_env` (preferred path used by
-/// migrated constructors) OR the legacy `config.extract.google.api_key`
-/// field (populated from `GEMINI_API_KEY` at config-load time).
-/// Mirrors the resolution order of `extract::llm::create_extractor`
-/// post-R2 fix.
-fn google_api_key_resolved(
+/// Shared shape for the LLM-surface provider checks. Message texts are the
+/// pre-v1.5 ones so existing doctor consumers keep parsing them.
+fn llm_surface_check(
     config: &ReinConfig,
-    resolved: Option<&crate::config::ResolvedLlmConfig>,
-) -> bool {
-    // Resolved api_key_env path takes precedence — reflects how the
-    // constructors actually decide whether the key exists at runtime.
-    let env_present = resolved
-        .and_then(|r| r.api_key_env.as_deref())
-        .and_then(|env_name| std::env::var(env_name).ok())
-        .is_some();
-    env_present || config.extract.google.api_key.is_some()
+    surface: &str,
+    name: &'static str,
+    disabled_text: &str,
+    suffix: &str,
+) -> DoctorCheck {
+    let Some(s) = surface_status(config, surface) else {
+        return ok_in(DoctorCategory::Configuration, name, "disabled");
+    };
+    match (s.provider.as_str(), s.status.as_str()) {
+        ("none", _) | (_, "disabled") => ok_in(DoctorCategory::Configuration, name, "disabled"),
+        ("google", "ready") => ok_in(
+            DoctorCategory::Configuration,
+            name,
+            format!("google:{} configured{suffix}", s.model),
+        ),
+        ("google", _) => warn_in(
+            DoctorCategory::Configuration,
+            name,
+            format!(
+                "google configured but no API key found at the resolved api_key_env \
+                 (default {}); {disabled_text}",
+                credential_env_name(&s)
+            ),
+        ),
+        (_, "ready") => ok_in(
+            DoctorCategory::Configuration,
+            name,
+            format!("{}:{} at {}{suffix}", s.provider, s.model, s.endpoint),
+        ),
+        (_, _) => warn_in(
+            DoctorCategory::Configuration,
+            name,
+            format!(
+                "{} configured but {} is missing; {disabled_text}",
+                s.provider,
+                credential_env_name(&s)
+            ),
+        ),
+    }
 }
 
 fn check_extract_provider(config: &ReinConfig) -> DoctorCheck {
-    // v0.27.1 B2 (spec §15 R9-K6): route through `resolve_llm_for("extract")`
-    // so doctor reports the same provider/model production reads. Reading
-    // legacy `[extract]` directly would mislead operators using `[llm]`
-    // inheritance into thinking the resolved model differs from production.
-    let resolved = config.resolve_llm_for("extract").ok();
-    let provider = resolved
-        .as_ref()
-        .map(|r| r.provider)
-        .unwrap_or(Provider::None);
-    let model = resolved
-        .as_ref()
-        .map(|r| r.model.clone())
-        .unwrap_or_default();
-    let endpoint = resolved
-        .as_ref()
-        .map(|r| r.endpoint.clone())
-        .unwrap_or_default();
-    // Codex R5 P3 fix — honor the resolver's api_key_env. v0 doctor
-    // hardcoded `GEMINI_API_KEY`, so an operator on a custom env name
-    // (e.g. `[llm.google].api_key_env = "MY_KEY"`) saw a false WARN
-    // even though the migrated constructors successfully read MY_KEY.
-    let api_key_present_for_extract = google_api_key_resolved(config, resolved.as_ref());
-    match provider {
-        Provider::Google if api_key_present_for_extract => ok_in(
-            DoctorCategory::Configuration,
-            "extract_provider",
-            format!("google:{model} configured"),
-        ),
-        Provider::Google => warn_in(
-            DoctorCategory::Configuration,
-            "extract_provider",
-            "google configured but no API key found at the resolved api_key_env \
-             (default GEMINI_API_KEY); LLM extraction is disabled",
-        ),
-        Provider::Omlx => ok_in(
-            DoctorCategory::Configuration,
-            "extract_provider",
-            format!("omlx:{model} at {endpoint}"),
-        ),
-        Provider::None => ok_in(
-            DoctorCategory::Configuration,
-            "extract_provider",
-            "disabled",
-        ),
-    }
+    llm_surface_check(
+        config,
+        "extract",
+        "extract_provider",
+        "LLM extraction is disabled",
+        "",
+    )
 }
 
 fn check_query_expansion_provider(config: &ReinConfig) -> DoctorCheck {
-    // v0.27.1 B2 (spec §15 R9-K6): route through
-    // `resolve_llm_for("query_expansion")`.
-    let resolved = config.resolve_llm_for("query_expansion").ok();
-    let provider = resolved
-        .as_ref()
-        .map(|r| r.provider)
-        .unwrap_or(Provider::None);
-    let model = resolved
-        .as_ref()
-        .map(|r| r.model.clone())
-        .unwrap_or_default();
-    let endpoint = resolved
-        .as_ref()
-        .map(|r| r.endpoint.clone())
-        .unwrap_or_default();
-    // Codex R5 P3 — honor resolved api_key_env (mirror of extract path).
-    let key_present = google_api_key_resolved_for_qe(config, resolved.as_ref());
-    match provider {
-        Provider::Google if key_present => ok_in(
-            DoctorCategory::Configuration,
-            "query_expansion",
-            format!("google:{model} configured"),
-        ),
-        Provider::Google => warn_in(
-            DoctorCategory::Configuration,
-            "query_expansion",
-            "google configured but no API key found at the resolved api_key_env \
-             (default GEMINI_API_KEY); expansion is disabled",
-        ),
-        Provider::Omlx => ok_in(
-            DoctorCategory::Configuration,
-            "query_expansion",
-            format!("omlx:{model} at {endpoint}"),
-        ),
-        Provider::None => ok_in(DoctorCategory::Configuration, "query_expansion", "disabled"),
-    }
+    llm_surface_check(
+        config,
+        "query_expansion",
+        "query_expansion",
+        "expansion is disabled",
+        "",
+    )
 }
 
 const RETIRED_GEMINI_FLASH_LITE_PREVIEW_MODEL: &str = "gemini-3.1-flash-lite-preview";
@@ -1615,72 +1602,71 @@ fn check_judge_llm_provider(config: &ReinConfig) -> DoctorCheck {
     }
 }
 
-fn google_api_key_resolved_for_qe(
-    config: &ReinConfig,
-    resolved: Option<&crate::config::ResolvedLlmConfig>,
-) -> bool {
-    let env_present = resolved
-        .and_then(|r| r.api_key_env.as_deref())
-        .and_then(|env_name| std::env::var(env_name).ok())
-        .is_some();
-    env_present || config.query_expansion.google.api_key.is_some()
-}
-
 fn check_reranker_provider(config: &ReinConfig) -> DoctorCheck {
-    // v0.27.1 B2 (spec §15 R9-K6): route through
-    // `resolve_llm_for("search.llm_reranker")`.
-    let resolved = config.resolve_llm_for("search.llm_reranker").ok();
-    let provider = resolved
-        .as_ref()
-        .map(|r| r.provider)
-        .unwrap_or(Provider::None);
-    let model = resolved
-        .as_ref()
-        .map(|r| r.model.clone())
-        .unwrap_or_default();
-    let endpoint = resolved
-        .as_ref()
-        .map(|r| r.endpoint.clone())
-        .unwrap_or_default();
-    let top_n = config.search.llm_reranker_top_n;
-    // Codex R5 P3 — honor resolved api_key_env (mirror of extract path).
-    // Reranker shares `[query_expansion.google]` for the api_key field.
-    let key_present = google_api_key_resolved_for_qe(config, resolved.as_ref());
-    match provider {
-        Provider::Google if key_present => ok_in(
-            DoctorCategory::Configuration,
-            "llm_reranker",
-            format!("google:{model} configured (top_n={top_n})"),
-        ),
-        Provider::Google => warn_in(
-            DoctorCategory::Configuration,
-            "llm_reranker",
-            "google reranker configured but no API key found at the resolved \
-             api_key_env (default GEMINI_API_KEY); reranker will be skipped",
-        ),
-        Provider::Omlx => ok_in(
-            DoctorCategory::Configuration,
-            "llm_reranker",
-            format!("omlx:{model} at {endpoint} (top_n={top_n})"),
-        ),
-        Provider::None => ok_in(DoctorCategory::Configuration, "llm_reranker", "disabled"),
-    }
+    let suffix = format!(" (top_n={})", config.search.llm_reranker_top_n);
+    llm_surface_check(
+        config,
+        "search.llm_reranker",
+        "llm_reranker",
+        "reranker will be skipped",
+        &suffix,
+    )
 }
 
 fn check_supermemory(config: &ReinConfig) -> DoctorCheck {
-    if !config.sync.supermemory_enabled {
+    let Some(s) = surface_status(config, "supermemory") else {
         return ok_in(DoctorCategory::Configuration, "supermemory", "disabled");
-    }
-    match config.sync.api_key.as_ref() {
-        Some(_) => ok_in(
+    };
+    match s.status.as_str() {
+        "disabled" => ok_in(DoctorCategory::Configuration, "supermemory", "disabled"),
+        "ready" => ok_in(
             DoctorCategory::Configuration,
             "supermemory",
             format!("enabled via {}", config.sync.endpoint),
         ),
-        None => warn_in(
+        _ => warn_in(
             DoctorCategory::Configuration,
             "supermemory",
             "enabled but SUPERMEMORY_CC_API_KEY is missing; cross-validation will be partial",
+        ),
+    }
+}
+
+fn check_secrets_file() -> DoctorCheck {
+    check_secrets_file_at(&crate::secrets::default_path())
+}
+
+/// `~/.rein/secrets.env`: absent is fine (keys come from the environment),
+/// readable reports the key count, wrong permissions is a FAIL (the file
+/// is not loaded in that state), a parse error is a WARN with the line.
+fn check_secrets_file_at(path: &Path) -> DoctorCheck {
+    if !path.exists() {
+        return ok_in(
+            DoctorCategory::Configuration,
+            "secrets_file",
+            format!(
+                "not present ({}); keys come from the process environment — manage with `rein keys`",
+                path.display()
+            ),
+        );
+    }
+    match crate::secrets::load_from(path) {
+        Ok(map) => ok_in(
+            DoctorCategory::Configuration,
+            "secrets_file",
+            format!("{} key(s) in {}", map.len(), path.display()),
+        ),
+        Err(msg) if msg.contains("chmod 600") => fail_with_hint(
+            DoctorCategory::Configuration,
+            "secrets_file",
+            msg,
+            format!("chmod 600 {}", path.display()),
+        ),
+        Err(msg) => warn_with_hint(
+            DoctorCategory::Configuration,
+            "secrets_file",
+            msg,
+            "fix the line or rewrite the file with `rein keys set`",
         ),
     }
 }
@@ -3894,6 +3880,53 @@ fn check_judge_cache_size(config: &ReinConfig) -> DoctorCheck {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn provider_checks_use_vendor_names_and_keep_message_shapes() {
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("PERPLEXITY_API_KEY");
+        let mut config = ReinConfig::load_from_str(
+            "[extract]\nprovider = \"openai\"\n[extract.openai]\nmodel = \"gpt-5-mini\"\n[embedding]\nprovider = \"perplexity\"\ndimensions = 2560\n[embedding.openai]\nmodel = \"pplx-embed-v1-4b\"\n",
+        )
+        .unwrap();
+        let c = check_extract_provider(&config);
+        assert_eq!(c.status, CheckStatus::Warn, "{}", c.message);
+        assert!(c.message.contains("OPENAI_API_KEY"), "{}", c.message);
+        config.secrets.insert("OPENAI_API_KEY".into(), "k".into());
+        config
+            .secrets
+            .insert("PERPLEXITY_API_KEY".into(), "p".into());
+        let c = check_extract_provider(&config);
+        assert_eq!(c.status, CheckStatus::Ok);
+        assert_eq!(c.message, "openai:gpt-5-mini at https://api.openai.com/v1");
+        let e = check_embedding_provider(&config);
+        assert_eq!(e.status, CheckStatus::Ok);
+        assert_eq!(
+            e.message,
+            "perplexity:pplx-embed-v1-4b at https://api.perplexity.ai/v1 (2560d)"
+        );
+    }
+
+    #[test]
+    fn secrets_file_check_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.env");
+        assert_eq!(check_secrets_file_at(&path).status, CheckStatus::Ok);
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("A".to_string(), "1".to_string());
+        crate::secrets::write_to(&path, &m).unwrap();
+        let c = check_secrets_file_at(&path);
+        assert_eq!(c.status, CheckStatus::Ok);
+        assert!(c.message.contains("1 key"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let c = check_secrets_file_at(&path);
+            assert_eq!(c.status, CheckStatus::Fail);
+            assert!(c.repair_hint.as_deref().unwrap().contains("chmod 600"));
+        }
+    }
+
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
