@@ -636,10 +636,16 @@ impl SqliteStore {
         rows.filter_map(|r| r.ok()).collect()
     }
 
-    /// Get the most recently created memories.
+    /// The most recently created live canonical memories, newest first.
+    /// Deprecated rows, superseded revisions and non-canonical revisions are
+    /// excluded in SQL, before the LIMIT, so a burst of merges or deletions
+    /// cannot crowd out older live memories or surface an old canonical
+    /// (reached through a freshly merged loser) ahead of a newer one.
     pub fn recent(&self, limit: usize) -> ReinResult<Vec<Memory>> {
         let sql = format!(
-            "{} ORDER BY m.created_at DESC LIMIT ?1",
+            "{} WHERE m.superseded_by IS NULL AND COALESCE(cs.canonical_id, m.id) = m.id \
+             AND m.status IN ('active', 'updated') \
+             ORDER BY m.created_at DESC LIMIT ?1",
             memory_select_base()
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -1400,8 +1406,17 @@ impl MemoryStore for SqliteStore {
                         None
                     }
                 } else {
-                    // Never leave a stale vector row behind when the semantic fields changed.
+                    // Never leave a stale vector row behind when the semantic
+                    // fields changed — and never leave the memory without a
+                    // vector for good either: flag it so the deferred
+                    // embedding sweep (`run_vec_dedup`, `needs_vec_dedup = 1`)
+                    // re-embeds it. Without the flag an edited memory silently
+                    // dropped out of vector recall until a full warmup.
                     vec::delete_embedding(&self.conn, &memory.id)?;
+                    self.conn.execute(
+                        "UPDATE memories SET needs_vec_dedup = 1 WHERE id = ?1",
+                        rusqlite::params![memory.id],
+                    )?;
                     None
                 }
             } else {
@@ -4793,6 +4808,15 @@ enabled = true
             .unwrap()
             .is_some());
 
+        // A processed memory has its sweep flag cleared.
+        store
+            .conn()
+            .execute(
+                "UPDATE memories SET needs_vec_dedup = 0 WHERE id = ?1",
+                rusqlite::params![&memory_id],
+            )
+            .unwrap();
+
         let mut fetched = store.get(&memory_id).unwrap();
         fetched.summary = "updated".to_string();
         fetched.content = "content changed enough to require a new embedding".to_string();
@@ -4804,6 +4828,86 @@ enabled = true
                 .is_none(),
             "semantic edits without a replacement embedding must not leave stale vec rows behind"
         );
+        let flag: i32 = store
+            .conn()
+            .query_row(
+                "SELECT needs_vec_dedup FROM memories WHERE id = ?1",
+                rusqlite::params![&memory_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            flag, 1,
+            "an edit that drops the vector must schedule a replacement embedding"
+        );
+    }
+
+    #[test]
+    fn recent_returns_live_canonicals_even_when_newest_rows_are_dead() {
+        let store = SqliteStore::in_memory().unwrap();
+        let old_live = store
+            .store(test_memory("t", "old live", Importance::Medium))
+            .unwrap();
+        for i in 0..5 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let id = store
+                .store(test_memory("t", &format!("dead {i}"), Importance::Medium))
+                .unwrap();
+            store
+                .conn()
+                .execute(
+                    "UPDATE memories SET status = 'deprecated' WHERE id = ?1",
+                    rusqlite::params![id],
+                )
+                .unwrap();
+        }
+        // The five newest raw rows are dead; the live memory must still show.
+        let recent = store.recent(3).unwrap();
+        assert_eq!(
+            recent.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec![old_live.as_str()]
+        );
+    }
+
+    #[test]
+    fn consolidate_snapshots_refuses_sources_edited_during_synthesis() {
+        let store = SqliteStore::in_memory().unwrap();
+        let a = store
+            .store(test_memory("topic-a", "first", Importance::Medium))
+            .unwrap();
+        let b = store
+            .store(test_memory("topic-a", "second", Importance::Medium))
+            .unwrap();
+        let snapshots = vec![store.get(&a).unwrap(), store.get(&b).unwrap()];
+
+        // A concurrent edit lands while the LLM synthesizes.
+        let mut edited = store.get(&a).unwrap();
+        edited.content = "first, with a fact the synthesis never saw".to_string();
+        edited.updated_at = chrono::Utc::now() + chrono::Duration::seconds(1);
+        store.update(&edited).unwrap();
+
+        let replacement = test_memory("topic-a", "merged", Importance::High);
+        let err = store
+            .consolidate_snapshots_atomic(&snapshots, replacement)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("changed during synthesis"), "{err}");
+        // Nothing was deleted or inserted.
+        assert_eq!(
+            store.get(&a).unwrap().content,
+            "first, with a fact the synthesis never saw"
+        );
+        assert!(store.get(&b).is_ok());
+        assert_eq!(store.recent(10).unwrap().len(), 2);
+
+        // Fresh snapshots go through.
+        let snapshots = vec![store.get(&a).unwrap(), store.get(&b).unwrap()];
+        let replacement = test_memory("topic-a", "merged", Importance::High);
+        let old = store
+            .consolidate_snapshots_atomic(&snapshots, replacement)
+            .unwrap();
+        assert_eq!(old.len(), 2);
+        assert!(store.get(&a).is_err());
     }
 
     #[test]

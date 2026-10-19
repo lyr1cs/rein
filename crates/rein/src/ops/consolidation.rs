@@ -447,13 +447,24 @@ pub fn run_consolidation(
                 summary_template,
             );
             let new_id = replacement.id.clone();
-            // Use ID-based deletion to prevent TOCTOU data loss (new memories added
-            // to the topic between load_group_memories and this commit are preserved).
-            let memory_ids: Vec<String> = memories.iter().map(|m| m.id.clone()).collect();
-            let old_memories = store.consolidate_by_ids_atomic(&memory_ids, replacement)?;
-            emit_consolidation_events(store, group, &new_id, &old_memories);
-            changed = true;
-            Some(new_id)
+            // Snapshot-checked, ID-based replacement: new memories added to the
+            // topic since load_group_memories are preserved, and a source that
+            // was edited meanwhile makes the group skip instead of being
+            // overwritten with stale synthesized text (2026-10 audit U13-03).
+            match store.consolidate_snapshots_atomic(&memories, replacement) {
+                Ok(old_memories) => {
+                    emit_consolidation_events(store, group, &new_id, &old_memories);
+                    changed = true;
+                    Some(new_id)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "consolidation: group '{}' skipped: {e}",
+                        group.canonical_topic
+                    );
+                    None
+                }
+            }
         };
 
         report.groups.push(ConsolidationGroupReport {
@@ -608,12 +619,24 @@ pub async fn run_consolidation_async(
 
             let created_id = if let Some((replacement, _)) = replacement {
                 let new_id = replacement.id.clone();
-                // Use ID-based deletion to prevent TOCTOU data loss
-                let memory_ids: Vec<String> = memories.iter().map(|m| m.id.clone()).collect();
-                let old_memories = store.consolidate_by_ids_atomic(&memory_ids, replacement)?;
-                emit_consolidation_events(store, &group, &new_id, &old_memories);
-                changed = true;
-                Some(new_id)
+                // Snapshot-checked, ID-based replacement (see the single-group
+                // path above): an edited source skips the group rather than
+                // being overwritten with stale synthesized text.
+                match store.consolidate_snapshots_atomic(&memories, replacement) {
+                    Ok(old_memories) => {
+                        emit_consolidation_events(store, &group, &new_id, &old_memories);
+                        changed = true;
+                        Some(new_id)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "consolidation: group '{}' skipped: {e}",
+                            group.canonical_topic
+                        );
+                        report.memories_replaced -= memories.len();
+                        None
+                    }
+                }
             } else {
                 None
             };

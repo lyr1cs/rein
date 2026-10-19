@@ -915,6 +915,53 @@ impl SqliteStore {
     /// Unlike `consolidate_atomic` (which deletes by topic), this deletes ONLY the
     /// specified IDs, preventing TOCTOU data loss if new memories are added to the
     /// topic between the load and commit phases.
+    /// Like [`Self::consolidate_by_ids_atomic`], but refuses when any source
+    /// row changed after `snapshots` were read (content, `updated_at`, or a
+    /// supersession), so a synthesis built from stale inputs can never
+    /// replace a concurrent edit (2026-10 audit U13-03). The check and the
+    /// replacement share one savepoint.
+    pub fn consolidate_snapshots_atomic(
+        &self,
+        snapshots: &[Memory],
+        replacement: Memory,
+    ) -> ReinResult<Vec<Memory>> {
+        self.conn.execute_batch("SAVEPOINT consolidate_snapshots")?;
+        let rollback = |conn: &rusqlite::Connection| {
+            let _ = conn
+                .execute_batch("ROLLBACK TO consolidate_snapshots; RELEASE consolidate_snapshots");
+        };
+        for snapshot in snapshots {
+            let current = match self.get(&snapshot.id) {
+                Ok(m) => m,
+                Err(e) => {
+                    rollback(&self.conn);
+                    return Err(e);
+                }
+            };
+            if current.content != snapshot.content
+                || current.updated_at != snapshot.updated_at
+                || current.superseded_by.is_some()
+            {
+                rollback(&self.conn);
+                return Err(ReinError::Config(format!(
+                    "consolidation: memory {} changed during synthesis; group skipped",
+                    snapshot.id
+                )));
+            }
+        }
+        let ids: Vec<String> = snapshots.iter().map(|m| m.id.clone()).collect();
+        match self.consolidate_by_ids_atomic(&ids, replacement) {
+            Ok(old) => {
+                self.conn.execute_batch("RELEASE consolidate_snapshots")?;
+                Ok(old)
+            }
+            Err(e) => {
+                rollback(&self.conn);
+                Err(e)
+            }
+        }
+    }
+
     pub fn consolidate_by_ids_atomic(
         &self,
         memory_ids: &[String],
