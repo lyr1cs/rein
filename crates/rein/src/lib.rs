@@ -51,3 +51,4 @@ pub mod service;
 pub mod store;
 pub mod sync;
 pub mod types;
+pub mod vendors;
