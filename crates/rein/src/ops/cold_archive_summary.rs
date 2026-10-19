@@ -1209,6 +1209,18 @@ fn refresh_one_for_handler_inner(
         ReinError::NotFound(_) => e,
         other => other,
     })?;
+    // Raw `updated_at` of the row we are about to summarize: the commit
+    // below requires it unchanged, so a content edit that lands while the
+    // LLM runs cannot be overwritten with a summary of the old text
+    // (2026-10 audit U12-01; same guard as the worker's success commit).
+    let updated_at_raw: String = store
+        .conn()
+        .query_row(
+            "SELECT updated_at FROM memories WHERE id = ?1",
+            rusqlite::params![memory_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| ReinError::Config(format!("Cap C: failed to read updated_at: {e}")))?;
     if memory.tier != MemoryTier::Cold {
         return Ok(ManualRefreshOutcome {
             generated: false,
@@ -1261,6 +1273,22 @@ fn refresh_one_for_handler_inner(
     let generator = ColdArchiveSummaryGenerator::new(extractor, cold_config.clone())
         .with_rein_config(std::sync::Arc::new(config.clone()));
 
+    // M5 may already have stripped this row (original moved to
+    // `cold_archive`, `memories.content` replaced by the summary). Summarize
+    // the archived original, as the worker does — otherwise a short stripped
+    // body is reported as "already at or below target" and a longer one is
+    // re-summarized from already-compressed text (2026-10 audit U12-02).
+    let mut memory = memory;
+    if let Ok(original) = store.conn().query_row(
+        "SELECT content FROM cold_archive WHERE memory_id = ?1",
+        rusqlite::params![memory_id],
+        |row| row.get::<_, String>(0),
+    ) {
+        if original != memory.content {
+            memory.content = original;
+        }
+    }
+
     // Manual refresh path doesn't go through claim_batch — operator-driven,
     // single-row, no contention model. We still write under the same
     // schema columns so concurrent worker passes see consistent state.
@@ -1297,6 +1325,7 @@ fn refresh_one_for_handler_inner(
              archival_claim_token = NULL, \
              last_too_large_at = NULL \
          WHERE id = ?4 \
+           AND updated_at = ?5 \
            AND status IN ('active', 'updated') \
            AND tier = 'cold'",
         rusqlite::params![
@@ -1304,6 +1333,7 @@ fn refresh_one_for_handler_inner(
             now,
             ARCHIVAL_SUMMARY_VERSION as i64,
             memory_id,
+            &updated_at_raw,
         ],
     )?;
     if affected == 0 {
@@ -2165,6 +2195,54 @@ mod tests {
             assert!(saved.is_some(), "summary persisted post-fallback");
             assert_eq!(version, Some(ARCHIVAL_SUMMARY_VERSION as i64));
             assert_eq!(flag, 0, "needs_archival_summary cleared on success");
+        }
+
+        /// 2026-10 audit U12-02: the operator-driven refresh must read the
+        /// archived original like the worker does, instead of judging the
+        /// M5-stripped body.
+        #[test]
+        fn manual_refresh_reads_cold_archive_original_when_already_stripped() {
+            let (config, _tmp) = fresh_store();
+            let store = config.open_store().expect("open store");
+            let stripped = "short summary placeholder (post-M5-strip)";
+            seed_cold_flagged(&store, "stripped2", stripped, "2026-04-01T00:00:00Z");
+            let original = "Anthropic released Claude 4.6 in 2026 with a 200K context window. \
+                The model targets long-document synthesis and tool use across multi-turn \
+                dialogs. Released alongside an upgrade to the Sonnet tier and improved \
+                citation grounding. The release also brought structured-output mode \
+                and improved tool calling latency."
+                .repeat(2);
+            store
+                .conn()
+                .execute(
+                    "INSERT INTO cold_archive (memory_id, content, archived_at) \
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params!["stripped2", &original, "2026-04-01T00:00:00Z"],
+                )
+                .expect("seed cold_archive original");
+            let cold_config = ColdArchiveConfig::from_ars(&config.ars);
+            let summary = "Anthropic Claude 4.6 (2026) — 200K context, long-document \
+                synthesis, multi-turn tool use, Sonnet upgrade, structured output.";
+            let extractor =
+                ExtractorKind::Mock(MockExtractor::with_responses(vec![Ok(summary.to_string())]));
+            let outcome = refresh_one_for_handler_with_extractor(
+                &store,
+                &config,
+                &cold_config,
+                "stripped2",
+                true,
+                extractor,
+            )
+            .expect("manual refresh");
+            assert!(
+                outcome.generated,
+                "manual refresh must summarize the archived original: {:?}",
+                outcome.skipped_reason
+            );
+            let (saved, _, version, flag) = read_archival_state(&store, "stripped2");
+            assert!(saved.is_some());
+            assert_eq!(version, Some(ARCHIVAL_SUMMARY_VERSION as i64));
+            assert_eq!(flag, 0);
         }
 
         /// v0.27.5 R1 — too-large backoff: rows whose previous attempt
