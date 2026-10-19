@@ -199,7 +199,7 @@ pub fn start_service(name: &str, serve_args: &[&str]) -> anyhow::Result<()> {
     }
 
     let exe = std::env::current_exe()?;
-    let child = std::process::Command::new(exe)
+    let mut child = std::process::Command::new(exe)
         .args(serve_args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -209,20 +209,33 @@ pub fn start_service(name: &str, serve_args: &[&str]) -> anyhow::Result<()> {
     let pid = child.id();
     // Write PID file immediately to prevent race with concurrent start attempts
     let _ = write_pid_of(name, pid);
-    println!("Started {name} (PID {pid})");
 
-    // Wait a moment and check if the process is still alive (catches immediate failures).
-    std::thread::sleep(Duration::from_millis(500));
-
-    #[cfg(unix)]
-    {
-        let ret = unsafe { libc::kill(pid as i32, 0) };
-        if ret != 0 {
-            anyhow::bail!("{name} failed to start — check logs");
-        }
+    // Catch immediate failures (bad flags, port in use, missing auth config).
+    if let Some(status) = exited_within(&mut child, Duration::from_millis(500)) {
+        remove_pid(name);
+        anyhow::bail!("{name} exited during startup ({status}) — check logs");
     }
 
+    println!("Started {name} (PID {pid})");
     Ok(())
+}
+
+/// Wait `grace`, then report whether the child has already exited. Uses
+/// `try_wait` (which reaps) rather than `kill(pid, 0)`: an exited child is a
+/// zombie until reaped and still answers signal 0, so the old liveness probe
+/// reported "Started" for a process that was already dead.
+fn exited_within(
+    child: &mut std::process::Child,
+    grace: Duration,
+) -> Option<std::process::ExitStatus> {
+    std::thread::sleep(grace);
+    match child.try_wait() {
+        Ok(status) => status,
+        Err(e) => {
+            tracing::warn!("try_wait on spawned service failed: {e}");
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -464,6 +477,27 @@ pub fn print_dashboard(config: &crate::config::ReinConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exited_within_sees_a_child_that_died_before_the_grace_period() {
+        // `true` exits immediately; without reaping, kill(pid, 0) would still
+        // succeed on the zombie and the start path would report success.
+        let mut dead = std::process::Command::new("true")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let status = exited_within(&mut dead, Duration::from_millis(200)).expect("exited");
+        assert!(status.success());
+
+        let mut alive = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        assert!(exited_within(&mut alive, Duration::from_millis(50)).is_none());
+        let _ = alive.kill();
+        let _ = alive.wait();
+    }
 
     #[test]
     fn explicit_pid_names_are_not_rewritten() {
