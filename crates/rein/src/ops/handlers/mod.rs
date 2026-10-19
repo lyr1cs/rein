@@ -11,6 +11,7 @@ pub mod judge;
 pub mod knowledge;
 pub mod maintenance;
 pub mod memory;
+pub mod providers;
 pub mod session;
 
 /// Test-only path-template ops. Gated behind the `test-support` feature so
