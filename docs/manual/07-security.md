@@ -166,6 +166,21 @@ Important defaults and controls:
 Set providers to `none`, omit API keys, or keep feature flags disabled when a
 deployment must avoid remote LLM calls.
 
+### Key storage and the reveal endpoint
+
+- `~/.rein/secrets.env` must be mode `600`; rein refuses to load a key file
+  readable by group or others and `rein doctor` reports it as `secrets_file`
+  FAIL.
+- No CLI, REST or GUI surface prints a key unmasked except
+  `POST /api/providers/reveal`, which requires the mutation marker **and** the
+  owner credential (`REIN_HTTP_TOKEN` as header, bearer or the `/api` session
+  cookie), answers with `Cache-Control: no-store`, and logs only the credential
+  id. Under `[server].auth = "public"` there is no owner credential, so reveal
+  is unavailable. The GUI keeps a revealed value in memory only and hides it
+  again after 60 seconds or when the page is left.
+- Probe requests carry the configured key to the configured endpoint only;
+  error strings never include response bodies.
+
 ## AGPL Network-Use Notice
 
 Rein is licensed under AGPL-3.0-or-later. If you modify Rein and let users

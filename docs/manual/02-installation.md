@@ -10,8 +10,10 @@ intended to run from the repository root.
   version (MSRV): 1.86** (declared as `rust-version` in `Cargo.toml` and
   enforced by the CI `msrv` job); newer toolchains also work.
 - Node.js and npm when building the embedded GUI.
-- Optional: `GEMINI_API_KEY` for Google embeddings, extraction, query expansion,
-  synthesis, and other LLM-backed features.
+- Optional: an API key for at least one model vendor. Gemini (`GEMINI_API_KEY`)
+  powers every surface out of the box; any OpenAI-compatible vendor works per
+  surface (see `rein providers vendors`). Keys can live in the environment or in
+  `~/.rein/secrets.env` (`rein keys set`).
 - Optional: `SUPERMEMORY_CC_API_KEY` when using the Supermemory integration.
 - Optional: Docker and Docker Compose for container deployment.
 
@@ -280,7 +282,9 @@ and Windows users have two alternatives:
    ```
 
    Use the **absolute path** because Claude Desktop does not inherit shell
-   `PATH`.
+   `PATH`. With v1.5.0 you can instead run `rein keys set GEMINI_API_KEY` once
+   and drop the `env` block: every `rein serve` started by any host reads the
+   same `~/.rein/secrets.env`.
 
 For maintainers building the `.mcpb` artifact, see
 [docs/guides/dxt-build.md](../guides/dxt-build.md).
@@ -369,6 +373,8 @@ token is read from `REIN_PROXY_TOKEN` at invocation time.
 | --- | --- |
 | `REIN_DB` | Override the SQLite database path. |
 | `GEMINI_API_KEY` | Google embedding and LLM API key. |
+| `OPENAI_API_KEY`, `PERPLEXITY_API_KEY`, … | Vendor keys; `rein providers vendors` lists the variable each preset reads, `api_key_env` overrides it. |
+| `REIN_SECRETS_FILE` | Override the key file path (default `~/.rein/secrets.env`). The file is read on every config load, after the process environment, so an exported variable always wins. The file must be mode `600`. |
 | `SUPERMEMORY_CC_API_KEY` | Supermemory API key. |
 | `REIN_HTTP_TOKEN` | Bearer token for HTTP/SSE, GUI APIs, and Docker. |
 | `REIN_SSE_BIND` | Override HTTP/SSE bind address. |

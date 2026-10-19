@@ -235,6 +235,12 @@ rather than rebuilt from vectors in the old embedding space.
 still running the previous configuration is refused vector writes once the store
 is stamped for the current model.
 
+To change the model on purpose (another vendor, another dimension), follow
+[Switching the embedding model](#switching-the-embedding-model) below:
+`rein providers set embedding …` edits the configuration, `rein warmup
+--reembed-all` performs this migration, and `rein migrate --reindex` remains the
+lexical/vector reindex path for a stamped table.
+
 ## Workers And Queues
 
 Rein has file-backed queues for work that should not block the hot path.
@@ -436,6 +442,68 @@ origin. Codex API-key proxy examples use a custom provider with
 The proxy is record-only. It forwards upstream requests and responses, mirrors
 eligible artifacts, and queues extraction work when enabled; it does not modify
 the prompt or inject recalled memories.
+
+## Providers And API Keys
+
+`rein providers status` (also `rein status`) lists every AI surface — embedding,
+extraction, async memory, intelligent merge, query expansion, LLM rerank, recall
+synthesis, concept summaries, cold archive, resummerize, judge, nightly judge,
+Supermemory — with the provider and model it resolves to, the config table that
+decided it, and the key it needs. Keys are shown masked (`AIza••••3f2a`).
+`--probe` calls each provider once (5 s timeout each) and reports `ok`,
+`unauthorized`, `unreachable`, or for embeddings `dimension_mismatch`; `--json`
+prints the same report as `GET /api/providers`.
+
+### Changing a surface
+
+```bash
+rein providers vendors                                             # names, default endpoints, key env vars
+rein providers show judge                                          # what the judge resolves to right now
+rein providers set judge --provider openrouter --model anthropic/claude-sonnet-4.5
+rein keys set OPENROUTER_API_KEY                                   # hidden prompt; or --stdin / --value
+rein providers status --probe
+launchctl kickstart -k gui/$(id -u)/com.rein.gui                   # services read config at boot
+```
+
+`rein providers set` edits `config.toml` in place with comments preserved,
+validates the result (unknown vendors, vendors without the needed API, invalid
+auth headers) and refuses to write on failure; `--dry-run` prints the resulting
+TOML. Surfaces: `embedding`, `extract`, `async_memory`, `intelligent_merge`,
+`query_expansion`, `reranker`, `resummerize`, `ars` (synthesis + concept
+summaries + cold archive), `judge`, `llm` (global default). Vendor-specific
+embedding options ride on the same command: `--dimensions`,
+`--send-dimensions`, `--encoding float|base64_int8`, `--query-input-type`,
+`--document-input-type`, `--max-batch`; chat options are `--auth-header
+bearer|x-api-key|api-key`, `--disable-thinking`, `--api-key-env`, `--endpoint`.
+
+### Keys
+
+`rein keys list` shows every key the current wiring needs, where it comes from
+(`env`, `secrets_file`, `config_file`) and which surfaces use it. `rein keys set
+NAME` writes `~/.rein/secrets.env` (created `600`, directory `700`); `rein keys
+unset NAME` removes one; `rein keys probe [NAME]` verifies. Process environment
+variables always win over the file, so a launchd plist that sets
+`GEMINI_API_KEY` keeps working. A key written as `api_key = "…"` inside
+`config.toml` is honoured but flagged — move it with `rein keys set` and delete
+the line.
+
+### Switching the embedding model
+
+1. `rein providers set embedding --provider <vendor> --model <model> --dimensions <n>`
+   (dimensions must match the model; Perplexity `pplx-embed-v1-4b` = 2560,
+   OpenAI `text-embedding-3-large` = 3072, Gemini = 3072).
+2. `rein keys set <KEY_ENV>` if the vendor needs one.
+3. `rein providers status --probe` — the key must be `ok` and the probe must not
+   report `dimension_mismatch`; the `vector index` line now shows ✗.
+4. `rein warmup --reembed-all` — re-embeds every live memory, swaps the vector
+   table atomically, restamps provenance, rebuilds HNSW.
+5. Restart `com.rein.gui` / `com.rein.adaptive-tick` and any host-spawned
+   `rein serve`.
+6. `rein providers status` shows `vector index … ✓`.
+
+While the stamp and the configuration disagree, vector writes are refused and
+new memories stay FTS-only; that is the existing safety behaviour, not a
+regression.
 
 ## Diagnostics
 

@@ -12,7 +12,7 @@
 
 rein is a self-adaptive memory system for AI coding agents. It stores, recalls, and manages memories across sessions with embedding-based semantic dedup, data-driven decay (Kaplan-Meier survival curves), and a fully closed self-learning loop that replaces fixed parameters with learned values.
 
-**Current release: `v1.4.2`** (2026-10-17) — maintenance patch on the v1.4.0 runway automation line, driven by GitHub issue #4 and a client-compatibility audit. Streamable HTTP sessions that rmcp expired after 300 s idle, or that predate a `rein serve` restart, are re-created transparently from a persistent session store instead of answering `404 Session not found`, so MCP clients that never re-initialize on 404 keep working; rmcp 1.6 → 1.8 turns idle expiry into a DEBUG event. Every MCP tool schema is rewritten into the portable subset all clients accept (nullability kept as `[x, "null"]`) and string-encoded arguments are repaired only after a rejected decode. Provider error bodies and LLM output no longer reach WARN logs or clients, and memory / query text is no longer logged from hot paths. Transitive dependency advisories (h2, quinn-proto, rustls, chacha20, react-router) closed. No schema or config version change. **1938 lib tests / 0 fail; clippy + fmt clean; 5 codex review rounds on the session store (4 P2 closed, last round clean) plus an independent diff review (3 hardening items applied).**
+**Current release: `v1.5.0`** (2026-10-19) — feature release: any OpenAI-compatible vendor for embeddings and for every LLM surface, with per-surface API keys. Vendor presets (`provider = "openai" | "perplexity" | "deepseek" | "openrouter" | "voyage" | "zhipu" | …`, `rein providers vendors`) carry the endpoint, key variable, auth header and request quirks; the judge can run on its own vendor. Keys live in the environment or in rein's own `~/.rein/secrets.env` (mode 600, `rein keys set`), and `rein providers` / `rein status` / `GET /api/providers` / the GUI **AI Keys** page show which key powers which surface, always masked. `rein providers set <surface> --provider … --model …` rewrites `config.toml` in place with validation. Perplexity int8 embeddings, asymmetric query/document roles, and a one-call `--probe` are included. No schema version change. **2000+ lib tests / 0 fail; clippy + fmt clean.**
 
 **v1.4.1** (2026-10-10) — maintenance patch on the v1.4.0 runway automation line. Tantivy no longer leaves one segment per memory: the staged rebuild loads the corpus through a single writer with automatic merges disabled and compacts to one segment (a 10.6k-memory database rebuilds in 15 s instead of ~28 min; 10,651 segments → 1), and single inserts wait for their scheduled merges. Background warmup runs on a detached thread, so `rein serve` exits on SIGINT/SIGTERM during a rebuild instead of lingering until it finishes. The GUI's synthesis thumbs no longer show a vote as recorded when the server refused the write (`auth = "public"` with a `public_url` rejects every REST mutation) and show the refusal reason instead; the Connectors page explains the owner-only 401; the GUI's own doctor page no longer flags `gui_runtime` by probing itself; and `#[op]` validates literal REST paths at expansion time. **1900 lib tests / 0 fail; clippy + fmt clean; 2 codex review rounds (1 P2 closed, last round clean).**
 
@@ -324,6 +324,9 @@ rein serve
 | `worker dedup-queue` | Drain queued store-time dedup jobs | `rein worker dedup-queue` |
 | `worker cleanup-queue` | Drain queued cleanup jobs | `rein worker cleanup-queue` |
 | `dashboard` | Show service status, metrics, memory stats | `rein dashboard` |
+| `status` | Alias of `dashboard` | `rein status` |
+| `providers` | Provider wiring + masked key status (`status --probe`, `set`, `show`, `vendors`) | `rein providers set judge --provider openrouter --model …` |
+| `keys` | Manage keys in `~/.rein/secrets.env` (`list`, `set`, `unset`, `probe`) | `rein keys set OPENAI_API_KEY --stdin` |
 | `gui on/off` | Start/stop GUI server in background | `rein gui on` |
 | `proxy on/off` | Start/stop proxy in background | `rein proxy on` |
 
@@ -448,14 +451,14 @@ rein upgrade --topic debug  # convert specific topic only
 **Configuration:**
 ```toml
 [extract]
-provider = "google"    # or "omlx" or "none"
+provider = "google"    # or a vendor name ("openai", "deepseek", "openrouter", …), "omlx", or "none"
 
 [extract.google]
 model = "gemini-3.1-flash-lite"
 max_input_chars = 0    # 0 = no truncation (1M token model)
 
-[extract.omlx]
-endpoint = "http://localhost:11434/v1"  # Ollama, LM Studio, vLLM, etc.
+[extract.openai]       # one table for every OpenAI-compatible vendor; "omlx" is an alias
+endpoint = "http://localhost:11434/v1"  # Ollama, LM Studio, vLLM, etc. — omitted for a named vendor
 model = "default"
 max_input_chars = 16000
 ```
@@ -548,6 +551,7 @@ The v0.21 → v0.38.0 arc rebuilt rein around six axes: a unified operation regi
 
 | Version | Theme | Highlights |
 |---|---|---|
+| **v1.5.0** (2026-10-19) | Providers & keys | **Vendor presets**: `provider = "<vendor>"` for embeddings and every LLM surface (OpenAI, Perplexity, DeepSeek, OpenRouter, Groq, Mistral, xAI, Together, Fireworks, Voyage, Jina, Cohere, Anthropic, Azure, NVIDIA, Cerebras, Hugging Face, DashScope, Zhipu, SiliconFlow, Moonshot, Volcengine, Ollama, LM Studio, vLLM, omlx), each with endpoint / key env / auth header / embedding encoding / batch defaults; vendors without an embeddings API are rejected for `[embedding]`. **Per-surface keys**: `api_key_env`, `auth_header`, `disable_thinking`; `[ars.llm_judge].provider` lets the judge use its own vendor. **Secrets file**: `~/.rein/secrets.env` (600) read after the environment; `rein keys list|set|unset|probe`. **Status**: `rein providers status [--probe] [--json]`, `rein providers set|show|vendors`, `rein status`, masked keys in `rein config`, `GET /api/providers`, owner-only `POST /api/providers/reveal`, doctor `secrets_file`. **GUI**: AI Keys page with a flow diagram of the six AI roles, role/key cards, eye-toggle reveal (60 s), live probe; Dashboard card. **Embedding**: base64 int8 decoding (Perplexity), batch chunking, query/document roles with an isolated query cache key. |
 | **v1.4.2** (2026-10-17) | Maintenance | **Session restore (#4)**: expired (300 s idle) and pre-restart Streamable HTTP sessions are re-created from a persistent store instead of 404; sidecar `<db file name>.mcp-sessions-<bind>-<port>-<hash>.json` (0600; 1024 entries / 16 KiB each / 4 MiB total); doctor `mcp_session_store`. **rmcp 1.8**: idle expiry logged at DEBUG. **Portable MCP schemas**: no `$ref` / `oneOf` / `const` / `format`, nullability kept as `[x, "null"]`; arguments repaired only after a rejected decode. **Content-free logs**: provider bodies, LLM output, memory and query text kept out of WARN / INFO. **Deps**: h2 / quinn-proto / rustls / chacha20 / react-router advisories closed. **1938 lib tests / 0 fail; clippy + fmt clean; 5 codex rounds + independent diff review.** |
 | **v1.4.1** (2026-10-10) | Maintenance | **Tantivy compaction**: the staged rebuild uses one writer with automatic merges off and an explicit final merge (10,651 segments → 1, 63,733 files → 7, rebuild ~28 min → 15 s on a 10.6k-memory database); single inserts wait for their scheduled merges. **Clean shutdown**: warmup runs on a detached thread, so `rein serve` exits on SIGINT/SIGTERM mid-rebuild instead of waiting for the blocking pool. **GUI feedback honesty**: synthesis thumbs latch only after the server accepts the vote and show the refusal reason otherwise; Connectors renders the owner-only 401 as guidance. **Doctor**: no self-probe when `/api/doctor` is served by the GUI process; 2 s probe timeout. **`#[op]`**: literal REST paths validated at expansion time (compile-fail snapshot now pinned to the macro's own error). **1900 lib tests / 0 fail; clippy + fmt clean; 2 codex review rounds.** |
 | **v1.4.0** (2026-09-04) | Runway automation | **Pipeline observability**: every adaptive stage is timed and persisted (`adaptive_pipeline_last_run`), surfaced by `rein doctor`, `adaptive-status` and a `rein gc` summary line; a killed run stays visible as `running`. **A12 publish-on-drift**: a calibration whose store moved mid-run is published as `Complete` carrying its build fingerprint instead of being discarded — the live resolver still refuses a stale generation on the input epoch. **A12 LOO exclusion index**: hash + posting lists reproduce `extract::dedup::similarity` exactly (randomized property test + real-database equivalence run); corpus build 2 h → 8 s. **Vector durability**: `rein warmup` backfills missing `vec_memories` rows, migrates the table atomically on a model change (staged, revalidated at publish, rows that raced the swap flagged for re-embedding), and a `vec_rows_provenance` stamp refuses mixed-model writes (`rein warmup --trust-existing-vectors` attests a legacy table). **Claude Code prompt recall**: `[hooks.claude]` with `prompt_context_source = "recall"` runs a local fast recall, emits `RecallComplete` and appends a `rein_feedback` attribution line; doctor `claude_hooks`, `vector_provenance` and `adaptive_pipeline_last_run` checks. `config_version` 4. **1887 lib tests / 0 fail; clippy + fmt clean; 26 adversarial review rounds.** |
@@ -665,7 +669,9 @@ rein loads configuration with the following priority (highest wins):
 
 | Variable | Description |
 |----------|-------------|
-| `GEMINI_API_KEY` | Google Gemini API key for embeddings |
+| `GEMINI_API_KEY` | Google Gemini API key (embeddings and every LLM surface by default) |
+| `OPENAI_API_KEY`, `PERPLEXITY_API_KEY`, … | Vendor keys; `rein providers vendors` lists the variable each preset reads (`api_key_env` overrides it) |
+| `REIN_SECRETS_FILE` | Override the key file path (default `~/.rein/secrets.env`, mode 600; environment wins over the file) |
 | `SUPERMEMORY_CC_API_KEY` | Supermemory API key for cross-validation |
 | `REIN_HTTP_TOKEN` | Bearer token for non-localhost HTTP/SSE access |
 | `REIN_DB` | Override database path |
@@ -677,6 +683,46 @@ rein loads configuration with the following priority (highest wins):
 | `REIN_SSE_PORT` | Override SSE/HTTP port (default `8680`) |
 | `REIN_PROXY_TOKEN` | Bearer token for non-localhost proxy access |
 
+#### Providers and API keys (v1.5.0)
+
+rein talks to two kinds of model APIs: **Google Gemini** (`provider = "google"`) and **any OpenAI-compatible endpoint** (`provider = "<vendor>"`). A vendor name carries defaults for the endpoint, the key's environment variable, the auth header and request quirks; every default can be overridden per section. `rein providers vendors` prints the built-in list (OpenAI, Perplexity, DeepSeek, OpenRouter, Groq, Mistral, xAI, Together, Fireworks, Voyage, Jina, Cohere, Anthropic, Azure, NVIDIA, Cerebras, Hugging Face, DashScope, Zhipu, SiliconFlow, Moonshot, Volcengine, Ollama, LM Studio, vLLM, omlx) with the chat / embeddings support of each. Vendors without an embeddings API (DeepSeek, Groq, xAI, Anthropic, …) are rejected for `[embedding]` at load time.
+
+Keys are read, in order, from the process environment, then from rein's own `~/.rein/secrets.env` (mode 600, written by `rein keys set`), then from a plaintext `api_key = "…"` in `config.toml` (works, but `rein providers` flags it). The secrets file is what launchd services and the `rein serve` processes started by Claude Desktop or Codex see, so it is the recommended place.
+
+```bash
+rein providers vendors                                   # what you can pick
+rein providers set embedding --provider perplexity --model pplx-embed-v1-4b --dimensions 2560
+rein keys set PERPLEXITY_API_KEY --stdin < key.txt       # or interactive hidden prompt
+rein providers status --probe                            # calls each provider once
+rein warmup --reembed-all                                # embedding model changed → re-embed
+rein providers set judge --provider openrouter --model anthropic/claude-sonnet-4.5
+rein keys set OPENROUTER_API_KEY
+```
+
+The same wiring is shown by `rein status`, `rein config`, `GET /api/providers` and the GUI's **AI Keys** page, always with masked keys; the page can reveal a key behind an eye toggle for the owner session only.
+
+Equivalent TOML:
+
+```toml
+[embedding]
+provider = "perplexity"            # google | <vendor> | none
+dimensions = 2560
+
+[embedding.openai]                 # table name is "openai" (alias "omlx") for every OpenAI-compatible vendor
+model = "pplx-embed-v1-4b"
+# api_key_env = "PERPLEXITY_API_KEY"   # vendor default
+# send_dimensions = true               # Matryoshka models
+# query_input_type = "query"           # asymmetric models (Voyage, Jina, NVIDIA)
+# document_input_type = "document"
+
+[ars.llm_judge]
+provider = "openrouter"            # judge-only provider; other surfaces untouched
+[ars.llm_judge.openai]
+model = "anthropic/claude-sonnet-4.5"
+```
+
+One embedding model is active per database; switching re-embeds everything (`rein warmup --reembed-all`), and the `vec_rows_provenance` stamp refuses mixed-model writes meanwhile.
+
 #### config.toml
 
 ```toml
@@ -684,13 +730,13 @@ rein loads configuration with the following priority (highest wins):
 path = "auto"                          # "auto" = ~/.rein/memories.db
 
 [embedding]
-provider = "google"    # or "omlx" or "none"
+provider = "google"    # google | <vendor name> | none
 dimensions = 3072
 
 [embedding.google]
 model = "gemini-embedding-001"
 
-[embedding.omlx]
+[embedding.openai]     # every OpenAI-compatible vendor; alias [embedding.omlx]
 endpoint = "http://localhost:8000/v1"
 model = "default"
 
@@ -1156,9 +1202,9 @@ Two independent search paths run in parallel, then merge:
 rein uses an `EmbedderKind` enum dispatch to support multiple embedding backends:
 
 - **Google** (`gemini-embedding-001`) -- default, 3072 dimensions; provider benchmark details are documented in `docs/reference/bibliography.md`
-- **OMLX** -- local embedding via OpenAI-compatible API endpoint
+- **OpenAI-compatible** (`provider = "<vendor>"`) -- OpenAI, Perplexity (int8), OpenRouter, Mistral, Fireworks, Voyage, Jina, Cohere, Azure, NVIDIA, DashScope, Zhipu, SiliconFlow, plus local Ollama / LM Studio / vLLM / omlx; `rein providers vendors` lists them with their defaults
 
-Set `[embedding] provider` to `"google"`, `"omlx"`, or `"none"` in config.
+Set `[embedding] provider` to `"google"`, a vendor name, or `"none"` in config; `rein providers set embedding --provider <vendor> --model <model> --dimensions <n>` does it with validation.
 
 #### Proxy / Endpoint Override
 
@@ -1177,14 +1223,13 @@ endpoint = "https://your-supermemory-proxy.com"
 **OpenRouter or other OpenAI-compatible aggregators:**
 ```toml
 [embedding]
-provider = "omlx"
+provider = "openrouter"             # preset: endpoint + OPENROUTER_API_KEY
 
-[embedding.omlx]
-endpoint = "https://openrouter.ai/api/v1"
+[embedding.openai]
 model = "google/gemini-embedding-001"
 ```
 
-This works because the OMLX backend uses the OpenAI `/v1/embeddings` format, which is compatible with OpenRouter, LiteLLM, and similar services.
+This works because every non-Google vendor uses the OpenAI `/v1/embeddings` and `/v1/chat/completions` format; an aggregator without a preset (LiteLLM, a private gateway) is `provider = "openai"` plus an explicit `endpoint`.
 
 #### Memory Decay Model
 
@@ -1247,7 +1292,7 @@ If you need a non-AGPL license for commercial / proprietary use, the project's c
 
 rein 是一个自适应记忆系统，专为 AI 编程智能体设计。它跨会话存储、检索和管理记忆，通过反馈事件和慢通道学习逐步减少固定参数。
 
-**当前版本：`v1.4.2`**（2026-10-17）— v1.4.0 runway 自动化线上的维护补丁，由 GitHub issue #4 和一次客户端兼容性审计驱动。rmcp 在空闲 300 秒后回收的 Streamable HTTP 会话、以及 `rein serve` 重启前的会话，现在都从持久化的 session store 透明重建，不再回 `404 Session not found`，所以不会在 404 后重新初始化的 MCP 客户端也能一直用；rmcp 1.6 → 1.8，空闲过期降为 DEBUG 事件。所有 MCP 工具 schema 改写成各客户端都接受的可移植子集（可空性保留为 `[x, "null"]`），字符串编码的参数只在解码被拒后才修复。provider 的错误响应体和 LLM 输出不再进入 WARN 日志和客户端，热路径不再记录记忆 / 查询文本。传递依赖的安全通告（h2、quinn-proto、rustls、chacha20、react-router）全部关闭。无 schema / config 版本变化。**1938 lib 测试 / 0 失败；clippy + fmt clean；session store 经 5 轮 codex 审查（修复 4 个 P2，最后一轮零发现）+ 一轮独立 diff 审查（3 项加固）。**
+**当前版本：`v1.5.0`**（2026-10-19）— 功能版本：embedding 和所有 LLM 面都可以接任意 OpenAI 兼容厂商，并按面分别配 API key。厂商预设（`provider = "openai" | "perplexity" | "deepseek" | "openrouter" | "voyage" | "zhipu" | …`，`rein providers vendors`）自带 endpoint、key 环境变量名、认证头和请求细节；judge 可以单独用另一家厂商。key 可以放在环境变量，也可以放在 rein 自己的 `~/.rein/secrets.env`（600 权限，`rein keys set` 写入）；`rein providers` / `rein status` / `GET /api/providers` / GUI 的 **AI Keys** 页面会显示哪把 key 在驱动哪个面，始终打码。`rein providers set <面> --provider … --model …` 带校验地原地改写 `config.toml`。包含 Perplexity int8 embedding、query/document 非对称角色，以及一键 `--probe`。无 schema 版本变化。**2000+ lib 测试 / 0 失败；clippy + fmt clean。**
 
 **v1.4.1**（2026-10-10）— v1.4.0 runway 自动化线上的维护补丁。Tantivy 不再每条记忆一个 segment：staged 重建改为单 writer 批量写入、关闭自动合并、最后显式合并成一个 segment（10.6k 记忆库重建 28 分钟 → 15 秒；10,651 个 segment → 1），单条插入等待已调度的合并完成。后台 warmup 改在独立线程运行，`rein serve` 在重建期间收到 SIGINT/SIGTERM 会立即退出而不是等重建结束。GUI 的合成点赞在服务器拒绝写入时（`auth = "public"` 且配置了 `public_url` 时所有 REST 写操作都被拒绝）不再显示"已记录"，而是显示拒绝原因；Connectors 页把 owner-only 401 解释为配置提示；GUI 自己的 doctor 页不再因自探测而误报 `gui_runtime`；`#[op]` 在展开期校验字面量 REST 路径。**1900 lib 测试 / 0 失败；clippy + fmt clean；2 轮 codex 审查（修复 1 个 P2，最后一轮零发现）。**
 
@@ -1396,6 +1441,9 @@ rein serve
 | `worker dedup-queue` | 清空 store 灰区 dedup 任务队列 | `rein worker dedup-queue` |
 | `worker cleanup-queue` | 清空 cleanup 任务队列 | `rein worker cleanup-queue` |
 | `dashboard` | 显示服务状态、指标、记忆统计 | `rein dashboard` |
+| `status` | `dashboard` 的别名 | `rein status` |
+| `providers` | 各 AI 面的 provider 接线 + 打码的 key 状态（`status --probe`、`set`、`show`、`vendors`） | `rein providers set judge --provider openrouter --model …` |
+| `keys` | 管理 `~/.rein/secrets.env` 里的 key（`list`、`set`、`unset`、`probe`） | `rein keys set OPENAI_API_KEY --stdin` |
 | `gui on/off` | 后台启动/停止 GUI 服务 | `rein gui on` |
 | `proxy on/off` | 后台启动/停止 proxy 服务 | `rein proxy on` |
 
@@ -1482,14 +1530,14 @@ rein upgrade              # 将旧记忆转为知识图谱
 **配置：**
 ```toml
 [extract]
-provider = "google"    # 或 "omlx" 或 "none"
+provider = "google"    # 或厂商名（"openai"、"deepseek"、"openrouter" …）、"omlx"、"none"
 
 [extract.google]
 model = "gemini-3.1-flash-lite"
 max_input_chars = 0    # 0 = 不截断（1M token 模型）
 
-[extract.omlx]
-endpoint = "http://localhost:11434/v1"  # Ollama, LM Studio, vLLM 等
+[extract.openai]       # 所有 OpenAI 兼容厂商共用这一张表；"omlx" 是别名
+endpoint = "http://localhost:11434/v1"  # Ollama, LM Studio, vLLM 等 —— 用具名厂商时可省略
 model = "default"
 max_input_chars = 16000
 ```
@@ -1521,7 +1569,9 @@ rein 按以下优先级加载配置（高优先级覆盖低优先级）：
 
 | 变量 | 说明 |
 |------|------|
-| `GEMINI_API_KEY` | Google Gemini API 密钥（用于嵌入） |
+| `GEMINI_API_KEY` | Google Gemini API 密钥（默认驱动嵌入和所有 LLM 面） |
+| `OPENAI_API_KEY`、`PERPLEXITY_API_KEY` … | 各厂商的 key；`rein providers vendors` 列出每个预设读取的变量名（`api_key_env` 可覆盖） |
+| `REIN_SECRETS_FILE` | 覆盖 key 文件路径（默认 `~/.rein/secrets.env`，600 权限；环境变量优先于文件） |
 | `SUPERMEMORY_CC_API_KEY` | Supermemory API 密钥（用于交叉验证） |
 | `REIN_HTTP_TOKEN` | 非 localhost HTTP/SSE 访问的 bearer token |
 | `REIN_DB` | 覆盖数据库路径 |
@@ -1533,6 +1583,46 @@ rein 按以下优先级加载配置（高优先级覆盖低优先级）：
 | `REIN_SSE_PORT` | 覆盖 SSE/HTTP 端口（默认 `8680`） |
 | `REIN_PROXY_TOKEN` | 非 localhost proxy 的 bearer token |
 
+#### Provider 与 API key（v1.5.0）
+
+rein 会跟两类模型 API 打交道：**Google Gemini**（`provider = "google"`）和**任意 OpenAI 兼容端点**（`provider = "<厂商>"`）。厂商名自带 endpoint、key 环境变量名、认证头和请求细节的默认值，每一项都可以在各自的配置段里覆盖。`rein providers vendors` 打印内置列表（OpenAI、Perplexity、DeepSeek、OpenRouter、Groq、Mistral、xAI、Together、Fireworks、Voyage、Jina、Cohere、Anthropic、Azure、NVIDIA、Cerebras、Hugging Face、DashScope、智谱、SiliconFlow、Moonshot、火山引擎、Ollama、LM Studio、vLLM、omlx）以及各家是否支持 chat / embeddings。没有 embedding API 的厂商（DeepSeek、Groq、xAI、Anthropic …）在 `[embedding]` 里会在加载时被拒绝。
+
+key 的读取顺序：先进程环境变量，再 rein 自己的 `~/.rein/secrets.env`（600 权限，由 `rein keys set` 写入），最后是 `config.toml` 里明文的 `api_key = "…"`（可用，但 `rein providers` 会标出来）。launchd 服务和 Claude Desktop / Codex 启动的 `rein serve` 都读得到 secrets 文件，所以推荐放那里。
+
+```bash
+rein providers vendors                                   # 能选什么
+rein providers set embedding --provider perplexity --model pplx-embed-v1-4b --dimensions 2560
+rein keys set PERPLEXITY_API_KEY --stdin < key.txt       # 或交互式隐藏输入
+rein providers status --probe                            # 每家 provider 调一次
+rein warmup --reembed-all                                # 换了 embedding 模型 → 重新嵌入
+rein providers set judge --provider openrouter --model anthropic/claude-sonnet-4.5
+rein keys set OPENROUTER_API_KEY
+```
+
+`rein status`、`rein config`、`GET /api/providers` 和 GUI 的 **AI Keys** 页面显示同一套接线，key 始终打码；页面上的小眼睛只对 owner 会话显示明文。
+
+等价 TOML：
+
+```toml
+[embedding]
+provider = "perplexity"            # google | <厂商> | none
+dimensions = 2560
+
+[embedding.openai]                 # 所有 OpenAI 兼容厂商都用 "openai" 这张表（别名 "omlx"）
+model = "pplx-embed-v1-4b"
+# api_key_env = "PERPLEXITY_API_KEY"   # 厂商默认值
+# send_dimensions = true               # Matryoshka 模型
+# query_input_type = "query"           # 非对称模型（Voyage、Jina、NVIDIA）
+# document_input_type = "document"
+
+[ars.llm_judge]
+provider = "openrouter"            # 只给 judge 用的 provider；其他面不受影响
+[ars.llm_judge.openai]
+model = "anthropic/claude-sonnet-4.5"
+```
+
+一个数据库同一时间只有一个 embedding 模型在用；切换后要全部重新嵌入（`rein warmup --reembed-all`），期间 `vec_rows_provenance` 戳会拒绝混模型写入。
+
 #### config.toml
 
 ```toml
@@ -1540,13 +1630,13 @@ rein 按以下优先级加载配置（高优先级覆盖低优先级）：
 path = "auto"                          # "auto" = ~/.rein/memories.db
 
 [embedding]
-provider = "google"    # 或 "omlx" 或 "none"
+provider = "google"    # google | <厂商名> | none
 dimensions = 3072
 
 [embedding.google]
 model = "gemini-embedding-001"
 
-[embedding.omlx]
+[embedding.openai]     # every OpenAI-compatible vendor; alias [embedding.omlx]
 endpoint = "http://localhost:8000/v1"
 model = "default"
 
@@ -1812,6 +1902,7 @@ v0.21 → v0.38.0 这一段重构围绕六条主线：统一 operation registry�
 
 | 版本 | 主题 | 重点 |
 |---|---|---|
+| **v1.5.0** (2026-10-19) | Provider 与 key | **厂商预设**：embedding 和所有 LLM 面都可写 `provider = "<厂商>"`（OpenAI、Perplexity、DeepSeek、OpenRouter、Groq、Mistral、xAI、Together、Fireworks、Voyage、Jina、Cohere、Anthropic、Azure、NVIDIA、Cerebras、Hugging Face、DashScope、智谱、SiliconFlow、Moonshot、火山引擎、Ollama、LM Studio、vLLM、omlx），各自带 endpoint / key 环境变量 / 认证头 / embedding 编码 / 批大小默认值；没有 embedding API 的厂商在 `[embedding]` 里会被拒绝。**按面配 key**：`api_key_env`、`auth_header`、`disable_thinking`；`[ars.llm_judge].provider` 让 judge 单独用一家厂商。**secrets 文件**：`~/.rein/secrets.env`（600）在环境变量之后读取；`rein keys list|set|unset|probe`。**状态面**：`rein providers status [--probe] [--json]`、`rein providers set|show|vendors`、`rein status`、`rein config` 打码 key、`GET /api/providers`、仅 owner 的 `POST /api/providers/reveal`、doctor `secrets_file`。**GUI**：AI Keys 页面——六个 AI 角色的流程图、角色 / key 卡片、小眼睛显示（60 秒自动隐藏）、在线探测；Dashboard 卡片。**Embedding**：base64 int8 解码（Perplexity）、分批、query/document 角色与独立的 query 缓存键。|
 | **v1.4.2** (2026-10-17) | 维护补丁 | **会话恢复（#4）**：空闲 300 秒过期或重启前的 Streamable HTTP 会话从持久化 store 重建而不是 404；sidecar `<db file name>.mcp-sessions-<bind>-<port>-<hash>.json`（0600；1024 条 / 单条 16 KiB / 总计 4 MiB）；doctor `mcp_session_store`。**rmcp 1.8**：空闲过期降为 DEBUG。**可移植 MCP schema**：无 `$ref` / `oneOf` / `const` / `format`，可空性保留为 `[x, "null"]`；参数只在解码被拒后修复。**日志不带内容**：provider 响应体、LLM 输出、记忆与查询文本不进 WARN / INFO。**依赖**：h2 / quinn-proto / rustls / chacha20 / react-router 通告关闭。**1938 lib 测试 / 0 失败；clippy + fmt clean；5 轮 codex 审查 + 独立 diff 审查。** |
 | **v1.4.1** (2026-10-10) | 维护补丁 | **Tantivy 压缩**：staged 重建改为单 writer、关闭自动合并并在最后显式合并（10,651 个 segment → 1，63,733 个文件 → 7，10.6k 记忆库重建 28 分钟 → 15 秒）；单条插入等待已调度的合并完成。**干净退出**：warmup 在独立线程运行，`rein serve` 重建期间收到 SIGINT/SIGTERM 立即退出，不再等 blocking 线程池。**GUI 反馈诚实化**：合成点赞只在服务器接受后锁定，否则显示拒绝原因；Connectors 把 owner-only 401 渲染为配置提示。**Doctor**：`/api/doctor` 由 GUI 进程自己提供时不再自探测；探针超时 2 秒。**`#[op]`**：字面量 REST 路径在展开期校验（compile-fail 快照改为宏自身的报错）。**1900 lib 测试 / 0 失败；clippy + fmt clean；2 轮 codex 审查。** |
 | **v1.4.0** (2026-09-04) | Runway 自动化 | **Pipeline 可观测**：每个自适应阶段计时并持久化（`adaptive_pipeline_last_run`），由 `rein doctor` / `adaptive-status` / `rein gc` 摘要行呈现；被杀掉的运行以 `running` 状态可见。**A12 漂移仍发布**：跑期间库发生变化的校准以自身 build fingerprint 发布为 `Complete` 而非整份丢弃——激活端仍按 input epoch 拒绝过期代。**A12 LOO 倒排索引**：hash + posting list 精确复现 `extract::dedup::similarity`（随机 property test + 真实库等价验证）；语料构建 2 小时 → 8 秒。**向量持久化**：`rein warmup` 回填缺失 `vec_memories` 行，模型变更时原子换表（staging + 发布时重验证，换表期间竞争写入的行标记重嵌入），`vec_rows_provenance` 戳拒绝混模型写入（`rein warmup --trust-existing-vectors` 认证历史表）。**Claude Code prompt 召回**：`[hooks.claude]` 配 `prompt_context_source = "recall"` 走本地快速召回，发出 `RecallComplete` 并追加 `rein_feedback` 归因行；doctor 新增 `claude_hooks` / `vector_provenance` / `adaptive_pipeline_last_run` 检查。`config_version` 4。**1887 lib 测试 / 0 失败；clippy + fmt clean；26 轮对抗式审查。** |
@@ -2006,9 +2097,9 @@ flowchart TD
 rein 使用 `EmbedderKind` 枚举分发支持多种嵌入后端：
 
 - **Google**（`gemini-embedding-001`）-- 默认，3072 维；provider benchmark 细节见 `docs/reference/bibliography.md`
-- **OMLX** -- 通过 OpenAI 兼容 API 端点进行本地嵌入
+- **OpenAI 兼容**（`provider = "<厂商>"`）-- OpenAI、Perplexity（int8）、OpenRouter、Mistral、Fireworks、Voyage、Jina、Cohere、Azure、NVIDIA、DashScope、智谱、SiliconFlow，以及本地 Ollama / LM Studio / vLLM / omlx；`rein providers vendors` 列出各家默认值
 
-在配置中设置 `[embedding] provider` 为 `"google"`、`"omlx"` 或 `"none"`。
+在配置中设置 `[embedding] provider` 为 `"google"`、厂商名或 `"none"`；`rein providers set embedding --provider <厂商> --model <模型> --dimensions <n>` 会带校验地改好。
 
 #### 代理 / Endpoint 覆盖
 
@@ -2027,14 +2118,13 @@ endpoint = "https://your-supermemory-proxy.com"
 **OpenRouter 等 OpenAI 兼容聚合商：**
 ```toml
 [embedding]
-provider = "omlx"
+provider = "openrouter"             # preset: endpoint + OPENROUTER_API_KEY
 
-[embedding.omlx]
-endpoint = "https://openrouter.ai/api/v1"
+[embedding.openai]
 model = "google/gemini-embedding-001"
 ```
 
-OMLX 后端使用 OpenAI `/v1/embeddings` 格式，兼容 OpenRouter、LiteLLM 等服务。
+所有非 Google 厂商都走 OpenAI 的 `/v1/embeddings` 与 `/v1/chat/completions` 格式；没有预设的聚合商（LiteLLM、私有网关）写 `provider = "openai"` 再显式给 `endpoint` 即可。
 
 #### 记忆衰减模型
 
