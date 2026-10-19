@@ -10,14 +10,14 @@ default TOML template is `crates/rein/config/default.toml`.
 |---|---|
 | `config_version` (top-level) | Schema-version metadata, not a tunable (default `3` = `CURRENT_CONFIG_VERSION` on the post-v1.2 integration line; v1.2.0 used version 2). A config stamped newer than the running build is refused at load (forward-compat guard); the unversioned sentinel `0` and the current version both load. |
 | `[database]` | SQLite path. `path = "auto"` resolves to the user's Rein data directory. |
-| `[embedding]`, `[embedding.google]`, `[embedding.omlx]` | Embedding provider, dimensions, model, endpoint, and optional Google key. |
+| `[embedding]`, `[embedding.google]`, `[embedding.omlx]` (alias `[embedding.openai]`) | Embedding provider (`google`, `none`, or any vendor name from `rein providers vendors`), dimensions, model, endpoint, `api_key_env`, `auth_header`, `send_dimensions`, `query_input_type` / `document_input_type`, `encoding`, `max_batch`. |
 | `[search]` | RRF/convex-combination fusion, dedup threshold, LLM reranker, MMR, and strong-signal settings. |
 | `[chunking]` | Chunk size, overlap, and metadata-prefix behavior. |
 | `[sync]` | Supermemory and auto-memory import settings. |
 | `[decay]` | Ebbinghaus-style decay constants, pruning threshold, and STM-to-LTM promotion count. |
 | `[server]` | HTTP/SSE bind, port, compact mode, GUI flag, loopback auth opt-in, and allowed hosts. |
 | `[hooks]`, `[hooks.codex]`, `[hooks.claude]` | Hook extraction thresholds, context window, buffer location, signal keywords, and per-runtime prompt-context policy. |
-| `[extract]`, `[extract.google]`, `[extract.omlx]` | LLM extraction provider, model, endpoint, prompt cap, and local thinking-mode toggle. |
+| `[extract]`, `[extract.google]`, `[extract.omlx]` (alias `[extract.openai]`) | LLM extraction provider, model, endpoint, prompt cap, `api_key_env`, `auth_header`, and the optional `disable_thinking` toggle (unset → vendor default). |
 | `[query_expansion]`, provider subtables | Query expansion provider and maximum expansion count. |
 | `[proxy]` | Record-only proxy bind, upstreams, extraction thresholds, retry and buffer limits, and auth opt-in. |
 | `[async_memory]` | Async memory worker provider, retries, batching, cooldown, and working-set limits. |
@@ -28,7 +28,7 @@ default TOML template is `crates/rein/config/default.toml`.
 | `[dedup]` | Triple-overlap, N-merge, and temporal-supersede dedup controls, plus `persist_triples` (default `false`; opt-in durable `(subject,predicate,object)` persistence into the `memory_triples` fact table — v0.39 #A5, experimental). |
 | `[ars]`, `[ars.acceleration]` | ARS Cap A/B/C feature flags, batch/cold-start settings, and default-on/fail-closed v0.28 acceleration controls. |
 | `[ars.llm_judge]`, `[ars.llm_judge.nightly_cron]` | Default-off runtime judge and offline calibration cron policy (v0.28.7 H0 reverted these defaults from `true` to `false` per the v0.28 charter Non-Goal "Do not make LLM judge default-on"); when explicitly enabled, both are bounded by provider/cost gates. |
-| `[llm]`, `[llm.google]`, `[llm.omlx]` | Optional global LLM defaults used by the inheritance resolver. |
+| `[llm]`, `[llm.google]`, `[llm.omlx]` (alias `[llm.openai]`) | Optional global LLM defaults used by the inheritance resolver; the `omlx`/`openai` table also carries `api_key_env`, `auth_header`, `disable_thinking`. |
 
 ## LLM Inheritance
 
@@ -44,6 +44,31 @@ four levels:
 Provider-scoped fields are resolved as a unit for the selected provider:
 `model`, `api_key_env`, `endpoint`, and `max_input_chars` do not fall across to
 another provider's table.
+
+## Providers And Keys (v1.5)
+
+Two provider families exist: `google` (Gemini) and the OpenAI-compatible
+path, selected by any vendor name — `omlx`, `openai`, `perplexity`,
+`deepseek`, `openrouter`, `groq`, `mistral`, `xai`, `together`, `fireworks`,
+`voyage`, `jina`, `cohere`, `anthropic`, `azure`, `nvidia`, `cerebras`,
+`huggingface`, `dashscope`, `zhipu`, `siliconflow`, `moonshot`, `volcengine`,
+`ollama`, `lmstudio`, `vllm` (`rein providers vendors` prints the table). A
+vendor name supplies defaults for the endpoint, the key's environment
+variable, the auth header (`bearer` | `x-api-key` | `api-key`), the
+embeddings encoding and batch size; every default can be overridden in the
+section's `[<section>.openai]` table (`[<section>.omlx]` is the same table —
+write one or the other, never both). Vendors without an embeddings API are
+rejected for `[embedding]` at load time; vendors without a chat API are
+rejected for every LLM section.
+
+`[ars.llm_judge].provider` (default `inherit`) plus `[ars.llm_judge.google]`
+/ `[ars.llm_judge.openai]` give the judge its own provider without touching
+the other surfaces.
+
+Keys are read from the process environment first, then from
+`~/.rein/secrets.env` (`REIN_SECRETS_FILE` overrides the path; the file must
+be mode 600), then from a plaintext `api_key = "…"` field. `[embedding.google].api_key_env`
+names the variable for the embedding key (default `GEMINI_API_KEY`).
 
 ## ARS And Judge Defaults
 
@@ -66,6 +91,7 @@ default-on" — operators must explicitly opt in to incur LLM API spend).
 | `[ars.llm_judge].synthesis_enabled` | `true` | Applies only after the master `[ars.llm_judge].enabled` flag is true. |
 | `[ars.llm_judge].concept_summary_enabled` | `true` | Applies only after the master `[ars.llm_judge].enabled` flag is true. |
 | `[ars.llm_judge].recall_ranking_enabled` | `false` | Deferred judge path. |
+| `[ars.llm_judge].provider` | `inherit` | Judge-only provider (`google`, `omlx`, any vendor name, `none`); `inherit` walks to `[llm]`. Model / endpoint / key env live in `[ars.llm_judge.google]` or `[ars.llm_judge.openai]`. |
 | `[ars.llm_judge.nightly_cron].enabled` | `false` | **v0.28.7 H0 revert.** Same charter Non-Goal as the master judge flag; cron-mode calibration shares the daily-call ledger with the runtime judge, so its default also reverted from `true` to `false`. Set `enabled = true` in `~/.rein/config.toml` to opt in. |
 
 Use `rein ars-acceleration-gate` or `GET /api/ars-acceleration-gate` to inspect

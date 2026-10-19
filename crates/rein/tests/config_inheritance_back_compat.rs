@@ -523,3 +523,24 @@ model = "gemini-3.1-pro"
     assert_eq!(r.provider, Provider::Google);
     assert_eq!(r.model, "gemini-3.1-pro");
 }
+
+#[test]
+fn v15_vendor_presets_fixture_resolves_each_surface_to_its_vendor() {
+    let toml_str =
+        std::fs::read_to_string("tests/fixtures/config/v1.5/01_vendor_presets.toml").unwrap();
+    let cfg = ReinConfig::load_from_str(&toml_str).unwrap();
+    assert_eq!(cfg.embedding_provider(), Provider::Omlx);
+    assert_eq!(cfg.embedding_model(), "perplexity:pplx-embed-v1-4b");
+    let qe = cfg.resolve_llm_for("query_expansion").unwrap();
+    assert_eq!(qe.provider_name, "deepseek");
+    assert_eq!(qe.endpoint, "https://api.deepseek.com");
+    assert_eq!(qe.api_key_env.as_deref(), Some("DEEPSEEK_API_KEY"));
+    let judge = cfg.resolve_llm_for("ars.llm_judge").unwrap();
+    assert_eq!(judge.provider_name, "openrouter");
+    assert_eq!(judge.model, "anthropic/claude-sonnet-4.5");
+    let synth = cfg.resolve_llm_for("ars.recall_synthesis").unwrap();
+    assert_eq!(synth.provider, Provider::Google);
+    assert_eq!(synth.model, "gemini-3.6-flash");
+    let ex = cfg.resolve_llm_for("extract").unwrap();
+    assert_eq!(ex.provider_name, "google");
+}

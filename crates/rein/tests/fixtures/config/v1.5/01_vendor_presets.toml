@@ -1,0 +1,35 @@
+# v1.5 fixture: three vendors, three keys, judge on its own provider.
+[database]
+path = "/tmp/rein-fixture-v15-01.db"
+
+[embedding]
+provider = "perplexity"
+dimensions = 2560
+
+[embedding.openai]
+model = "pplx-embed-v1-4b"
+
+[extract]
+provider = "google"
+
+[extract.google]
+model = "gemini-3.5-flash-lite"
+
+[query_expansion]
+provider = "deepseek"
+
+[query_expansion.openai]
+model = "deepseek-chat"
+
+[llm]
+provider = "google"
+
+[llm.google]
+model = "gemini-3.6-flash"
+
+[ars.llm_judge]
+enabled = true
+provider = "openrouter"
+
+[ars.llm_judge.openai]
+model = "anthropic/claude-sonnet-4.5"
