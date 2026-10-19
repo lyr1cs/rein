@@ -9,7 +9,7 @@ The full release notes (with audit-round breakdowns and operator-visible
 schema changes) live on the [GitHub Releases page](https://github.com/lyr1cs/rein/releases).
 This file is a condensed index intended for quick scanning.
 
-## [1.5.0] — 2026-10-20
+## [1.5.0] — 2026-10-19
 
 Feature release: any OpenAI-compatible vendor for embeddings and every LLM
 surface, per-surface API keys, rein-managed key storage, and a status surface
