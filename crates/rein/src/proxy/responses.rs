@@ -87,9 +87,10 @@ pub fn extract_assistant_text_full(resp_bytes: &[u8]) -> Option<String> {
 
 /// Extract assistant text fragments from Responses API SSE chunks.
 ///
-/// SSE format:
+/// SSE format (the Responses API sends `delta` as a plain string; the
+/// older object form `{"text": …}` is still accepted):
 /// ```text
-/// data: {"type":"response.output_text.delta","delta":{"text":"Hello"}}
+/// data: {"type":"response.output_text.delta","delta":"Hello"}
 /// ```
 pub fn extract_assistant_text_sse(chunk_text: &str) -> Option<String> {
     let mut result = String::new();
@@ -105,11 +106,7 @@ pub fn extract_assistant_text_sse(chunk_text: &str) -> Option<String> {
         if let Ok(json) = serde_json::from_str::<Value>(data) {
             let event_type = json.get("type").and_then(|t| t.as_str()).unwrap_or("");
             if event_type == "response.output_text.delta" {
-                if let Some(text) = json
-                    .get("delta")
-                    .and_then(|d| d.get("text"))
-                    .and_then(|t| t.as_str())
-                {
+                if let Some(text) = delta_text(json.get("delta")) {
                     result.push_str(text);
                 }
             }
@@ -122,6 +119,15 @@ pub fn extract_assistant_text_sse(chunk_text: &str) -> Option<String> {
     }
 }
 
+/// `delta` is a string in the documented `response.output_text.delta`
+/// event; accept the object form too so neither shape is silently dropped.
+fn delta_text(delta: Option<&Value>) -> Option<&str> {
+    let delta = delta?;
+    delta
+        .as_str()
+        .or_else(|| delta.get("text").and_then(|t| t.as_str()))
+}
+
 /// Extract assistant text fragment from a single Responses websocket JSON event.
 ///
 /// Expected event shape:
@@ -131,8 +137,14 @@ pub fn extract_assistant_text_ws_message(message_text: &str) -> Option<String> {
     if json.get("type").and_then(|t| t.as_str()) != Some("response.output_text.delta") {
         return None;
     }
-    json.get("delta")
-        .and_then(|delta| delta.as_str())
+    delta_text(json.get("delta")).map(str::to_string)
+}
+
+/// Event type of a single Responses websocket JSON event, if it has one.
+pub fn ws_event_type(message_text: &str) -> Option<String> {
+    let json = serde_json::from_str::<Value>(message_text).ok()?;
+    json.get("type")
+        .and_then(|t| t.as_str())
         .map(str::to_string)
 }
 
@@ -210,6 +222,19 @@ mod tests {
         assert_eq!(
             extract_assistant_text_full(&bytes),
             Some("Nested text".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_sse_delta_string_form() {
+        // The shape the Responses API actually streams.
+        let chunk = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}\n\n\
+                     data: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n\n\
+                     data: {\"type\":\"response.completed\"}\n\n";
+        assert_eq!(extract_assistant_text_sse(chunk).as_deref(), Some("Hello"));
+        assert_eq!(
+            ws_event_type("{\"type\":\"response.completed\",\"response\":{}}").as_deref(),
+            Some("response.completed")
         );
     }
 

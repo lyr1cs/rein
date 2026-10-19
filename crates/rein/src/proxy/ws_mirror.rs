@@ -43,6 +43,9 @@ pub(super) struct WebSocketMirrorState {
     pub(super) event_bytes: usize,
     pub(super) truncated: bool,
     pub(super) close_seen: bool,
+    /// Set when a `response.completed` event arrived; cleared by
+    /// [`Self::take_completed_turn`].
+    pub(super) completed_turn: bool,
 }
 
 impl WebSocketMirrorState {
@@ -313,6 +316,16 @@ impl WebSocketMirrorState {
         }
         self.push_event_limited(text.clone(), max_event_bytes);
         if collect_assistant_text {
+            match responses::ws_event_type(&text).as_deref() {
+                Some("response.completed") => self.completed_turn = true,
+                // A failed, cancelled or incomplete response never becomes a
+                // memory; drop its partial text so it cannot bleed into the
+                // next turn.
+                Some("response.failed")
+                | Some("response.incomplete")
+                | Some("response.cancelled") => self.assistant_text.clear(),
+                _ => {}
+            }
             if let Some(delta) = responses::extract_assistant_text_ws_message(&text) {
                 // Cap assistant_text the same way stream_response caps MAX_EXTRACT_BUF
                 // in mod.rs — without this, a long-lived /responses WS session with a
@@ -334,6 +347,18 @@ impl WebSocketMirrorState {
                 }
             }
         }
+    }
+
+    /// The assistant text of one completed `/responses` turn (everything
+    /// accumulated since the previous completion), or `None` until a
+    /// `response.completed` event has been seen. Resets the buffer so the
+    /// next turn starts empty.
+    pub(super) fn take_completed_turn(&mut self) -> Option<String> {
+        if !self.completed_turn {
+            return None;
+        }
+        self.completed_turn = false;
+        Some(std::mem::take(&mut self.assistant_text))
     }
 
     fn push_event(&mut self, text: String) {

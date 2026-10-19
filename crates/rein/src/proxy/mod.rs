@@ -1428,6 +1428,36 @@ async fn handle_request(
 /// Spawn an extraction task. extract_and_store only appends to a durable
 /// file-based queue (cheap I/O), so no concurrency limiting is needed here.
 /// Actual LLM extraction happens in the background worker with its own rate limiting.
+/// Accumulates upstream transport chunks and yields complete SSE lines as
+/// raw bytes. Chunk boundaries fall anywhere, including inside a multibyte
+/// UTF-8 sequence; decoding chunk by chunk dropped both halves (and every
+/// event inside them) from extraction, so lines are split on `\n` first and
+/// decoded only once complete.
+#[derive(Default)]
+struct SseLineBuffer {
+    buf: Vec<u8>,
+}
+
+impl SseLineBuffer {
+    /// Append `chunk` and return the complete lines now available (without
+    /// the trailing `\n`). `None` means the buffer exceeded `max_bytes`; it is
+    /// cleared and the caller stops parsing.
+    fn push(&mut self, chunk: &[u8], max_bytes: usize) -> Option<Vec<Vec<u8>>> {
+        self.buf.extend_from_slice(chunk);
+        if self.buf.len() > max_bytes {
+            self.buf.clear();
+            return None;
+        }
+        let mut lines = Vec::new();
+        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            let mut line: Vec<u8> = self.buf.drain(..=pos).collect();
+            line.pop();
+            lines.push(line);
+        }
+        Some(lines)
+    }
+}
+
 fn maybe_spawn_extraction(
     config: &ReinConfig,
     state: &Arc<ProxyState>,
@@ -1498,8 +1528,9 @@ where
         futures_util::pin_mut!(upstream_stream);
         let mut assistant_buf = String::new();
         let mut raw_response_buf = Vec::new();
-        // SSE line buffer: transport chunks may split across SSE event boundaries.
-        let mut sse_line_buf = String::new();
+        // SSE line buffer: transport chunks may split across SSE event
+        // boundaries and inside multibyte UTF-8 sequences.
+        let mut sse_line_buf = SseLineBuffer::default();
         // Whether SSE parsing has been abandoned due to buffer overflow.
         let mut sse_parsing_active = true;
         const MAX_EXTRACT_BUF: usize = 200_000; // ~50K tokens, prevent OOM
@@ -1534,25 +1565,19 @@ where
                         && sse_parsing_active
                         && assistant_buf.len() < MAX_EXTRACT_BUF
                     {
-                        if let Ok(text) = std::str::from_utf8(&chunk) {
-                            sse_line_buf.push_str(text);
-
-                            // Cap SSE line buffer to prevent unbounded growth.
-                            if sse_line_buf.len() > max_sse_buffer {
+                        match sse_line_buf.push(&chunk, max_sse_buffer) {
+                            None => {
                                 tracing::warn!(
                                     "SSE line buffer exceeded {} bytes, forwarding raw (skipping extraction)",
                                     max_sse_buffer
                                 );
                                 sse_parsing_active = false;
-                                sse_line_buf.clear();
                                 assistant_buf.clear(); // discard partial content — don't extract truncated responses
-                            } else {
-                                // Process only complete lines (ending with \n).
-                                while let Some(newline_pos) = sse_line_buf.find('\n') {
-                                    let line = sse_line_buf[..newline_pos].to_string();
-                                    sse_line_buf = sse_line_buf[newline_pos + 1..].to_string();
+                            }
+                            Some(lines) => {
+                                for line in lines {
                                     if let Some(extracted) =
-                                        provider_clone.extract_assistant_text_sse(line.as_bytes())
+                                        provider_clone.extract_assistant_text_sse(&line)
                                     {
                                         assistant_buf.push_str(&extracted);
                                     }
@@ -1976,6 +2001,23 @@ async fn relay_websocket_with_mirror(
                     Some(Ok(message)) => {
                         if should_collect {
                             response_mirror.record_message(&message, true);
+                            // A persistent /responses socket carries many
+                            // request/response pairs. Extract each completed
+                            // turn against its own query instead of judging
+                            // the whole session against the first query at
+                            // close (which suppressed every later turn).
+                            if let Some(turn_text) = response_mirror.take_completed_turn() {
+                                let turn_query = request_mirror.request_query.take();
+                                if config.proxy.extract_enabled
+                                    && policy::should_extract_response(
+                                        config,
+                                        turn_query.as_deref(),
+                                        &turn_text,
+                                    )
+                                {
+                                    maybe_spawn_extraction(config, &state, turn_query, turn_text);
+                                }
+                            }
                         }
                         let is_close = matches!(message, Message::Close(_));
                         if client_sink.send(message).await.is_err() {
@@ -4356,6 +4398,83 @@ x-openai-subagent: worker_abc\r\n\
     }
 
     #[test]
+    fn sse_line_buffer_keeps_multibyte_chars_split_across_chunks() {
+        let event = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"你好\"}\n";
+        let bytes = event.as_bytes();
+        // Cut inside the first multibyte character of 你: neither half is
+        // valid UTF-8 on its own, which is what the old per-chunk decode hit.
+        let cut = event.find('你').unwrap() + 1;
+        assert!(std::str::from_utf8(&bytes[..cut]).is_err());
+        assert!(std::str::from_utf8(&bytes[cut..]).is_err());
+        let mut buf = SseLineBuffer::default();
+        assert!(buf.push(&bytes[..cut], 1_000).unwrap().is_empty());
+        let lines = buf.push(&bytes[cut..], 1_000).unwrap();
+        assert_eq!(lines.len(), 1);
+        let line = std::str::from_utf8(&lines[0]).unwrap();
+        assert_eq!(line, event.trim_end_matches('\n'));
+        assert_eq!(
+            responses::extract_assistant_text_sse(line).as_deref(),
+            Some("你好")
+        );
+        // Over the cap: parsing is abandoned and the buffer cleared.
+        let mut small = SseLineBuffer::default();
+        assert!(small.push(b"0123456789", 4).is_none());
+        assert_eq!(small.push(b"a\n", 4).unwrap(), vec![b"a".to_vec()]);
+    }
+
+    #[test]
+    fn websocket_response_mirror_yields_each_completed_turn() {
+        let mut mirror = WebSocketMirrorState::default();
+        let delta = |t: &str| {
+            Message::Text(
+                format!(r#"{{"type":"response.output_text.delta","delta":"{t}"}}"#).into(),
+            )
+        };
+        mirror.record_message(&delta("hel"), true);
+        mirror.record_message(&delta("lo"), true);
+        assert!(mirror.take_completed_turn().is_none());
+        mirror.record_message(
+            &Message::Text(r#"{"type":"response.completed","response":{}}"#.to_string().into()),
+            true,
+        );
+        assert_eq!(mirror.take_completed_turn().as_deref(), Some("hello"));
+        assert!(mirror.take_completed_turn().is_none());
+        assert!(mirror.assistant_text.is_empty());
+        // The next turn accumulates afresh; a failed response discards its
+        // partial text instead of leaking it into the following turn.
+        mirror.record_message(&delta("second"), true);
+        assert_eq!(mirror.assistant_text, "second");
+        mirror.record_message(
+            &Message::Text(r#"{"type":"response.failed"}"#.to_string().into()),
+            true,
+        );
+        assert!(mirror.assistant_text.is_empty());
+        assert!(mirror.take_completed_turn().is_none());
+    }
+
+    #[test]
+    fn websocket_request_mirror_relatches_the_query_after_a_turn_is_taken() {
+        let mut mirror = WebSocketMirrorState::default();
+        let create = |q: &str| {
+            Message::Text(
+                format!(
+                    r#"{{"type":"response.create","input":[{{"role":"user","content":"{q}"}}]}}"#
+                )
+                .into(),
+            )
+        };
+        mirror.record_message(&create("hello"), false);
+        assert_eq!(mirror.request_query.as_deref(), Some("hello"));
+        // Per-turn extraction takes the query; the next request.create lands.
+        assert_eq!(mirror.request_query.take().as_deref(), Some("hello"));
+        mirror.record_message(&create("what did we decide about the schema"), false);
+        assert_eq!(
+            mirror.request_query.as_deref(),
+            Some("what did we decide about the schema")
+        );
+    }
+
+    #[test]
     fn websocket_request_mirror_extracts_response_create_query() {
         let mut mirror = WebSocketMirrorState::default();
         mirror.record_message(
@@ -4459,6 +4578,7 @@ x-openai-subagent: worker_abc\r\n\
             event_bytes: 0,
             truncated: false,
             close_seen: false,
+            completed_turn: false,
         }
     }
 
