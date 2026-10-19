@@ -73,6 +73,9 @@ where
     D: serde::Deserializer<'de>,
 {
     use serde::de::Error;
+    // Rejected values are described by shape only (audit U20-01): the
+    // judge quotes synthesis and source text, and a model that puts prose
+    // where the bool belongs would otherwise land that text in the error.
     let v = serde_json::Value::deserialize(deserializer)?;
     match v {
         serde_json::Value::Bool(b) => Ok(b),
@@ -80,7 +83,8 @@ where
             "true" => Ok(true),
             "false" => Ok(false),
             other => Err(D::Error::custom(format!(
-                "expected bool or 'true'/'false' string, got string: {other}"
+                "expected bool or 'true'/'false' string, got a {}-char string",
+                other.chars().count()
             ))),
         },
         serde_json::Value::Number(n) => {
@@ -88,19 +92,25 @@ where
                 match i {
                     0 => Ok(false),
                     1 => Ok(true),
-                    _ => Err(D::Error::custom(format!(
-                        "expected bool or 0/1 int, got number: {n}"
-                    ))),
+                    _ => Err(D::Error::custom(
+                        "expected bool or 0/1 int, got another integer",
+                    )),
                 }
             } else {
-                Err(D::Error::custom(format!(
-                    "expected integer 0/1, got non-integer number: {n}"
-                )))
+                Err(D::Error::custom(
+                    "expected integer 0/1, got a non-integer number",
+                ))
             }
         }
-        other => Err(D::Error::custom(format!(
-            "expected bool / string / number, got: {other:?}"
-        ))),
+        serde_json::Value::Null => Err(D::Error::custom(
+            "expected bool / string / number, got null",
+        )),
+        serde_json::Value::Array(_) => Err(D::Error::custom(
+            "expected bool / string / number, got an array",
+        )),
+        serde_json::Value::Object(_) => Err(D::Error::custom(
+            "expected bool / string / number, got an object",
+        )),
     }
 }
 
@@ -338,11 +348,16 @@ fn parse_judge_output(raw: &str) -> ReinResult<JudgeOutcome> {
     let trimmed = cleaned.trim();
     serde_json::from_str::<JudgeOutcome>(trimmed).map_err(|e| {
         // The judge output quotes synthesis and source text, so the
-        // message stays content-free (serde position + length); the
-        // preview goes to DEBUG via the shared helper.
+        // message stays content-free: serde's category and position only.
+        // Its `Display` text is deliberately not appended — for a
+        // wrong-typed field it embeds the offending value (audit U20-01).
+        // The preview goes to DEBUG via the shared helper.
         ReinError::Extract(format!(
-            "{} ({e})",
-            crate::types::unparseable_output_error("judge output", trimmed)
+            "{} ({:?} at line {} column {})",
+            crate::types::unparseable_output_error("judge output", trimmed),
+            e.classify(),
+            e.line(),
+            e.column()
         ))
     })
 }
@@ -491,6 +506,30 @@ mod tests {
             .expect("judge call must succeed when mock returns valid JSON");
         assert!(!outcome.hit);
         assert!(outcome.reason.contains("M3"));
+    }
+
+    /// Audit U20-01: every parse-failure path keeps generated text out of
+    /// the returned error — a wrong-typed `hit`, a wrong-typed `reason`, and
+    /// structured values — not just the "not JSON at all" case.
+    #[test]
+    fn parse_judge_output_error_does_not_echo_generated_content() {
+        let cases = [
+            r#"{"hit":"SENTINEL private customer detail","reason":"coverage explanation"}"#,
+            r#"{"hit":{"SENTINEL":"private"},"reason":"ok"}"#,
+            r#"{"hit":["SENTINEL"],"reason":"ok"}"#,
+            r#"{"hit":true,"reason":{"SENTINEL":1}}"#,
+            r#"{"hit":true,"reason":["SENTINEL"]}"#,
+            r#"{"hit":7,"reason":"SENTINEL"}"#,
+            r#"{"hit":1.5,"reason":"SENTINEL"}"#,
+            r#"{"hit":null,"reason":"SENTINEL"}"#,
+            r#"prose that mentions SENTINEL before the braces {"hit": true}"#,
+        ];
+        for raw in cases {
+            let err = parse_judge_output(raw).expect_err(raw);
+            let msg = err.to_string();
+            assert!(!msg.contains("SENTINEL"), "{raw} -> {msg}");
+            assert!(msg.contains("failed to parse judge output"), "{msg}");
+        }
     }
 
     #[test]
