@@ -494,6 +494,231 @@ pub fn config_file_key_value(cfg: &ReinConfig, id: &str) -> Option<String> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ProbeTarget {
+    /// `GET {endpoint}/v1beta/models?pageSize=1` with `x-goog-api-key`.
+    GoogleModels { endpoint: String, key: String },
+    /// `GET {endpoint}/models` with the resolved auth header (if any).
+    OpenAiModels {
+        endpoint: String,
+        key: Option<(crate::vendors::AuthHeader, String)>,
+    },
+    /// A real embedding call through `create_embedder`; checks dimensions.
+    Embedding,
+    /// `POST {endpoint}/v4/search` bearer.
+    Supermemory { endpoint: String, key: String },
+}
+
+fn classify(status: reqwest::StatusCode) -> &'static str {
+    match status.as_u16() {
+        200..=299 => "ok",
+        400 | 401 | 403 => "unauthorized",
+        _ => "error",
+    }
+}
+
+fn transport_result(err: &reqwest::Error) -> ProbeResult {
+    let status = if err.is_connect() || err.is_timeout() {
+        "unreachable"
+    } else {
+        "error"
+    };
+    ProbeResult {
+        status: status.into(),
+        http_status: None,
+        latency_ms: 0,
+        detail: None,
+    }
+}
+
+async fn run_probe(cfg: &ReinConfig, target: &ProbeTarget) -> ProbeResult {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .expect("reqwest client");
+    let started = std::time::Instant::now();
+    let finish = |status: &str, http: Option<u16>, detail: Option<String>| ProbeResult {
+        status: status.to_string(),
+        http_status: http,
+        latency_ms: started.elapsed().as_millis() as u64,
+        detail,
+    };
+    match target {
+        ProbeTarget::GoogleModels { endpoint, key } => {
+            let url = format!("{endpoint}/v1beta/models?pageSize=1");
+            match client.get(url).header("x-goog-api-key", key).send().await {
+                Ok(resp) => finish(classify(resp.status()), Some(resp.status().as_u16()), None),
+                Err(e) => transport_result(&e),
+            }
+        }
+        ProbeTarget::OpenAiModels { endpoint, key } => {
+            let mut rb = client.get(format!("{endpoint}/models"));
+            if let Some((header, value)) = key {
+                rb = rb.header(header.header_name(), header.header_value(value));
+            }
+            match rb.send().await {
+                Ok(resp) => finish(classify(resp.status()), Some(resp.status().as_u16()), None),
+                Err(e) => transport_result(&e),
+            }
+        }
+        ProbeTarget::Supermemory { endpoint, key } => {
+            let body = serde_json::json!({"q": "rein", "limit": 1});
+            match client
+                .post(format!("{endpoint}/v4/search"))
+                .bearer_auth(key)
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(resp) => finish(classify(resp.status()), Some(resp.status().as_u16()), None),
+                Err(e) => transport_result(&e),
+            }
+        }
+        ProbeTarget::Embedding => {
+            let Some(embedder) = crate::embed::create_embedder(cfg) else {
+                return finish("error", None, Some("embedder not configured".into()));
+            };
+            use crate::types::traits::Embedder;
+            match embedder.embed("rein providers probe").await {
+                Ok(v) if v.len() == cfg.embedding.dimensions => finish("ok", Some(200), None),
+                Ok(v) => finish(
+                    "dimension_mismatch",
+                    Some(200),
+                    Some(format!(
+                        "expected {} dimensions, got {}",
+                        cfg.embedding.dimensions,
+                        v.len()
+                    )),
+                ),
+                Err(e) => {
+                    // Error strings are already content-free (provider_status_error).
+                    let msg = e.to_string();
+                    let http = msg
+                        .split(|c: char| !c.is_ascii_digit())
+                        .filter_map(|w| w.parse::<u16>().ok())
+                        .find(|n| (100..600).contains(n));
+                    let status = match http {
+                        Some(400 | 401 | 403) => "unauthorized",
+                        Some(_) => "error",
+                        None if msg.contains("dimension mismatch") => "dimension_mismatch",
+                        None => "unreachable",
+                    };
+                    let detail = msg
+                        .split("dimension mismatch: ")
+                        .nth(1)
+                        .map(|s| s.to_string());
+                    finish(status, http, detail)
+                }
+            }
+        }
+    }
+}
+
+/// Run one probe per distinct target and attach the result to every
+/// credential (or synthetic endpoint row) that target belongs to.
+pub async fn probe(report: &mut ProviderStatusReport, cfg: &ReinConfig) {
+    use std::collections::HashMap;
+    let mut plan: Vec<(String, ProbeTarget)> = Vec::new();
+    for def in SURFACES {
+        let Some(s) = report
+            .surfaces
+            .iter()
+            .find(|s| s.surface == def.name)
+            .cloned()
+        else {
+            continue;
+        };
+        if s.status == "disabled" || !s.enabled {
+            continue;
+        }
+        let target = match def.kind {
+            SurfaceKind::Embedding => ProbeTarget::Embedding,
+            SurfaceKind::Supermemory => {
+                let Some(key) = cfg
+                    .secret("SUPERMEMORY_CC_API_KEY")
+                    .or_else(|| cfg.sync.api_key.clone())
+                else {
+                    continue;
+                };
+                ProbeTarget::Supermemory {
+                    endpoint: s.endpoint.clone(),
+                    key,
+                }
+            }
+            SurfaceKind::Llm(section) => {
+                let Ok(r) = cfg.resolve_llm_for(section) else {
+                    continue;
+                };
+                match r.provider {
+                    Provider::None => continue,
+                    Provider::Google => {
+                        let key = crate::extract::llm::resolved_api_key(&r)
+                            .or_else(|| google_api_key_field(cfg, section).1.cloned());
+                        let Some(key) = key else { continue };
+                        ProbeTarget::GoogleModels {
+                            endpoint: r.endpoint.clone(),
+                            key,
+                        }
+                    }
+                    Provider::Omlx => ProbeTarget::OpenAiModels {
+                        endpoint: r.endpoint.clone(),
+                        key: crate::extract::llm::resolved_api_key(&r).map(|k| (r.auth_header, k)),
+                    },
+                }
+            }
+        };
+        let id = s
+            .credential
+            .clone()
+            .unwrap_or_else(|| format!("endpoint:{}", s.endpoint));
+        if !plan.iter().any(|(pid, pt)| *pid == id && *pt == target) {
+            plan.push((id, target));
+        }
+    }
+    let mut results: HashMap<ProbeTarget, ProbeResult> = HashMap::new();
+    for (id, target) in plan {
+        let result = match results.get(&target) {
+            Some(r) => r.clone(),
+            None => {
+                let r = run_probe(cfg, &target).await;
+                results.insert(target.clone(), r.clone());
+                r
+            }
+        };
+        match report.credentials.iter_mut().find(|c| c.id == id) {
+            Some(c) => {
+                // Keep the worst outcome when one key serves several APIs.
+                let already_bad = c.probe.as_ref().is_some_and(|p| p.status != "ok");
+                if !already_bad {
+                    c.probe = Some(result);
+                }
+            }
+            None => report.credentials.push(CredentialStatus {
+                id,
+                kind: "endpoint".into(),
+                present: true,
+                masked: None,
+                used_by: Vec::new(),
+                warning: None,
+                probe: Some(result),
+            }),
+        }
+    }
+    let surfaces = report.surfaces.clone();
+    for c in report
+        .credentials
+        .iter_mut()
+        .filter(|c| c.kind == "endpoint")
+    {
+        c.used_by = surfaces
+            .iter()
+            .filter(|s| s.credential.is_none() && format!("endpoint:{}", s.endpoint) == c.id)
+            .map(|s| s.surface.clone())
+            .collect();
+    }
+    report.probed_at = Some(chrono::Utc::now().to_rfc3339());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -717,5 +942,82 @@ mod tests {
         );
         assert_eq!(vi.rows, 0);
         assert!(vi.matches, "no stamp + zero rows counts as matching");
+    }
+
+    #[tokio::test]
+    async fn probe_classifies_ok_unauthorized_unreachable() {
+        clear_env();
+        let ok = crate::stub_http::StubServer::start(vec![(200, "{\"data\":[]}".into())]);
+        let unauth =
+            crate::stub_http::StubServer::start(vec![(401, "{\"error\":\"nope secret\"}".into())]);
+        let mut cfg = ReinConfig::load_from_str(&format!(
+            "[extract]\nprovider = \"openai\"\n[extract.openai]\nmodel = \"m\"\nendpoint = \"{}\"\napi_key_env = \"REIN_TEST_PROBE_A\"\n[query_expansion]\nprovider = \"openai\"\n[query_expansion.openai]\nmodel = \"m\"\nendpoint = \"{}\"\napi_key_env = \"REIN_TEST_PROBE_B\"\n[search]\nllm_reranker = \"none\"\n[embedding]\nprovider = \"none\"\n[sync]\nsupermemory_enabled = false\n[async_memory]\nprovider = \"none\"\n",
+            ok.url, unauth.url
+        ))
+        .unwrap();
+        cfg.secrets.insert("REIN_TEST_PROBE_A".into(), "ka".into());
+        cfg.secrets.insert("REIN_TEST_PROBE_B".into(), "kb".into());
+        let mut report = collect(&cfg, None);
+        probe(&mut report, &cfg).await;
+        assert!(report.probed_at.is_some());
+        let a = report
+            .credentials
+            .iter()
+            .find(|c| c.id == "env:REIN_TEST_PROBE_A")
+            .unwrap();
+        assert_eq!(a.probe.as_ref().unwrap().status, "ok");
+        assert_eq!(a.probe.as_ref().unwrap().http_status, Some(200));
+        let b = report
+            .credentials
+            .iter()
+            .find(|c| c.id == "env:REIN_TEST_PROBE_B")
+            .unwrap();
+        assert_eq!(b.probe.as_ref().unwrap().status, "unauthorized");
+        let detail = b.probe.as_ref().unwrap().detail.clone().unwrap_or_default();
+        assert!(!detail.contains("secret"), "{detail}");
+        assert_eq!(ok.requests()[0].path, "/models");
+        assert_eq!(ok.requests()[0].header("authorization"), Some("Bearer ka"));
+    }
+
+    #[tokio::test]
+    async fn probe_embedding_reports_dimension_mismatch() {
+        clear_env();
+        let body =
+            serde_json::json!({"data": [{"index": 0, "embedding": [0.1, 0.2, 0.3]}]}).to_string();
+        let stub = crate::stub_http::StubServer::start(vec![(200, body)]);
+        let mut cfg = ReinConfig::load_from_str(&format!(
+            "[embedding]\nprovider = \"openai\"\ndimensions = 2\n[embedding.openai]\nmodel = \"m\"\nendpoint = \"{}\"\n[extract]\nprovider = \"none\"\n[query_expansion]\nprovider = \"none\"\n[search]\nllm_reranker = \"none\"\n[sync]\nsupermemory_enabled = false\n[async_memory]\nprovider = \"none\"\n",
+            stub.url
+        ))
+        .unwrap();
+        cfg.secrets.insert("OPENAI_API_KEY".into(), "k".into());
+        let mut report = collect(&cfg, None);
+        probe(&mut report, &cfg).await;
+        let c = report
+            .credentials
+            .iter()
+            .find(|c| c.id == "env:OPENAI_API_KEY")
+            .unwrap();
+        let p = c.probe.as_ref().unwrap();
+        assert_eq!(p.status, "dimension_mismatch");
+        assert_eq!(p.detail.as_deref(), Some("expected 2 dimensions, got 3"));
+    }
+
+    #[tokio::test]
+    async fn probe_unreachable_endpoint() {
+        clear_env();
+        let mut cfg = ReinConfig::load_from_str(
+            "[extract]\nprovider = \"openai\"\n[extract.openai]\nmodel = \"m\"\nendpoint = \"http://127.0.0.1:9/v1\"\n[query_expansion]\nprovider = \"none\"\n[search]\nllm_reranker = \"none\"\n[embedding]\nprovider = \"none\"\n[sync]\nsupermemory_enabled = false\n[async_memory]\nprovider = \"none\"\n",
+        )
+        .unwrap();
+        cfg.secrets.insert("OPENAI_API_KEY".into(), "k".into());
+        let mut report = collect(&cfg, None);
+        probe(&mut report, &cfg).await;
+        let c = report
+            .credentials
+            .iter()
+            .find(|c| c.id == "env:OPENAI_API_KEY")
+            .unwrap();
+        assert_eq!(c.probe.as_ref().unwrap().status, "unreachable");
     }
 }

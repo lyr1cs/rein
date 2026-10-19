@@ -11,7 +11,7 @@
 //! public API documentation on 2026-10-19.
 
 /// Which request header carries the API key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AuthHeader {
     /// `Authorization: Bearer <key>` — OpenAI and nearly every compatible vendor.
     Bearer,

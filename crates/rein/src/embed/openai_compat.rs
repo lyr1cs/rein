@@ -141,7 +141,7 @@ impl OpenAiCompatibleEmbedder {
             let vector = decode_embedding(&item["embedding"], self.options.encoding)?;
             if vector.len() != self.dimensions {
                 return Err(ReinError::Embedding(format!(
-                    "dimension mismatch: expected {}, got {}",
+                    "dimension mismatch: expected {} dimensions, got {}",
                     self.dimensions,
                     vector.len()
                 )));
@@ -380,7 +380,7 @@ mod tests {
         let stub = StubServer::start(vec![(200, float_resp(&[vec![1.0, 2.0, 3.0]]))]);
         let e = OpenAiCompatibleEmbedder::new(stub.url.clone(), "m".into(), 2, opts());
         let err = e.embed("x").await.unwrap_err().to_string();
-        assert!(err.contains("expected 2, got 3"), "{err}");
+        assert!(err.contains("expected 2 dimensions, got 3"), "{err}");
     }
 
     #[tokio::test]
