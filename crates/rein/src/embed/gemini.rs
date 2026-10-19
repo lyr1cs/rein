@@ -10,6 +10,10 @@ pub struct GeminiEmbedder {
     endpoint: String,
     model: String,
     dimensions: usize,
+    /// `validate_endpoint` verdict taken once at construction. When false,
+    /// every embed call fails before a request is built so the key and the
+    /// memory text never leave the process over plain HTTP.
+    endpoint_ok: bool,
 }
 
 /// Reject embedder endpoints that are not HTTPS (except explicit loopback).
@@ -47,9 +51,13 @@ pub(crate) fn validate_endpoint(endpoint: &str) -> Result<(), String> {
 
 impl GeminiEmbedder {
     pub fn new(api_key: String, endpoint: String, model: String, dimensions: usize) -> Self {
-        if let Err(msg) = validate_endpoint(&endpoint) {
-            tracing::warn!("{msg}; the request will still be built but outbound calls will fail");
-        }
+        let endpoint_ok = match validate_endpoint(&endpoint) {
+            Ok(()) => true,
+            Err(msg) => {
+                tracing::warn!("{msg}; every embed call on this embedder is refused");
+                false
+            }
+        };
         let client = Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
@@ -60,6 +68,20 @@ impl GeminiEmbedder {
             endpoint,
             model,
             dimensions,
+            endpoint_ok,
+        }
+    }
+
+    /// Fail closed on a rejected endpoint. Called before any request is
+    /// built so a plain-HTTP remote override can never carry the key.
+    fn check_endpoint(&self) -> ReinResult<()> {
+        if self.endpoint_ok {
+            Ok(())
+        } else {
+            Err(ReinError::Embedding(format!(
+                "embedder endpoint '{}' refused: must be https:// (loopback http allowed)",
+                self.endpoint
+            )))
         }
     }
 }
@@ -155,6 +177,7 @@ impl Embedder for GeminiEmbedder {
     }
 
     async fn embed(&self, text: &str) -> ReinResult<Vec<f32>> {
+        self.check_endpoint()?;
         let url = format!(
             "{}/v1beta/models/{}:embedContent",
             self.endpoint, self.model
@@ -191,6 +214,7 @@ impl Embedder for GeminiEmbedder {
     }
 
     async fn embed_batch(&self, texts: &[&str]) -> ReinResult<Vec<Vec<f32>>> {
+        self.check_endpoint()?;
         let url = format!(
             "{}/v1beta/models/{}:batchEmbedContents",
             self.endpoint, self.model
@@ -316,5 +340,28 @@ mod tests {
         assert!(validate_endpoint("http://api.example:8080").is_err());
         assert!(validate_endpoint("ftp://example.com").is_err());
         assert!(validate_endpoint("").is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_http_endpoint_is_refused_before_any_request() {
+        let e = GeminiEmbedder::new(
+            "AIzaSyTESTKEY00000000003f2a".into(),
+            "http://evil.example:8080".into(),
+            "gemini-embedding-001".into(),
+            8,
+        );
+        let err = e.embed("hello").await.unwrap_err().to_string();
+        assert!(err.contains("refused"), "{err}");
+        let err = e.embed_batch(&["a", "b"]).await.unwrap_err().to_string();
+        assert!(err.contains("refused"), "{err}");
+        // Loopback http stays usable (local test servers); the call fails
+        // only because nothing listens there.
+        let local = GeminiEmbedder::new(
+            "AIzaSyTESTKEY00000000003f2a".into(),
+            "http://127.0.0.1:9".into(),
+            "gemini-embedding-001".into(),
+            8,
+        );
+        assert!(local.endpoint_ok);
     }
 }

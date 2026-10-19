@@ -106,6 +106,12 @@ pub fn create_embedder(config: &crate::config::ReinConfig) -> Option<EmbedderKin
     match config.embedding_provider() {
         Provider::Google => {
             let api_key = config.embedding.google.api_key.as_ref()?;
+            if let Err(msg) = gemini::validate_endpoint(&config.embedding.google.endpoint) {
+                // Fail closed: no embedder at all (recall falls back to FTS)
+                // rather than one that would post the key over plain HTTP.
+                tracing::warn!("{msg}; embedding disabled");
+                return None;
+            }
             Some(EmbedderKind::Gemini(GeminiEmbedder::new(
                 api_key.clone(),
                 config.embedding.google.endpoint.clone(),
@@ -233,6 +239,26 @@ mod tests {
             crate::vendors::vendor_preset("azure")
         )
         .is_none());
+    }
+
+    #[test]
+    fn create_embedder_refuses_remote_http_google_endpoint() {
+        let base = "[embedding]\nprovider = \"google\"\ndimensions = 8\n[embedding.google]\nmodel = \"gemini-embedding-001\"\napi_key = \"AIzaSyTESTKEY00000000003f2a\"\n";
+        let cfg = crate::config::ReinConfig::load_from_str(&format!(
+            "{base}endpoint = \"http://evil.example:8080\"\n"
+        ))
+        .unwrap();
+        assert!(create_embedder(&cfg).is_none());
+        let cfg = crate::config::ReinConfig::load_from_str(&format!(
+            "{base}endpoint = \"https://generativelanguage.googleapis.com\"\n"
+        ))
+        .unwrap();
+        assert!(create_embedder(&cfg).is_some());
+        let cfg = crate::config::ReinConfig::load_from_str(&format!(
+            "{base}endpoint = \"http://127.0.0.1:8080\"\n"
+        ))
+        .unwrap();
+        assert!(create_embedder(&cfg).is_some());
     }
 
     #[test]
