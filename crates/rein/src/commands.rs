@@ -530,13 +530,19 @@ pub async fn handle_keys_probe(
     name: Option<&str>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let mut report = rein::ops::handlers::providers::status_report(config, true).await;
-    if let Some(n) = name {
-        let id = format!("env:{n}");
-        report.credentials.retain(|c| c.id == id);
-        if report.credentials.is_empty() {
-            anyhow::bail!("no surface uses {n}");
+    let mut report = rein::ops::handlers::providers::status_report(config, false).await;
+    match name {
+        Some(n) => {
+            // Filter first so an unknown or unrelated key never triggers
+            // network calls against other providers.
+            let id = format!("env:{n}");
+            if !report.credentials.iter().any(|c| c.id == id) {
+                anyhow::bail!("no surface uses {n}");
+            }
+            rein::ops::handlers::providers::probe_only(&mut report, config, Some(&id)).await;
+            report.credentials.retain(|c| c.id == id);
         }
+        None => rein::ops::handlers::providers::probe(&mut report, config).await,
     }
     if json {
         println!("{}", serde_json::to_string_pretty(&report.credentials)?);

@@ -617,6 +617,17 @@ async fn run_probe(cfg: &ReinConfig, target: &ProbeTarget) -> ProbeResult {
 /// Run one probe per distinct target and attach the result to every
 /// credential (or synthetic endpoint row) that target belongs to.
 pub async fn probe(report: &mut ProviderStatusReport, cfg: &ReinConfig) {
+    probe_only(report, cfg, None).await
+}
+
+/// Like [`probe`], restricted to the targets behind one credential id (or
+/// `endpoint:<url>` row) so `rein keys probe NAME` never calls unrelated
+/// providers.
+pub async fn probe_only(
+    report: &mut ProviderStatusReport,
+    cfg: &ReinConfig,
+    only_id: Option<&str>,
+) {
     use std::collections::HashMap;
     let mut plan: Vec<(String, ProbeTarget)> = Vec::new();
     for def in SURFACES {
@@ -671,6 +682,9 @@ pub async fn probe(report: &mut ProviderStatusReport, cfg: &ReinConfig) {
             .credential
             .clone()
             .unwrap_or_else(|| format!("endpoint:{}", s.endpoint));
+        if only_id.is_some_and(|only| only != id) {
+            continue;
+        }
         if !plan.iter().any(|(pid, pt)| *pid == id && *pt == target) {
             plan.push((id, target));
         }
@@ -1146,6 +1160,39 @@ mod tests {
         assert!(!detail.contains("secret"), "{detail}");
         assert_eq!(ok.requests()[0].path, "/models");
         assert_eq!(ok.requests()[0].header("authorization"), Some("Bearer ka"));
+    }
+
+    #[tokio::test]
+    async fn probe_only_skips_unrelated_targets() {
+        clear_env();
+        let a = crate::stub_http::StubServer::start(vec![(200, "{\"data\":[]}".into())]);
+        let b = crate::stub_http::StubServer::start(vec![(200, "{\"data\":[]}".into())]);
+        let mut cfg = ReinConfig::load_from_str(&format!(
+            "[extract]\nprovider = \"openai\"\n[extract.openai]\nmodel = \"m\"\nendpoint = \"{}\"\napi_key_env = \"REIN_TEST_ONLY_A\"\n[query_expansion]\nprovider = \"openai\"\n[query_expansion.openai]\nmodel = \"m\"\nendpoint = \"{}\"\napi_key_env = \"REIN_TEST_ONLY_B\"\n[search]\nllm_reranker = \"none\"\n[embedding]\nprovider = \"none\"\n[sync]\nsupermemory_enabled = false\n[async_memory]\nprovider = \"none\"\n",
+            a.url, b.url
+        ))
+        .unwrap();
+        cfg.secrets.insert("REIN_TEST_ONLY_A".into(), "ka".into());
+        cfg.secrets.insert("REIN_TEST_ONLY_B".into(), "kb".into());
+        let mut report = collect(&cfg, None);
+        probe_only(&mut report, &cfg, Some("env:REIN_TEST_ONLY_B")).await;
+        assert!(
+            a.requests().is_empty(),
+            "unrelated provider must not be called"
+        );
+        assert_eq!(b.requests().len(), 1);
+        let a_cred = report
+            .credentials
+            .iter()
+            .find(|c| c.id == "env:REIN_TEST_ONLY_A")
+            .unwrap();
+        assert!(a_cred.probe.is_none());
+        let b_cred = report
+            .credentials
+            .iter()
+            .find(|c| c.id == "env:REIN_TEST_ONLY_B")
+            .unwrap();
+        assert_eq!(b_cred.probe.as_ref().unwrap().status, "ok");
     }
 
     #[tokio::test]

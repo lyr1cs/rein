@@ -120,20 +120,48 @@ pub struct SetProviderOutcome {
     pub hints: Vec<String>,
 }
 
-fn table_at<'a>(doc: &'a mut DocumentMut, dotted: &str) -> &'a mut Table {
-    let mut cur: &mut Table = doc.as_table_mut();
-    for part in dotted.split('.') {
-        if !cur.contains_key(part) {
+/// Get (or create) the child table `key` of `parent`. An inline table
+/// (`embedding = { provider = "google" }`) is promoted to a standard table so
+/// it can hold sub-tables; any other value type is a descriptive error.
+fn child_table_mut<'a>(
+    parent: &'a mut Table,
+    key: &str,
+    path: &str,
+) -> Result<&'a mut Table, String> {
+    match parent.get(key) {
+        None => {
             let mut t = Table::new();
             t.set_implicit(true);
-            cur.insert(part, Item::Table(t));
+            parent.insert(key, Item::Table(t));
         }
-        cur = cur
-            .get_mut(part)
-            .and_then(|i| i.as_table_mut())
-            .expect("table just inserted");
+        Some(Item::Table(_)) => {}
+        Some(Item::Value(v)) if v.is_inline_table() => {
+            let inline = v.as_inline_table().expect("checked").clone();
+            parent.insert(key, Item::Table(inline.into_table()));
+        }
+        Some(_) => {
+            return Err(format!(
+                "config.toml: `{path}` is not a table; edit it by hand or remove it first"
+            ))
+        }
     }
-    cur
+    parent
+        .get_mut(key)
+        .and_then(|i| i.as_table_mut())
+        .ok_or_else(|| format!("config.toml: `{path}` could not be opened as a table"))
+}
+
+fn table_at<'a>(doc: &'a mut DocumentMut, dotted: &str) -> Result<&'a mut Table, String> {
+    let mut cur: &mut Table = doc.as_table_mut();
+    let mut walked = String::new();
+    for part in dotted.split('.') {
+        if !walked.is_empty() {
+            walked.push('.');
+        }
+        walked.push_str(part);
+        cur = child_table_mut(cur, part, &walked)?;
+    }
+    Ok(cur)
 }
 
 fn item_to_string(item: Option<&Item>) -> Option<String> {
@@ -254,7 +282,7 @@ pub fn apply_set_provider(
     let mut diff = Vec::new();
     let section_path = loc.section;
     {
-        let section = table_at(&mut doc, section_path);
+        let section = table_at(&mut doc, section_path)?;
         section.set_implicit(false);
         set_str(
             section,
@@ -271,13 +299,7 @@ pub fn apply_set_provider(
         if loc.has_tables && !matches!(provider.as_str(), "none" | "inherit") {
             let sub = provider_table_name(section, &provider)?;
             let sub_path = format!("{section_path}.{sub}");
-            if !section.contains_key(sub) {
-                section.insert(sub, Item::Table(Table::new()));
-            }
-            let tbl = section
-                .get_mut(sub)
-                .and_then(|i| i.as_table_mut())
-                .expect("provider table");
+            let tbl = child_table_mut(section, sub, &sub_path)?;
             tbl.set_implicit(false);
             if let Some(m) = &req.model {
                 set_str(tbl, "model", m, &format!("{sub_path}.model"), &mut diff);
@@ -546,6 +568,24 @@ mod tests {
         );
         assert!(!out.hints.iter().any(|h| h.contains("warmup")));
         assert!(out.hints.iter().any(|h| h.contains("restart")));
+    }
+
+    #[test]
+    fn inline_tables_are_promoted_not_panicked_and_scalars_are_errors() {
+        std::env::remove_var("OPENAI_API_KEY");
+        let text = "embedding = { provider = \"google\", dimensions = 3072, openai = { model = \"old\" } }\n";
+        let mut r = req("embedding", "openai");
+        r.model = Some("text-embedding-3-large".into());
+        let out = apply_set_provider(text, &r).unwrap();
+        let doc: DocumentMut = out.text.parse().unwrap();
+        assert_eq!(doc["embedding"]["provider"].as_str(), Some("openai"));
+        assert_eq!(
+            doc["embedding"]["openai"]["model"].as_str(),
+            Some("text-embedding-3-large")
+        );
+        crate::config::ReinConfig::load_from_str(&out.text).unwrap();
+        let err = apply_set_provider("embedding = 42\n", &req("embedding", "google")).unwrap_err();
+        assert!(err.contains("not a table"), "{err}");
     }
 
     #[test]
