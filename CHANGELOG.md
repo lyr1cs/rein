@@ -9,6 +9,77 @@ The full release notes (with audit-round breakdowns and operator-visible
 schema changes) live on the [GitHub Releases page](https://github.com/lyr1cs/rein/releases).
 This file is a condensed index intended for quick scanning.
 
+## [1.5.0] — 2026-10-20
+
+Feature release: any OpenAI-compatible vendor for embeddings and every LLM
+surface, per-surface API keys, rein-managed key storage, and a status surface
+that shows the wiring. No schema version change.
+
+### Added
+
+- **Vendor presets** — `provider = "openai" | "perplexity" | "deepseek" |
+  "openrouter" | "groq" | "mistral" | "xai" | "together" | "fireworks" |
+  "voyage" | "jina" | "cohere" | "anthropic" | "azure" | "nvidia" |
+  "cerebras" | "huggingface" | "dashscope" | "zhipu" | "siliconflow" |
+  "moonshot" | "volcengine" | "ollama" | "lmstudio" | "vllm" | "omlx"`
+  (`rein providers vendors`). Every name maps to one OpenAI-compatible code
+  path with per-vendor defaults for endpoint, key environment variable, auth
+  header (`bearer` / `x-api-key` / `api-key`), embedding encoding, role and
+  dimensions field names, and batch size; vendors without the needed API
+  (chat or embeddings) are rejected at config load. Request shapes were
+  checked against each vendor's current API reference.
+- `api_key_env`, `auth_header` and optional `disable_thinking` on every
+  OpenAI-compatible table (`[extract.openai]`, `[query_expansion.openai]`,
+  `[intelligent_merge.openai]`, `[llm.openai]`, …); `[embedding.openai]`
+  adds `send_dimensions`, `query_input_type`, `document_input_type`,
+  `encoding` (`float` | `base64_int8`) and `max_batch`;
+  `[embedding.google].api_key_env`. `openai` is an alias of every `omlx`
+  table name.
+- `[ars.llm_judge].provider` + `[ars.llm_judge.google | openai]` — the judge
+  can run on its own vendor; judge ledger fingerprints carry the vendor name.
+- **Secrets file** — `~/.rein/secrets.env` (mode 600, `REIN_SECRETS_FILE`
+  overrides the path) is read on every config load after the process
+  environment; `rein keys list | set | unset | probe`. A file readable by
+  group or others is refused and reported by `rein doctor` (`secrets_file`).
+- **Status surfaces** — `rein providers status [--probe] [--json]`,
+  `rein providers set <surface> --provider … [--model …] [--dimensions …] …`
+  (comment-preserving, validated in-place edit of `config.toml`, `--dry-run`),
+  `rein providers show <surface>`, `rein status` (alias of `dashboard`) with
+  Providers / Keys sections, masked key lines in `rein config`, doctor
+  provider checks fed by the same report.
+- `GET /api/providers` (read token; `?probe=true`) and owner-only
+  `POST /api/providers/reveal` (mutation marker + owner credential,
+  `Cache-Control: no-store`, logs only the credential id).
+- **GUI AI Keys page** (`/providers`) — a flow diagram of rein's six AI
+  roles (vectorize, write, sharpen search, answer, grade, cloud cross-check)
+  showing the model and key behind each, role cards with "how to change"
+  CLI / TOML snippets, key cards with masked values, an eye toggle that
+  reveals for the owner session and hides after 60 s, and a live probe. The
+  Dashboard gets an AI Keys summary card; the Settings token field uses the
+  same eye toggle. GUI unit tests run under vitest (`npm test`).
+
+### Changed
+
+- `Embedder` trait gains `embed_query` / `embed_query_batch` / `asymmetric`;
+  recall embeds queries with the query role and keeps a separate cache key
+  for asymmetric models so document and query vectors never share an entry.
+- The OpenAI-compatible embedder decodes base64 int8 responses (Perplexity),
+  chunks batches to the vendor limit, reorders by index, and reports
+  dimension mismatches with the expected and received sizes.
+- OpenAI-compatible chat clients send the configured auth header and key on
+  every surface (extraction, async memory, expansion, rerank, intelligent
+  merge, synthesis, concept summaries, cold archive, resummerize, judge).
+- `ResolvedLlmConfig` carries `provider_name`, `auth_header`,
+  `disable_thinking`, the resolved key and the config table it came from;
+  legacy local endpoints are no longer offered as fallbacks for named
+  vendors. `omlx` users see no behaviour change.
+
+### Notes
+
+- Config: all new keys are optional; existing files load unchanged. A file
+  that uses the new keys fails to load on v1.4.x.
+- MCP tool count unchanged (40). The `providers` operation is REST-only.
+
 ## [1.4.2] — 2026-10-17
 
 Maintenance patch on the runway automation line. No schema or config
