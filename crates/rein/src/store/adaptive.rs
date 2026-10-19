@@ -1365,6 +1365,25 @@ impl AdaptiveState {
                     // equally-advanced copy would be stripped below and the
                     // already-committed offsets could never replay to
                     // rebuild them.
+                    // Watermarks of the persisted (peer) feedback states, read
+                    // BEFORE the arbitration below replaces them with ours.
+                    // The judge-calibration Layer 1 fields and the pending
+                    // κ half-pairs are owned by these same consumers and must
+                    // follow the same decision; comparing against the
+                    // already-replaced value made every "writer wins" case
+                    // look like a tie, so a pass that completed new pairs
+                    // persisted its advanced watermark but not the pairs —
+                    // and the committed offsets could never replay them.
+                    let theirs_synth_water = current
+                        .synthesis_feedback_stats
+                        .as_ref()
+                        .map(|s| s.last_consumed_event_id)
+                        .unwrap_or(0);
+                    let theirs_concept_water = current
+                        .concept_summary_feedback_stats
+                        .as_ref()
+                        .map(|s| s.last_consumed_event_id)
+                        .unwrap_or(0);
                     let synth_stats_from_self = match (
                         &self.synthesis_feedback_stats,
                         &current.synthesis_feedback_stats,
@@ -1483,38 +1502,18 @@ impl AdaptiveState {
                             (None, Some(t)) => Some(t.clone()),
                             (Some(mine), Some(theirs)) => {
                                 let mut out = theirs.clone();
-                                // Layer 1 arbitration: whichever side
-                                // incorporated more synthesis_feedback events
-                                // wins the Layer 1 fields. We approximate
-                                // "Layer 1 watermark" by inferring from
-                                // synthesis_feedback_stats.last_consumed_event_id
-                                // on the same Self/current.
-                                let mine_l1 = self
-                                    .synthesis_feedback_stats
-                                    .as_ref()
-                                    .map(|s| s.last_consumed_event_id)
-                                    .unwrap_or(0);
-                                let theirs_l1 = current
-                                    .synthesis_feedback_stats
-                                    .as_ref()
-                                    .map(|s| s.last_consumed_event_id)
-                                    .unwrap_or(0);
-                                if mine_l1 > theirs_l1 {
+                                // Layer 1 arbitration follows the owning
+                                // consumer's decision above: the side whose
+                                // synthesis_feedback_stats won (higher
+                                // watermark, or the recluster tie rule) also
+                                // owns the pairs and κ it derived from those
+                                // same events.
+                                if synth_stats_from_self {
                                     out.recent_pairs_synthesis =
                                         mine.recent_pairs_synthesis.clone();
                                     out.kappa = mine.kappa;
                                 }
-                                let mine_capa = self
-                                    .concept_summary_feedback_stats
-                                    .as_ref()
-                                    .map(|s| s.last_consumed_event_id)
-                                    .unwrap_or(0);
-                                let theirs_capa = current
-                                    .concept_summary_feedback_stats
-                                    .as_ref()
-                                    .map(|s| s.last_consumed_event_id)
-                                    .unwrap_or(0);
-                                if mine_capa > theirs_capa {
+                                if concept_stats_from_self {
                                     out.recent_pairs_concept = mine.recent_pairs_concept.clone();
                                 }
                                 // Layer 2 arbitration by judge_calibration
@@ -1574,19 +1573,15 @@ impl AdaptiveState {
                             .as_ref()
                             .map(|s| s.last_consumed_event_id)
                             .unwrap_or(0);
-                        let theirs_synth = current
-                            .synthesis_feedback_stats
-                            .as_ref()
-                            .map(|s| s.last_consumed_event_id)
-                            .unwrap_or(0);
-                        let theirs_cs = current
-                            .concept_summary_feedback_stats
-                            .as_ref()
-                            .map(|s| s.last_consumed_event_id)
-                            .unwrap_or(0);
+                        // Compare against the peer's ORIGINAL watermarks
+                        // (captured above), not the already-arbitrated
+                        // `current`, and let a writer that owns the feedback
+                        // state on a tie (recluster rule) own the halves too.
                         let mine_max = mine_synth.max(mine_cs);
-                        let theirs_max = theirs_synth.max(theirs_cs);
-                        if mine_max > theirs_max {
+                        let theirs_max = theirs_synth_water.max(theirs_concept_water);
+                        let writer_owns_feedback = synth_stats_from_self || concept_stats_from_self;
+                        if mine_max > theirs_max || (writer_owns_feedback && mine_max == theirs_max)
+                        {
                             current.pending_kappa_half_pairs =
                                 self.pending_kappa_half_pairs.clone();
                         }
@@ -7102,6 +7097,90 @@ mod tests {
         let restored_synth = restored.synthesis_feedback_stats.unwrap();
         assert_eq!(restored_synth.last_consumed_event_id, 999);
         assert_eq!(restored_synth.by_cluster, fresher_buckets);
+    }
+
+    /// A fold that completed new calibration pairs and consumed pending
+    /// halves must keep them through a CAS merge against a peer that saved
+    /// the same calibration state meanwhile (a reindex cluster reset). The
+    /// merge used to compare the Layer 1 watermark against the value it had
+    /// just replaced, so the advanced watermark persisted without its pairs.
+    #[test]
+    fn judge_calibration_pairs_and_pending_halves_follow_the_advancing_writer() {
+        let conn = setup_db();
+        let feedback = |last_consumed_event_id: i64| SynthesisFeedbackState {
+            by_cluster: HashMap::new(),
+            by_synthesis: HashMap::new(),
+            by_synthesis_order: vec![],
+            last_consumed_event_id,
+            total_events: 1,
+        };
+        let pairs = |n: usize| -> std::collections::VecDeque<(bool, bool, i64)> {
+            (0..n).map(|i| (true, true, i as i64)).collect()
+        };
+        let mut old_pending = HashMap::new();
+        old_pending.insert(
+            "judge:synth-30".to_string(),
+            HalfPair::Judge {
+                hit: true,
+                ts: 100,
+                surface: JudgeSurface::Synthesis,
+                alias_key: None,
+            },
+        );
+        let peer = AdaptiveState {
+            version: 5,
+            synthesis_feedback_stats: Some(feedback(100)),
+            judge_calibration_state: Some(JudgeCalibrationState {
+                recent_pairs_synthesis: pairs(29),
+                kappa: 0.1,
+                ..JudgeCalibrationState::default()
+            }),
+            pending_kappa_half_pairs: old_pending,
+            ..AdaptiveState::default()
+        };
+        conn.execute(
+            "INSERT INTO metadata (key, value) VALUES ('adaptive_state', ?1)",
+            rusqlite::params![serde_json::to_string(&peer).unwrap()],
+        )
+        .unwrap();
+
+        // The advancing fold consumed events 101–102: pair 30 completed
+        // (its judge half left pending) and a new thumb half is waiting.
+        let mut new_pending = HashMap::new();
+        new_pending.insert(
+            "thumb:synth-31".to_string(),
+            HalfPair::Thumb {
+                up: true,
+                ts: 102,
+                surface: JudgeSurface::Synthesis,
+            },
+        );
+        let writer = AdaptiveState {
+            version: 2,
+            synthesis_feedback_stats: Some(feedback(102)),
+            judge_calibration_state: Some(JudgeCalibrationState {
+                recent_pairs_synthesis: pairs(30),
+                kappa: 0.5,
+                ..JudgeCalibrationState::default()
+            }),
+            pending_kappa_half_pairs: new_pending.clone(),
+            ..AdaptiveState::default()
+        };
+        writer.save_snapshot(&conn).unwrap();
+
+        let restored = AdaptiveState::restore_snapshot(&conn).unwrap();
+        assert_eq!(
+            restored
+                .synthesis_feedback_stats
+                .as_ref()
+                .unwrap()
+                .last_consumed_event_id,
+            102
+        );
+        let calibration = restored.judge_calibration_state.unwrap();
+        assert_eq!(calibration.recent_pairs_synthesis.len(), 30);
+        assert_eq!(calibration.kappa, 0.5);
+        assert_eq!(restored.pending_kappa_half_pairs, new_pending);
     }
 
     #[test]
