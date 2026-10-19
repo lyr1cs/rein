@@ -432,3 +432,287 @@ pub async fn handle_providers_status(
     }
     Ok(())
 }
+
+pub async fn handle_keys_list(config: &ReinConfig, json: bool) -> anyhow::Result<()> {
+    let report = rein::ops::handlers::providers::status_report(config, false).await;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "credentials": report.credentials,
+                "secrets_file": rein::secrets::default_path(),
+            }))?
+        );
+        return Ok(());
+    }
+    println!("secrets file: {}", rein::secrets::default_path().display());
+    if report.credentials.is_empty() {
+        println!("  (no surface needs a key with the current configuration)");
+    }
+    for c in &report.credentials {
+        let name = c.id.split_once(':').map(|(_, n)| n).unwrap_or(&c.id);
+        let value = c.masked.clone().unwrap_or_else(|| "missing".into());
+        println!(
+            "  {name:<24} {value:<16} {:<13} {}",
+            c.kind,
+            c.used_by.join(", ")
+        );
+        if let Some(w) = &c.warning {
+            println!("    ! {w}");
+        }
+    }
+    Ok(())
+}
+
+pub fn handle_keys_set(name: &str, value: Option<String>, stdin: bool) -> anyhow::Result<()> {
+    use std::io::{IsTerminal, Read};
+    let value = match (value, stdin) {
+        (Some(v), _) => v,
+        (None, true) => {
+            let mut s = String::new();
+            std::io::stdin().read_to_string(&mut s)?;
+            s.lines().next().unwrap_or("").to_string()
+        }
+        (None, false) if std::io::stdin().is_terminal() => {
+            rpassword::prompt_password(format!("value for {name} (hidden): "))?
+        }
+        (None, false) => anyhow::bail!(
+            "no value given and stdin is not a terminal: pass --stdin (recommended) or --value"
+        ),
+    };
+    let path = rein::secrets::default_path();
+    rein::secrets::set_key(&path, name, &value).map_err(|e| anyhow::anyhow!(e))?;
+    let masked = rein::ops::handlers::providers::mask_secret(value.trim());
+    println!("stored {name} = {masked} in {}", path.display());
+    if std::env::var(name)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .is_some()
+    {
+        println!("note: {name} is also set in this process environment, which takes precedence");
+    }
+    // Reporting which surfaces use the key needs the config; tolerate a
+    // config that does not load (the key is already stored).
+    match ReinConfig::load() {
+        Ok(config) => {
+            let report = rein::ops::handlers::providers::collect(&config, None);
+            let used: Vec<String> = report
+                .credentials
+                .iter()
+                .find(|c| c.id == format!("env:{name}"))
+                .map(|c| c.used_by.clone())
+                .unwrap_or_default();
+            if used.is_empty() {
+                println!(
+                    "no surface currently uses {name} (configure one with `rein providers set …`)"
+                );
+            } else {
+                println!("used by: {}", used.join(", "));
+                println!("verify with: rein providers status --probe");
+            }
+        }
+        Err(e) => println!("note: config did not load ({e}); run `rein doctor`"),
+    }
+    Ok(())
+}
+
+pub fn handle_keys_unset(name: &str) -> anyhow::Result<()> {
+    let path = rein::secrets::default_path();
+    match rein::secrets::unset_key(&path, name).map_err(|e| anyhow::anyhow!(e))? {
+        true => println!("removed {name} from {}", path.display()),
+        false => println!("{name} was not set in {}", path.display()),
+    }
+    Ok(())
+}
+
+pub async fn handle_keys_probe(
+    config: &ReinConfig,
+    name: Option<&str>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let mut report = rein::ops::handlers::providers::status_report(config, true).await;
+    if let Some(n) = name {
+        let id = format!("env:{n}");
+        report.credentials.retain(|c| c.id == id);
+        if report.credentials.is_empty() {
+            anyhow::bail!("no surface uses {n}");
+        }
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report.credentials)?);
+    } else {
+        print!("{}", rein::ops::handlers::providers::render_human(&report));
+    }
+    Ok(())
+}
+
+pub fn handle_providers_set(
+    req: rein::config_edit::SetProviderRequest,
+    dry_run: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let path = rein::config::config_file_path();
+    let current = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => anyhow::bail!("{}: {e}", path.display()),
+    };
+    let outcome =
+        rein::config_edit::apply_set_provider(&current, &req).map_err(|e| anyhow::anyhow!(e))?;
+    if dry_run {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "path": path,
+                    "diff": outcome.diff,
+                    "hints": outcome.hints,
+                    "toml": outcome.text,
+                }))?
+            );
+        } else {
+            println!("would write {}:\n\n{}", path.display(), outcome.text);
+            for h in &outcome.hints {
+                println!("next: {h}");
+            }
+        }
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    rein::init::atomic_write_string(&path, &outcome.text)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "path": path,
+                "diff": outcome.diff,
+                "hints": outcome.hints,
+            }))?
+        );
+    } else {
+        println!("updated {}", path.display());
+        for d in &outcome.diff {
+            println!(
+                "  {}: {} → {}",
+                d.key,
+                d.old.as_deref().unwrap_or("(unset)"),
+                d.new
+            );
+        }
+        if outcome.diff.is_empty() {
+            println!("  (no changes)");
+        }
+        for h in &outcome.hints {
+            println!("next: {h}");
+        }
+    }
+    Ok(())
+}
+
+pub async fn handle_providers_show(
+    config: &ReinConfig,
+    surface: &str,
+    json: bool,
+) -> anyhow::Result<()> {
+    let name = match surface {
+        "embedding" | "extract" | "query_expansion" | "resummerize" | "supermemory" => {
+            surface.to_string()
+        }
+        "async_memory" => "extract.async_memory".into(),
+        "intelligent_merge" => "extract.intelligent_merge".into(),
+        "reranker" => "search.llm_reranker".into(),
+        "judge" => "ars.llm_judge".into(),
+        "nightly" => "ars.llm_judge.nightly_cron".into(),
+        "synthesis" => "ars.recall_synthesis".into(),
+        "concept_summary" => "ars.concept_summary".into(),
+        "cold_archive" => "ars.cold_archive".into(),
+        other
+            if rein::ops::handlers::providers::SURFACES
+                .iter()
+                .any(|s| s.name == other) =>
+        {
+            other.to_string()
+        }
+        other => anyhow::bail!("unknown surface '{other}'"),
+    };
+    let report = rein::ops::handlers::providers::status_report(config, false).await;
+    let Some(s) = report.surfaces.iter().find(|s| s.surface == name) else {
+        anyhow::bail!("unknown surface '{surface}'");
+    };
+    let cred = s
+        .credential
+        .as_ref()
+        .and_then(|id| report.credentials.iter().find(|c| &c.id == id));
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "surface": s, "credential": cred }))?
+        );
+        return Ok(());
+    }
+    let pm = if s.model.is_empty() {
+        s.provider.clone()
+    } else {
+        format!("{}:{}", s.provider, s.model)
+    };
+    println!("{:<12} {}", "surface", s.surface);
+    println!("{:<12} {}", "role", s.role);
+    println!("{:<12} {}", "status", s.status);
+    println!("{:<12} {pm}", "provider");
+    println!("{:<12} {}", "endpoint", s.endpoint);
+    println!("{:<12} {} ({})", "source", s.source_table, s.source_level);
+    match cred {
+        Some(c) => println!(
+            "{:<12} {} = {} ({})",
+            "key",
+            c.id.trim_start_matches("env:"),
+            c.masked.clone().unwrap_or_else(|| "missing".into()),
+            c.kind
+        ),
+        None => println!("{:<12} none needed", "key"),
+    }
+    Ok(())
+}
+
+pub fn handle_providers_vendors(json: bool) -> anyhow::Result<()> {
+    let rows: Vec<serde_json::Value> = rein::vendors::VENDOR_PRESETS
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "name": p.name,
+                "chat_endpoint": p.chat_endpoint,
+                "embeddings_endpoint": p.embeddings_endpoint,
+                "api_key_env": p.api_key_env,
+                "auth_header": p.auth_header.config_name(),
+                "chat": p.chat,
+                "embeddings": p.embeddings,
+                "encoding": p.encoding.config_name(),
+                "max_batch": p.max_batch,
+            })
+        })
+        .collect();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    println!(
+        "{:<12} {:<4} {:<4} {:<22} {}",
+        "vendor", "chat", "emb", "key env", "default endpoint"
+    );
+    for p in rein::vendors::VENDOR_PRESETS {
+        println!(
+            "{:<12} {:<4} {:<4} {:<22} {}",
+            p.name,
+            if p.chat { "yes" } else { "-" },
+            if p.embeddings { "yes" } else { "-" },
+            p.api_key_env.unwrap_or("(none)"),
+            p.chat_endpoint
+                .or(p.embeddings_endpoint)
+                .unwrap_or("(set --endpoint)")
+        );
+    }
+    println!("\nuse: rein providers set <surface> --provider <vendor> --model <model>   then   rein keys set <KEY_ENV>");
+    Ok(())
+}

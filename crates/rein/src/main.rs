@@ -143,6 +143,11 @@ enum Commands {
     /// Show service status dashboard
     #[command(alias = "status")]
     Dashboard,
+    /// Manage API keys in rein's own secrets file (~/.rein/secrets.env)
+    Keys {
+        #[command(subcommand)]
+        action: KeysAction,
+    },
     /// Provider wiring and API-key status (masked keys); `status` is the default action
     Providers {
         /// Call each provider once to verify its key (same as `providers status --probe`)
@@ -220,6 +225,83 @@ enum ProvidersAction {
         #[arg(long)]
         json: bool,
     },
+    /// Point a surface at a provider/model (edits config.toml in place, validated first)
+    Set {
+        /// embedding | extract | async_memory | intelligent_merge | query_expansion | reranker | resummerize | ars | judge | llm
+        surface: String,
+        /// google | none | inherit | a vendor name (see `rein providers vendors`)
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        endpoint: Option<String>,
+        #[arg(long)]
+        api_key_env: Option<String>,
+        /// bearer | x-api-key | api-key
+        #[arg(long)]
+        auth_header: Option<String>,
+        #[arg(long)]
+        disable_thinking: Option<bool>,
+        /// embedding only
+        #[arg(long)]
+        dimensions: Option<usize>,
+        #[arg(long)]
+        send_dimensions: Option<bool>,
+        /// float | base64_int8
+        #[arg(long)]
+        encoding: Option<String>,
+        #[arg(long)]
+        query_input_type: Option<String>,
+        #[arg(long)]
+        document_input_type: Option<String>,
+        #[arg(long)]
+        max_batch: Option<usize>,
+        /// Print the resulting TOML without writing
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resolved provider/model/key for one surface
+    Show {
+        surface: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// The built-in vendor preset table
+    Vendors {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeysAction {
+    /// List known keys (masked) and which surfaces use them
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Store a key; reads --value, --stdin, or a hidden prompt on a TTY
+    Set {
+        /// Env-var style name, e.g. OPENAI_API_KEY
+        name: String,
+        /// Pass the value on the command line (visible in shell history; prefer --stdin)
+        #[arg(long, conflicts_with = "stdin")]
+        value: Option<String>,
+        /// Read the value from stdin (first line)
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Remove a key from the secrets file
+    Unset { name: String },
+    /// Call providers to verify keys (optionally one key)
+    Probe {
+        name: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -280,6 +362,60 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::from_arg_matches(&matches)
         .map_err(|e| anyhow::anyhow!("cli arg matches → struct: {e}"))?;
+    // Config-editing commands must work even when the current config does
+    // not load (that is often why someone is editing it), so they run
+    // before `ReinConfig::load()`.
+    match &cli.command {
+        Some(Commands::Keys {
+            action: KeysAction::Set { name, value, stdin },
+        }) => return commands::handle_keys_set(name, value.clone(), *stdin),
+        Some(Commands::Keys {
+            action: KeysAction::Unset { name },
+        }) => return commands::handle_keys_unset(name),
+        Some(Commands::Providers {
+            action: Some(ProvidersAction::Vendors { json }),
+            ..
+        }) => return commands::handle_providers_vendors(*json),
+        Some(Commands::Providers {
+            action:
+                Some(ProvidersAction::Set {
+                    surface,
+                    provider,
+                    model,
+                    endpoint,
+                    api_key_env,
+                    auth_header,
+                    disable_thinking,
+                    dimensions,
+                    send_dimensions,
+                    encoding,
+                    query_input_type,
+                    document_input_type,
+                    max_batch,
+                    dry_run,
+                    json,
+                }),
+            ..
+        }) => {
+            let req = rein::config_edit::SetProviderRequest {
+                surface: surface.clone(),
+                provider: provider.clone(),
+                model: model.clone(),
+                endpoint: endpoint.clone(),
+                api_key_env: api_key_env.clone(),
+                auth_header: auth_header.clone(),
+                disable_thinking: *disable_thinking,
+                dimensions: *dimensions,
+                send_dimensions: *send_dimensions,
+                encoding: encoding.clone(),
+                query_input_type: query_input_type.clone(),
+                document_input_type: document_input_type.clone(),
+                max_batch: *max_batch,
+            };
+            return commands::handle_providers_set(req, *dry_run, *json);
+        }
+        _ => {}
+    }
     let config = config::ReinConfig::load()?;
 
     match cli.command {
@@ -386,6 +522,19 @@ async fn main() -> anyhow::Result<()> {
             ProvidersAction::Status { probe, json } => {
                 commands::handle_providers_status(&config, probe, json).await?
             }
+            ProvidersAction::Show { surface, json } => {
+                commands::handle_providers_show(&config, &surface, json).await?
+            }
+            // Set / Vendors returned before the config load above.
+            ProvidersAction::Set { .. } | ProvidersAction::Vendors { .. } => unreachable!(),
+        },
+        Some(Commands::Keys { action }) => match action {
+            KeysAction::List { json } => commands::handle_keys_list(&config, json).await?,
+            KeysAction::Probe { name, json } => {
+                commands::handle_keys_probe(&config, name.as_deref(), json).await?
+            }
+            // Set / Unset returned before the config load above.
+            KeysAction::Set { .. } | KeysAction::Unset { .. } => unreachable!(),
         },
         Some(Commands::Gui { action }) => match action {
             ServiceAction::On => commands::handle_gui_on()?,

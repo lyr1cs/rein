@@ -70,6 +70,22 @@ Keys are read from the process environment first, then from
 be mode 600), then from a plaintext `api_key = "…"` field. `[embedding.google].api_key_env`
 names the variable for the embedding key (default `GEMINI_API_KEY`).
 
+### Editing from the CLI
+
+`rein providers set <surface> --provider <vendor> [--model …] [--endpoint …]
+[--api-key-env …] [--auth-header …] [--disable-thinking …] [--dimensions …]
+[--send-dimensions …] [--encoding …] [--query-input-type …]
+[--document-input-type …] [--max-batch …] [--dry-run] [--json]` rewrites the
+matching section of `config.toml` in place (comments preserved), validates
+the result before writing, and prints the field-level diff plus the next
+steps (`rein warmup --reembed-all` after an embedding change, `rein keys
+set <ENV>` when the chosen vendor's key is absent). Surfaces: `embedding`,
+`extract`, `async_memory`, `intelligent_merge`, `query_expansion`,
+`reranker`, `resummerize`, `ars`, `judge`, `llm`. `rein providers show
+<surface>` prints the resolved result; `rein providers vendors` prints the
+preset table. Keys go through `rein keys set|unset|list|probe` and land in
+`~/.rein/secrets.env`, never in `config.toml`.
+
 ## ARS And Judge Defaults
 
 ARS content-generation capabilities remain opt-in by default. ARS acceleration

@@ -24,7 +24,7 @@ use std::path::Path;
 /// Note: `with_extension("tmp")` clobbers any pre-existing `.tmp` sibling
 /// (e.g. from a previously-crashed run). This is acceptable — that file is
 /// already orphaned and about to be overwritten-then-renamed-away.
-fn atomic_write_string(path: &Path, content: &str) -> io::Result<()> {
+pub fn atomic_write_string(path: &Path, content: &str) -> io::Result<()> {
     // v0.30.3 codex R2 P2: if the target is a symlink (common for
     // dotfile-managed `~/.claude.json` / Codex configs) `rename(tmp, path)`
     // replaces the symlink itself with a regular file, silently
