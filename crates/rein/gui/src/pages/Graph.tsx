@@ -4,6 +4,7 @@ import type { LinkObject, NodeObject } from 'react-force-graph-2d';
 import { useQueryClient } from '@tanstack/react-query';
 import { getConceptState } from '../api/client';
 import { useMemoirs, useMemoirExport } from '../hooks/useApi';
+import { useContainerSize } from '../hooks/useContainerSize';
 import {
   endpointId as endpointIdGeneric,
   endpointNode as endpointNodeGeneric,
@@ -110,8 +111,9 @@ export default function Graph() {
    * section" per the silent-fallback contract. */
   const [conceptState, setConceptState] = useState<ConceptState | null>(null);
 
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [dimensions, setDimensions] = useState(() => ({
+  // Callback ref + observer in one hook: the graph container only exists
+  // once the memoir loaded, so a mount-time effect never saw it (U21-02).
+  const [containerRef, dimensions] = useContainerSize(() => ({
     width: typeof window !== 'undefined' ? window.innerWidth - 96 : 800,
     height: typeof window !== 'undefined' ? window.innerHeight - 120 : 600,
   }));
@@ -265,24 +267,6 @@ export default function Graph() {
     return () => { cancelled = true; };
   }, [selectedNode]);
   /* eslint-enable react-hooks/set-state-in-effect */
-
-  /* ---- Resize observer ---- */
-  useEffect(() => {
-    const el = containerRef.current;
-    if (!el) return;
-    // Initialize dimensions immediately
-    setDimensions({ width: Math.floor(el.clientWidth), height: Math.floor(el.clientHeight) });
-    const ro = new ResizeObserver((entries) => {
-      for (const e of entries) {
-        setDimensions({
-          width: Math.floor(e.contentRect.width),
-          height: Math.floor(e.contentRect.height),
-        });
-      }
-    });
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, []);
 
   /* ---- Search helpers ---- */
   const searchLower = search.toLowerCase();

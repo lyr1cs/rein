@@ -91,14 +91,14 @@ export async function postConceptSummaryFeedback(
   interaction: ConceptSummaryInteractionKind,
   metadata?: ConceptSummaryMetadata,
   ids?: { conceptSummaryId?: string | null; livingSummaryId?: string | null },
-): Promise<boolean> {
+): Promise<FeedbackPostResult> {
   if (
     typeof conceptId !== 'string' ||
     conceptId.length === 0 ||
     typeof recallId !== 'string' ||
     recallId.length === 0
   ) {
-    return false;
+    return { ok: false, reason: 'concept summary has no feedback ids' };
   }
 
   const livingSummaryId =
@@ -124,9 +124,10 @@ export async function postConceptSummaryFeedback(
       '/api/feedback/concept_summary',
       body,
     );
-    return true;
+    return { ok: true };
   } catch (err) {
     console.warn('[feedback] concept_summary POST failed:', err);
-    return false;
+    const reason = err instanceof Error ? err.message : String(err);
+    return { ok: false, reason };
   }
 }

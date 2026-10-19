@@ -1,6 +1,13 @@
 import { useCallback, useMemo, useRef, useState } from 'react';
 import { postConceptSummaryFeedback } from '../api/feedback';
 import { useDwellTimer } from '../hooks/useDwellTimer';
+import {
+  beginThumb,
+  canCastThumb,
+  idleThumbVote,
+  settleThumb,
+  type ThumbVote,
+} from './conceptThumbModel';
 
 /**
  * ConceptSummaryCard — renders a Cap A concept living-summary alongside the
@@ -39,7 +46,9 @@ export default function ConceptSummaryCard({
   livingSummaryId?: string | null;
 }) {
   const cardRef = useRef<HTMLDivElement | null>(null);
-  const [thumbState, setThumbState] = useState<'up' | 'down' | null>(null);
+  const [thumbVote, setThumbVote] = useState<ThumbVote>(idleThumbVote);
+  const thumbState = thumbVote.state;
+  const thumbLocked = !canCastThumb(thumbVote);
 
   const conceptChars = summary.length;
 
@@ -97,19 +106,22 @@ export default function ConceptSummaryCard({
   );
 
   const handleThumb = useCallback(
-    (up: boolean) => {
-      setThumbState((prev) => (prev !== null ? prev : up ? 'up' : 'down'));
-      if (thumbState === null) {
-        void postConceptSummaryFeedback(
-          conceptId,
-          recallId,
-          { kind: 'explicit_thumb', up },
-          metadata,
-          { conceptSummaryId, livingSummaryId },
-        );
-      }
+    async (up: boolean) => {
+      // Latch only after the server accepted the vote (see
+      // conceptThumbModel): an optimistic latch announced a recorded vote
+      // for a POST that failed and blocked the retry until remount.
+      if (!canCastThumb(thumbVote)) return;
+      setThumbVote(beginThumb);
+      const result = await postConceptSummaryFeedback(
+        conceptId,
+        recallId,
+        { kind: 'explicit_thumb', up },
+        metadata,
+        { conceptSummaryId, livingSummaryId },
+      );
+      setThumbVote(settleThumb(up, result));
     },
-    [conceptId, recallId, metadata, thumbState, conceptSummaryId, livingSummaryId],
+    [conceptId, recallId, metadata, thumbVote, conceptSummaryId, livingSummaryId],
   );
 
   if (summary.trim().length === 0) return null;
@@ -184,8 +196,8 @@ export default function ConceptSummaryCard({
           >
             <button
               type="button"
-              onClick={() => handleThumb(true)}
-              disabled={thumbState !== null}
+              onClick={() => void handleThumb(true)}
+              disabled={thumbLocked}
               aria-label={
                 thumbState === 'up'
                   ? 'You rated this concept summary helpful'
@@ -203,8 +215,8 @@ export default function ConceptSummaryCard({
             </button>
             <button
               type="button"
-              onClick={() => handleThumb(false)}
-              disabled={thumbState !== null}
+              onClick={() => void handleThumb(false)}
+              disabled={thumbLocked}
               aria-label={
                 thumbState === 'down'
                   ? 'You rated this concept summary unhelpful'
@@ -226,6 +238,17 @@ export default function ConceptSummaryCard({
           Auto-refreshed living summary
         </span>
       </div>
+      {feedbackEnabled && thumbVote.error && (
+        <div
+          role="alert"
+          className="mt-1 text-[10px] text-[var(--hot)]"
+          data-testid="concept-feedback-error"
+        >
+          Feedback not saved: {thumbVote.error}. The server refused the write —
+          check <code>[server].auth</code> and apply your
+          <code> REIN_HTTP_TOKEN</code> in Settings, then try again.
+        </div>
+      )}
     </div>
   );
 }

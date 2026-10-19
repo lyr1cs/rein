@@ -4,6 +4,7 @@ import type { ForceGraphMethods, LinkObject, NodeObject } from 'react-force-grap
 import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import { apiGet, getConceptState } from '../api/client';
 import { useMemoryDetail, useRecent, useMemoirs } from '../hooks/useApi';
+import { useContainerSize } from '../hooks/useContainerSize';
 import {
   endpointId as endpointIdGeneric,
   endpointNode as endpointNodeGeneric,
@@ -82,7 +83,12 @@ export default function Brain() {
 
   /* Refs */
   const fgRef = useRef<GraphHandle | undefined>(undefined);
-  const containerRef = useRef<HTMLDivElement>(null);
+  // Callback ref + observer in one hook: the graph container only exists
+  // once loading finished, so a mount-time effect never saw it (U21-02).
+  const [containerRef, dimensions] = useContainerSize(() => ({
+    width: typeof window !== 'undefined' ? window.innerWidth - 48 : 800,
+    height: typeof window !== 'undefined' ? window.innerHeight - 40 : 600,
+  }));
   /* `hasLoadedGraph` participates in rendering (used to compute the loading
    * spinner gate), so it must be state, not a ref — the new
    * `react-hooks/refs` lint rule (eslint-plugin-react-hooks v7) flags any
@@ -93,11 +99,6 @@ export default function Brain() {
    * value we wrote last poll" without listing `timeMax` in its dep array
    * (which would self-loop because each poll writes a fresh `Date.now()`). */
   const timeMaxRef = useRef(0);
-  const [dimensions, setDimensions] = useState(() => ({
-    width: typeof window !== 'undefined' ? window.innerWidth - 48 : 800,
-    height: typeof window !== 'undefined' ? window.innerHeight - 40 : 600,
-  }));
-
   /* ---- Data fetching via react-query (H3 + M7) ----
    *
    * Three coordinated queries:
@@ -277,25 +278,6 @@ export default function Brain() {
       return () => clearTimeout(id);
     }
   }, [loading, graphData.nodes.length]);
-
-  /* ---- Resize observer ---- */
-  useEffect(() => {
-    const el = containerRef.current;
-    if (!el) return;
-    // Set initial dimensions from actual container
-    setDimensions({ width: el.clientWidth, height: el.clientHeight });
-    const ro = new ResizeObserver((entries) => {
-      for (const e of entries) {
-        const w = Math.floor(e.contentRect.width);
-        const h = Math.floor(e.contentRect.height);
-        if (w > 0 && h > 0) {
-          setDimensions({ width: w, height: h });
-        }
-      }
-    });
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, []);
 
   /* ---- Time-filtered data ---- */
   const filteredData = useMemo(() => {
