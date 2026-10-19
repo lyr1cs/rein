@@ -3525,8 +3525,17 @@ mod tests {
         assert_eq!(config.embedding_query_cache_key(), "voyage:voyage-3");
         config.embedding.omlx.query_input_type = Some("query".to_string());
         config.embedding.omlx.document_input_type = Some("document".to_string());
-        assert_eq!(config.embedding_query_cache_key(), "voyage:voyage-3#query");
+        assert_eq!(
+            config.embedding_query_cache_key(),
+            "voyage:voyage-3|doc=document#query=query"
+        );
+        assert_eq!(config.embedding_model(), "voyage:voyage-3|doc=document");
+        config.embedding.omlx.document_input_type = None;
         assert_eq!(config.embedding_model(), "voyage:voyage-3");
+        assert_eq!(
+            config.embedding_query_cache_key(),
+            "voyage:voyage-3#query=query"
+        );
     }
     use crate::ops::a12_autocalibration::{
         A12LooCase, A12LooExclusion, A12LooPositive, A12OutcomeProvenance,

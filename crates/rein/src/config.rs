@@ -886,6 +886,10 @@ pub struct ResolvedLlmConfig {
     pub max_retries: Option<u32>,
     /// Which precedence level supplied the dominant `provider` choice.
     pub source: PrecedenceSource,
+    /// The config table the resolved `model` came from, for humans:
+    /// `[extract.google]`, `[llm.openai]`, `[ars.llm_judge.openai]`, or
+    /// `none` when no provider is configured.
+    pub source_table: String,
     /// Consumer section name (echoed back for logging).
     pub section: String,
 }
@@ -2239,11 +2243,19 @@ impl ReinConfig {
                 || self.embedding.omlx.document_input_type.is_some())
     }
 
-    /// `EmbedCache` key for *query* vectors (document vectors keep `embedding_model()`).
+    /// `EmbedCache` key for *query* vectors (document vectors keep
+    /// `embedding_model()`). The query role is part of the identity so a
+    /// changed `query_input_type` never reuses stale cached vectors.
     pub fn embedding_query_cache_key(&self) -> String {
         let model = self.embedding_model();
         if self.embedding_is_asymmetric() {
-            format!("{model}#query")
+            let role = self
+                .embedding
+                .omlx
+                .query_input_type
+                .as_deref()
+                .unwrap_or("");
+            format!("{model}#query={role}")
         } else {
             model
         }
@@ -2258,13 +2270,24 @@ impl ReinConfig {
         self.ars.llm_judge.enabled && self.ars.llm_judge.nightly_cron.enabled
     }
 
+    /// Identity of the *document* vectors this configuration produces:
+    /// `<provider>:<model>`, plus `|doc=<role>` when an OpenAI-compatible
+    /// vendor embeds documents under an explicit role. It is the
+    /// `vec_rows_provenance` stamp and the document cache key, so changing
+    /// the role re-embeds instead of mixing incompatible vectors.
     pub fn embedding_model(&self) -> String {
         match self.embedding_provider() {
-            Provider::Omlx => format!(
-                "{}:{}",
-                self.embedding_provider_name(),
-                self.embedding.omlx.model
-            ),
+            Provider::Omlx => {
+                let base = format!(
+                    "{}:{}",
+                    self.embedding_provider_name(),
+                    self.embedding.omlx.model
+                );
+                match self.embedding.omlx.document_input_type.as_deref() {
+                    Some(role) if !role.is_empty() => format!("{base}|doc={role}"),
+                    _ => base,
+                }
+            }
             Provider::Google => format!("google:{}", self.embedding.google.model),
             Provider::None => "none".to_string(),
         }
@@ -2854,6 +2877,10 @@ struct SectionExplicit<'a> {
     inherit: bool,
     /// Section-level, provider-agnostic max input override.
     max_input_chars: Option<usize>,
+    /// Config table prefix the provider sub-tables live under (`extract`,
+    /// `query_expansion`, `intelligent_merge`, `ars.llm_judge`); empty when
+    /// the section has no level-1 tables.
+    table: &'static str,
     /// Section's own provider sub-tables (legacy v0.26.x shape).
     google_model: Option<&'a str>,
     google_api_key_env: Option<&'a str>,
@@ -2873,6 +2900,7 @@ impl<'a> SectionExplicit<'a> {
             provider: None,
             inherit: false,
             max_input_chars: None,
+            table: "",
             google_model: None,
             google_api_key_env: None,
             google_endpoint: None,
@@ -2921,6 +2949,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
             },
             inherit: extract_inherit,
             max_input_chars: None,
+            table: "extract",
             google_model: nonempty(&cfg.extract.google.model),
             google_api_key_env: Some("GEMINI_API_KEY"),
             google_endpoint: nonempty(&cfg.extract.google.endpoint),
@@ -2946,6 +2975,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                 },
                 inherit,
                 max_input_chars: None,
+                table: "extract",
                 // No async-memory-specific provider sub-table; reuse
                 // `[extract.{provider}]` (matches the v0.26.x semantic
                 // implemented in `extract/llm.rs::create_memory_worker_extractor`).
@@ -2976,6 +3006,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                 },
                 inherit,
                 max_input_chars: None,
+                table: "intelligent_merge",
                 google_model: nonempty(&cfg.intelligent_merge.google.model),
                 google_api_key_env: Some("GEMINI_API_KEY"),
                 google_endpoint: nonempty(&cfg.intelligent_merge.google.endpoint),
@@ -3002,6 +3033,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
             },
             inherit: query_expansion_inherit,
             max_input_chars: None,
+            table: "query_expansion",
             google_model: nonempty(&cfg.query_expansion.google.model),
             google_api_key_env: Some("GEMINI_API_KEY"),
             google_endpoint: nonempty(&cfg.query_expansion.google.endpoint),
@@ -3026,6 +3058,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                 },
                 inherit: reranker_inherit,
                 max_input_chars: None,
+                table: "query_expansion",
                 google_model: nonempty(&cfg.query_expansion.google.model),
                 google_api_key_env: Some("GEMINI_API_KEY"),
                 google_endpoint: nonempty(&cfg.query_expansion.google.endpoint),
@@ -3053,6 +3086,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                 },
                 inherit,
                 max_input_chars: None,
+                table: "extract",
                 google_model: nonempty(&cfg.extract.google.model),
                 google_api_key_env: Some("GEMINI_API_KEY"),
                 google_endpoint: nonempty(&cfg.extract.google.endpoint),
@@ -3076,6 +3110,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                 },
                 inherit,
                 max_input_chars: None,
+                table: "extract",
                 google_model: nonempty(&cfg.extract.google.model),
                 google_api_key_env: Some("GEMINI_API_KEY"),
                 google_endpoint: nonempty(&cfg.extract.google.endpoint),
@@ -3102,6 +3137,7 @@ fn section_explicit<'a>(cfg: &'a ReinConfig, sec: LlmSection) -> SectionExplicit
                 provider: explicit_provider,
                 inherit: false,
                 max_input_chars: j.max_input_chars,
+                table: "ars.llm_judge",
                 google_model: j.google.model.as_deref().and_then(nonempty),
                 google_api_key_env: Some(
                     j.google
@@ -3145,6 +3181,7 @@ fn hardcoded_fallback(sec: LlmSection) -> ResolvedLlmConfig {
         request_timeout_ms: None,
         max_retries: None,
         source: PrecedenceSource::HardcodedFallback,
+        source_table: "none".to_string(),
         section: section_name(sec).to_string(),
     }
 }
@@ -3310,16 +3347,21 @@ fn build_resolved_for_provider(
         .or(legacy.api_key_env)
         .map(|s| s.to_string())
         .or_else(|| preset.and_then(|p| p.api_key_env).map(|s| s.to_string()));
-    let configured_endpoint = l1
-        .endpoint
-        .or(l3.endpoint)
-        .or(legacy.endpoint)
-        .map(|s| s.to_string());
+    let named_vendor = matches!((chosen, preset), (Provider::Omlx, Some(p)) if p.name != "omlx");
+    // For a named vendor the compiled per-section localhost strings count as
+    // "unset" at every level, so a `[llm.openai].endpoint` (or proxy) still
+    // wins over the level-1 table's compiled default.
+    let candidate = |e: Option<&str>| -> Option<String> {
+        e.filter(|e| !named_vendor || !LEGACY_LOCAL_ENDPOINTS.contains(e))
+            .map(|s| s.to_string())
+    };
+    let configured_endpoint = candidate(l1.endpoint)
+        .or_else(|| candidate(l3.endpoint))
+        .or_else(|| candidate(legacy.endpoint));
     let endpoint = match (chosen, preset) {
         (Provider::Omlx, Some(p)) if p.name != "omlx" => {
             let explicit_non_local = configured_endpoint
                 .as_deref()
-                .filter(|e| !LEGACY_LOCAL_ENDPOINTS.contains(e))
                 .map(|s| s.trim_end_matches('/').to_string());
             match explicit_non_local.or_else(|| p.chat_endpoint.map(|s| s.to_string())) {
                 Some(e) => e,
@@ -3364,9 +3406,19 @@ fn build_resolved_for_provider(
         .as_deref()
         .and_then(|name| cfg.secret(name))
         .map(SecretString::new);
+    let sub = match chosen {
+        Provider::Google => "google",
+        _ => "openai",
+    };
+    let source_table = if l1.model.is_some() || (l3.model.is_none() && legacy.model.is_some()) {
+        format!("[{}.{sub}]", explicit.table)
+    } else {
+        format!("[llm.{sub}]")
+    };
     Ok(ResolvedLlmConfig {
         provider: chosen,
         provider_name,
+        source_table,
         model,
         api_key_env,
         api_key,
@@ -3438,6 +3490,7 @@ fn resolve_llm_for_impl(
                 request_timeout_ms: cfg.llm.request_timeout_ms,
                 max_retries: cfg.llm.max_retries,
                 source: PrecedenceSource::SectionExplicit,
+                source_table: "none".to_string(),
                 section: section.to_string(),
             });
         }
@@ -3507,6 +3560,7 @@ fn resolve_llm_for_impl(
                         request_timeout_ms: cfg.llm.request_timeout_ms,
                         max_retries: cfg.llm.max_retries,
                         source: PrecedenceSource::SectionProvider,
+                        source_table: "none".to_string(),
                         section: section.to_string(),
                     });
                 }
@@ -3611,6 +3665,7 @@ fn none_resolved(sec: LlmSection, section: &str, llm: &LlmDefaultsConfig) -> Res
         request_timeout_ms: llm.request_timeout_ms,
         max_retries: llm.max_retries,
         source: PrecedenceSource::SectionExplicit,
+        source_table: "none".to_string(),
         section: if section.is_empty() {
             section_name(sec).to_string()
         } else {
@@ -5201,6 +5256,33 @@ auth_header = "x-api-key"
     }
 
     #[test]
+    fn resolver_global_endpoint_beats_compiled_local_default_for_named_vendor() {
+        let cfg = ReinConfig::load_from_str(
+            "[extract]\nprovider = \"azure\"\n[extract.openai]\nmodel = \"gpt-4o\"\n[llm.openai]\nendpoint = \"https://my-res.openai.azure.com/openai/v1\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_llm_for("extract").unwrap();
+        assert_eq!(r.endpoint, "https://my-res.openai.azure.com/openai/v1");
+        let cfg = ReinConfig::load_from_str(
+            "[extract]\nprovider = \"openai\"\n[extract.openai]\nmodel = \"m\"\n[llm.openai]\nendpoint = \"https://proxy.example.com/v1\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.resolve_llm_for("extract").unwrap().endpoint,
+            "https://proxy.example.com/v1"
+        );
+        // omlx keeps its compiled per-section default even with a global table present
+        let cfg = ReinConfig::load_from_str(
+            "[extract]\nprovider = \"omlx\"\n[llm.omlx]\nendpoint = \"http://localhost:9999/v1\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.resolve_llm_for("extract").unwrap().endpoint,
+            "http://localhost:11434/v1"
+        );
+    }
+
+    #[test]
     fn resolver_azure_without_endpoint_is_an_error() {
         let cfg = ReinConfig::load_from_str(
             "[extract]\nprovider = \"azure\"\n[extract.openai]\nmodel = \"gpt-4o\"\n",
@@ -5251,6 +5333,7 @@ auth_header = "x-api-key"
         assert_eq!(r.model, "anthropic/claude-sonnet-4.5");
         assert_eq!(r.endpoint, "https://openrouter.ai/api/v1");
         assert_eq!(r.source, PrecedenceSource::SectionExplicit);
+        assert_eq!(r.source_table, "[ars.llm_judge.openai]");
         let n = cfg.resolve_llm_for("ars.llm_judge.nightly_cron").unwrap();
         assert_eq!(n.provider_name, "openrouter");
         assert_eq!(n.model, "anthropic/claude-sonnet-4.5");
@@ -5270,6 +5353,11 @@ auth_header = "x-api-key"
         assert_eq!(r.provider_name, "google");
         assert_eq!(r.model, "gemini-3.6-flash");
         assert_eq!(r.source, PrecedenceSource::GlobalDefault);
+        assert_eq!(r.source_table, "[llm.google]");
+        let s = cfg.resolve_llm_for("ars.recall_synthesis").unwrap();
+        assert_eq!(s.source_table, "[llm.google]");
+        let e = cfg.resolve_llm_for("extract").unwrap();
+        assert_eq!(e.source_table, "[extract.google]");
     }
 
     #[test]
