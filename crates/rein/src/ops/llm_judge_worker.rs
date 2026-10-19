@@ -150,7 +150,7 @@ fn structural_model_fingerprint(extractor: &ExtractorKind) -> String {
         ]),
         ExtractorKind::Omlx(extractor) => structural_fingerprint(&[
             "judge-model-v1",
-            "omlx",
+            &extractor.provider_name,
             &extractor.model,
             &extractor.endpoint,
             if extractor.disable_thinking {
@@ -206,10 +206,10 @@ pub(crate) fn structural_fingerprints_for_config(
         ]),
         Provider::Omlx => structural_fingerprint(&[
             "judge-model-v1",
-            "omlx",
+            &resolved.provider_name,
             &resolved.model,
             &resolved.endpoint,
-            if config.extract.omlx.disable_thinking.unwrap_or(true) {
+            if resolved.disable_thinking {
                 "disable_thinking"
             } else {
                 "thinking_enabled"
@@ -1018,6 +1018,11 @@ fn build_override_extractor(
                     o.endpoint.clone(),
                     model.to_string(),
                     o.disable_thinking,
+                )
+                .with_auth(
+                    o.provider_name.clone(),
+                    o.api_key.clone(),
+                    o.auth_header,
                 ),
             ))
         }
@@ -1035,7 +1040,7 @@ fn build_override_extractor(
 fn judge_model_id(extractor: &ExtractorKind) -> String {
     match extractor {
         ExtractorKind::Gemini(g) => format!("gemini:{}", g.model),
-        ExtractorKind::Omlx(o) => format!("omlx:{}", o.model),
+        ExtractorKind::Omlx(o) => format!("{}:{}", o.provider_name, o.model),
         #[cfg(feature = "test-support")]
         ExtractorKind::Mock(_) => "mock".to_string(),
     }

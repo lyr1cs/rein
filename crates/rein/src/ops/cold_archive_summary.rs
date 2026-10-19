@@ -529,21 +529,14 @@ pub fn create_cold_archive_extractor(config: &ReinConfig) -> Option<ExtractorKin
         Provider::None => None,
         Provider::Google => {
             // Codex R3 P2 fix — honor resolver's api_key_env.
-            let api_key = r
-                .api_key_env
-                .as_deref()
-                .and_then(|env_name| std::env::var(env_name).ok())
+            let api_key = crate::extract::llm::resolved_api_key(&r)
                 .or_else(|| config.extract.google.api_key.clone())?;
             Some(ExtractorKind::Gemini(
                 crate::extract::llm::GeminiExtractor::new(api_key, r.endpoint, r.model),
             ))
         }
         Provider::Omlx => Some(ExtractorKind::Omlx(
-            crate::extract::llm::OmlxExtractor::new(
-                r.endpoint,
-                r.model,
-                config.extract.omlx.disable_thinking.unwrap_or(true),
-            ),
+            crate::extract::llm::OmlxExtractor::from_resolved(&r),
         )),
     }
 }

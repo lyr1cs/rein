@@ -156,15 +156,29 @@ struct OmlxExpander {
     endpoint: String,
     model: String,
     disable_thinking: bool,
+    api_key: Option<String>,
+    auth_header: crate::vendors::AuthHeader,
 }
 
 impl OmlxExpander {
-    fn new(endpoint: String, model: String, disable_thinking: bool) -> Self {
+    fn from_resolved(r: &crate::config::ResolvedLlmConfig) -> Self {
         Self {
             client: crate::search::cache::http_client_15s(),
-            endpoint,
-            model,
-            disable_thinking,
+            endpoint: r.endpoint.clone(),
+            model: r.model.clone(),
+            disable_thinking: r.disable_thinking,
+            api_key: crate::extract::llm::resolved_api_key(r),
+            auth_header: r.auth_header,
+        }
+    }
+
+    fn authed(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.api_key {
+            Some(key) => rb.header(
+                self.auth_header.header_name(),
+                self.auth_header.header_value(key),
+            ),
+            None => rb,
         }
     }
 
@@ -205,13 +219,17 @@ impl OmlxExpander {
         };
 
         // Try with JSON mode first; retry without if model rejects it
-        let text_body = match self.client.post(&url).json(&make_body(true)).send().await {
+        let text_body = match self
+            .authed(self.client.post(&url))
+            .json(&make_body(true))
+            .send()
+            .await
+        {
             Ok(resp) if resp.status().is_success() => resp.text().await?,
             _ => {
                 tracing::info!("OMLX expand JSON mode failed, retrying without response_format");
                 let resp = self
-                    .client
-                    .post(&url)
+                    .authed(self.client.post(&url))
                     .json(&make_body(false))
                     .send()
                     .await?;
@@ -262,20 +280,13 @@ fn create_expander(config: &ReinConfig) -> Option<ExpanderKind> {
     match r.provider {
         Provider::Google => {
             // Codex R2 P2 fix — honor resolver api_key_env.
-            let api_key = r
-                .api_key_env
-                .as_deref()
-                .and_then(|env_name| std::env::var(env_name).ok())
+            let api_key = crate::extract::llm::resolved_api_key(&r)
                 .or_else(|| config.query_expansion.google.api_key.clone())?;
             Some(ExpanderKind::Gemini(GeminiExpander::new(
                 api_key, r.endpoint, r.model,
             )))
         }
-        Provider::Omlx => Some(ExpanderKind::Omlx(OmlxExpander::new(
-            r.endpoint,
-            r.model,
-            config.query_expansion.omlx.disable_thinking.unwrap_or(true),
-        ))),
+        Provider::Omlx => Some(ExpanderKind::Omlx(OmlxExpander::from_resolved(&r))),
         Provider::None => None,
     }
 }
@@ -565,6 +576,30 @@ mod tests {
         assert!(
             result.is_empty(),
             "250 ASCII chars must be rejected (over the 200-char cap)"
+        );
+    }
+
+    #[tokio::test]
+    async fn omlx_expander_sends_auth_header() {
+        let stub = crate::stub_http::StubServer::start(vec![(
+            200,
+            serde_json::json!({"choices": [{"message": {"content": "{\"queries\": [\"a b\"]}"}}]})
+                .to_string(),
+        )]);
+        let mut cfg = crate::config::ReinConfig::load_from_str(&format!(
+            "[query_expansion]\nprovider = \"openai\"\n[query_expansion.openai]\nmodel = \"m\"\nendpoint = \"{}\"\napi_key_env = \"REIN_TEST_EXPAND_KEY\"\n",
+            stub.url
+        ))
+        .unwrap();
+        cfg.secrets
+            .insert("REIN_TEST_EXPAND_KEY".into(), "sk-x".into());
+        let r = cfg.resolve_llm_for("query_expansion").unwrap();
+        let ex = OmlxExpander::from_resolved(&r);
+        let out = ex.expand("hello world", 2).await.unwrap();
+        assert_eq!(out, vec!["a b".to_string()]);
+        assert_eq!(
+            stub.requests()[0].header("authorization"),
+            Some("Bearer sk-x")
         );
     }
 }

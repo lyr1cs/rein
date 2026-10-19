@@ -569,21 +569,14 @@ pub fn create_ars_extractor(config: &ReinConfig, section: &str) -> Option<Extrac
             // GEMINI_API_KEY at config-load. Operators setting
             // `[llm.google].api_key_env = "MY_KEY"` resolved to Google but
             // were silently disabled because this constructor never read MY_KEY.
-            let api_key = r
-                .api_key_env
-                .as_deref()
-                .and_then(|env_name| std::env::var(env_name).ok())
+            let api_key = crate::extract::llm::resolved_api_key(&r)
                 .or_else(|| config.extract.google.api_key.clone())?;
             Some(ExtractorKind::Gemini(
                 crate::extract::llm::GeminiExtractor::new(api_key, r.endpoint, r.model),
             ))
         }
         Provider::Omlx => Some(ExtractorKind::Omlx(
-            crate::extract::llm::OmlxExtractor::new(
-                r.endpoint,
-                r.model,
-                config.extract.omlx.disable_thinking.unwrap_or(true),
-            ),
+            crate::extract::llm::OmlxExtractor::from_resolved(&r),
         )),
     }
 }

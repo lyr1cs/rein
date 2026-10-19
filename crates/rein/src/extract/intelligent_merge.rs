@@ -283,17 +283,13 @@ fn build_classifier(config: &ReinConfig) -> Option<ClassifierKind> {
             // Codex R4 P2 fix — honor resolver's api_key_env first.
             // Falls back to v0.26.x section-specific TOML field for
             // operators who haven't migrated.
-            let api_key = r
-                .api_key_env
-                .as_deref()
-                .and_then(|env_name| std::env::var(env_name).ok())
-                .or_else(|| {
-                    if used_dedicated {
-                        config.intelligent_merge.google.api_key.clone()
-                    } else {
-                        config.query_expansion.google.api_key.clone()
-                    }
-                })?;
+            let api_key = crate::extract::llm::resolved_api_key(&r).or_else(|| {
+                if used_dedicated {
+                    config.intelligent_merge.google.api_key.clone()
+                } else {
+                    config.query_expansion.google.api_key.clone()
+                }
+            })?;
             Some(ClassifierKind::Gemini(GeminiClassifier {
                 client: crate::search::cache::http_client_15s(),
                 api_key,
@@ -301,23 +297,14 @@ fn build_classifier(config: &ReinConfig) -> Option<ClassifierKind> {
                 model: r.model,
             }))
         }
-        Provider::Omlx => {
-            let disable_thinking = if used_dedicated {
-                config
-                    .intelligent_merge
-                    .omlx
-                    .disable_thinking
-                    .unwrap_or(true)
-            } else {
-                config.query_expansion.omlx.disable_thinking.unwrap_or(true)
-            };
-            Some(ClassifierKind::Omlx(OmlxClassifier {
-                client: crate::search::cache::http_client_15s(),
-                endpoint: r.endpoint,
-                model: r.model,
-                disable_thinking,
-            }))
-        }
+        Provider::Omlx => Some(ClassifierKind::Omlx(OmlxClassifier {
+            client: crate::search::cache::http_client_15s(),
+            endpoint: r.endpoint.clone(),
+            model: r.model.clone(),
+            disable_thinking: r.disable_thinking,
+            api_key: crate::extract::llm::resolved_api_key(&r),
+            auth_header: r.auth_header,
+        })),
         Provider::None => None,
     }
 }
@@ -377,9 +364,21 @@ struct OmlxClassifier {
     endpoint: String,
     model: String,
     disable_thinking: bool,
+    api_key: Option<String>,
+    auth_header: crate::vendors::AuthHeader,
 }
 
 impl OmlxClassifier {
+    fn authed(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.api_key {
+            Some(key) => rb.header(
+                self.auth_header.header_name(),
+                self.auth_header.header_value(key),
+            ),
+            None => rb,
+        }
+    }
+
     async fn classify(&self, user_msg: &str) -> ReinResult<VerdictResult> {
         let system_msg = if self.disable_thinking {
             format!("/no_think\n{CLASSIFY_SYSTEM_PROMPT}")
@@ -405,15 +404,19 @@ impl OmlxClassifier {
         // Mirror expand.rs/rerank_llm.rs: try with JSON mode first; some local
         // models (llama.cpp, older vLLM, Ollama variants) reject response_format
         // and would otherwise send the classifier silently to the fallback path.
-        let text_body = match self.client.post(&url).json(&make_body(true)).send().await {
+        let text_body = match self
+            .authed(self.client.post(&url))
+            .json(&make_body(true))
+            .send()
+            .await
+        {
             Ok(resp) if resp.status().is_success() => resp.text().await?,
             _ => {
                 tracing::info!(
                     "intelligent_merge OMLX JSON mode failed, retrying without response_format"
                 );
                 let resp = self
-                    .client
-                    .post(&url)
+                    .authed(self.client.post(&url))
                     .json(&make_body(false))
                     .send()
                     .await?;

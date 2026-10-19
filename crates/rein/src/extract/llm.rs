@@ -511,9 +511,20 @@ pub struct OmlxExtractor {
     pub(crate) endpoint: String,
     pub(crate) model: String,
     pub(crate) disable_thinking: bool,
+    /// Canonical vendor name (`omlx`, `openai`, `perplexity`, …) for ledgers/fingerprints.
+    pub(crate) provider_name: String,
+    pub(crate) api_key: Option<String>,
+    pub(crate) auth_header: crate::vendors::AuthHeader,
+}
+
+/// The key the resolver materialized (process env, then secrets file).
+pub fn resolved_api_key(r: &crate::config::ResolvedLlmConfig) -> Option<String> {
+    r.api_key.as_ref().map(|k| k.expose().to_string())
 }
 
 impl OmlxExtractor {
+    /// Local, unauthenticated client (pre-v1.5 behaviour). Tests and the
+    /// override path use this; production code goes through `from_resolved`.
     pub fn new(endpoint: String, model: String, disable_thinking: bool) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
@@ -524,6 +535,41 @@ impl OmlxExtractor {
             endpoint,
             model,
             disable_thinking,
+            provider_name: "omlx".to_string(),
+            api_key: None,
+            auth_header: crate::vendors::AuthHeader::Bearer,
+        }
+    }
+
+    pub fn with_auth(
+        mut self,
+        provider_name: String,
+        api_key: Option<String>,
+        auth_header: crate::vendors::AuthHeader,
+    ) -> Self {
+        self.provider_name = provider_name;
+        self.api_key = api_key;
+        self.auth_header = auth_header;
+        self
+    }
+
+    /// Build from a resolver result: endpoint, model, `/no_think`, vendor
+    /// name, key and header all come from `r`.
+    pub fn from_resolved(r: &crate::config::ResolvedLlmConfig) -> Self {
+        Self::new(r.endpoint.clone(), r.model.clone(), r.disable_thinking).with_auth(
+            r.provider_name.clone(),
+            resolved_api_key(r),
+            r.auth_header,
+        )
+    }
+
+    fn authed(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.api_key {
+            Some(key) => rb.header(
+                self.auth_header.header_name(),
+                self.auth_header.header_value(key),
+            ),
+            None => rb,
         }
     }
 
@@ -593,8 +639,7 @@ impl OmlxExtractor {
         // rejection" behavior.
         let text_body = if !prefer_json {
             let resp = self
-                .client
-                .post(&url)
+                .authed(self.client.post(&url))
                 .json(&make_body(false))
                 .send()
                 .await?;
@@ -609,13 +654,17 @@ impl OmlxExtractor {
             }
             body
         } else {
-            match self.client.post(&url).json(&make_body(true)).send().await {
+            match self
+                .authed(self.client.post(&url))
+                .json(&make_body(true))
+                .send()
+                .await
+            {
                 Ok(resp) if resp.status().is_success() => resp.text().await?,
                 _ => {
                     tracing::info!("OMLX JSON mode failed, retrying without response_format");
                     let resp = self
-                        .client
-                        .post(&url)
+                        .authed(self.client.post(&url))
                         .json(&make_body(false))
                         .send()
                         .await?;
@@ -879,20 +928,12 @@ pub fn create_extractor(config: &ReinConfig) -> Option<ExtractorKind> {
             // `config.extract.google.api_key`, which `load()` only
             // populates from `GEMINI_API_KEY` — operators with custom
             // env vars were silently disabled.
-            let api_key = r
-                .api_key_env
-                .as_deref()
-                .and_then(|env_name| std::env::var(env_name).ok())
-                .or_else(|| config.extract.google.api_key.clone())?;
+            let api_key = resolved_api_key(&r).or_else(|| config.extract.google.api_key.clone())?;
             Some(ExtractorKind::Gemini(GeminiExtractor::new(
                 api_key, r.endpoint, r.model,
             )))
         }
-        Provider::Omlx => Some(ExtractorKind::Omlx(OmlxExtractor::new(
-            r.endpoint,
-            r.model,
-            config.extract.omlx.disable_thinking.unwrap_or(true),
-        ))),
+        Provider::Omlx => Some(ExtractorKind::Omlx(OmlxExtractor::from_resolved(&r))),
         Provider::None => None,
     }
 }
@@ -912,20 +953,12 @@ pub fn create_memory_worker_extractor(config: &ReinConfig) -> Option<ExtractorKi
         Provider::Google => {
             // Codex R2 P2 fix — honor resolver's api_key_env (mirror of
             // create_extractor fix above).
-            let api_key = r
-                .api_key_env
-                .as_deref()
-                .and_then(|env_name| std::env::var(env_name).ok())
-                .or_else(|| config.extract.google.api_key.clone())?;
+            let api_key = resolved_api_key(&r).or_else(|| config.extract.google.api_key.clone())?;
             Some(ExtractorKind::Gemini(GeminiExtractor::new(
                 api_key, r.endpoint, r.model,
             )))
         }
-        Provider::Omlx => Some(ExtractorKind::Omlx(OmlxExtractor::new(
-            r.endpoint,
-            r.model,
-            config.extract.omlx.disable_thinking.unwrap_or(true),
-        ))),
+        Provider::Omlx => Some(ExtractorKind::Omlx(OmlxExtractor::from_resolved(&r))),
         Provider::None => None,
     }
 }
@@ -1989,5 +2022,86 @@ mod tests {
             assert!(!mem.summary.is_empty());
             assert!(!mem.content.is_empty());
         }
+    }
+
+    fn chat_ok_body(content: &str) -> String {
+        serde_json::json!({"choices": [{"message": {"content": content}}]}).to_string()
+    }
+
+    #[tokio::test]
+    async fn omlx_extractor_sends_bearer_when_key_present() {
+        let stub =
+            crate::stub_http::StubServer::start(vec![(200, chat_ok_body("HIT: yes\nWHY: ok"))]);
+        let ex = OmlxExtractor::new(stub.url.clone(), "m".into(), false).with_auth(
+            "openai".into(),
+            Some("sk-test".into()),
+            crate::vendors::AuthHeader::Bearer,
+        );
+        let out = ex
+            .call_and_extract_content_text("hello", "sys")
+            .await
+            .unwrap();
+        assert_eq!(out, "HIT: yes\nWHY: ok");
+        let req = &stub.requests()[0];
+        assert_eq!(req.path, "/chat/completions");
+        assert_eq!(req.header("authorization"), Some("Bearer sk-test"));
+        assert_eq!(req.json()["model"], "m");
+    }
+
+    #[tokio::test]
+    async fn omlx_extractor_sends_custom_header_and_no_header_without_key() {
+        let stub = crate::stub_http::StubServer::start(vec![
+            (200, chat_ok_body("a")),
+            (200, chat_ok_body("b")),
+        ]);
+        let ex = OmlxExtractor::new(stub.url.clone(), "m".into(), false).with_auth(
+            "azure".into(),
+            Some("az-key".into()),
+            crate::vendors::AuthHeader::ApiKey,
+        );
+        ex.call_and_extract_content_text("x", "s").await.unwrap();
+        let local = OmlxExtractor::new(stub.url.clone(), "m".into(), true);
+        local.call_and_extract_content_text("x", "s").await.unwrap();
+        let reqs = stub.requests();
+        assert_eq!(reqs[0].header("api-key"), Some("az-key"));
+        assert!(reqs[0].header("authorization").is_none());
+        assert!(reqs[1].header("api-key").is_none());
+        assert!(reqs[1].header("authorization").is_none());
+        let sys0 = reqs[0].json()["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let sys1 = reqs[1].json()["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!sys0.starts_with("/no_think"));
+        assert!(sys1.starts_with("/no_think"));
+    }
+
+    #[test]
+    fn resolved_api_key_exposes_the_secret_once() {
+        let mut r = crate::config::ReinConfig::default()
+            .resolve_llm_for("extract")
+            .unwrap();
+        // The test process may carry GEMINI_API_KEY; start from a known state.
+        r.api_key = None;
+        assert_eq!(resolved_api_key(&r), None);
+        r.api_key = Some(crate::config::SecretString::new("real".into()));
+        assert_eq!(resolved_api_key(&r).as_deref(), Some("real"));
+    }
+
+    #[test]
+    fn from_resolved_copies_provider_name_and_auth() {
+        let cfg = crate::config::ReinConfig::load_from_str(
+            "[extract]\nprovider = \"perplexity\"\n[extract.openai]\nmodel = \"perplexity/kimi-k3\"\nauth_header = \"x-api-key\"\n",
+        )
+        .unwrap();
+        let r = cfg.resolve_llm_for("extract").unwrap();
+        let ex = OmlxExtractor::from_resolved(&r);
+        assert_eq!(ex.provider_name, "perplexity");
+        assert_eq!(ex.endpoint, "https://api.perplexity.ai/router/v1");
+        assert_eq!(ex.auth_header, crate::vendors::AuthHeader::XApiKey);
+        assert!(!ex.disable_thinking);
     }
 }

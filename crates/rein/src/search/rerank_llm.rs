@@ -98,15 +98,29 @@ struct OmlxReranker {
     endpoint: String,
     model: String,
     disable_thinking: bool,
+    api_key: Option<String>,
+    auth_header: crate::vendors::AuthHeader,
 }
 
 impl OmlxReranker {
-    fn new(endpoint: String, model: String, disable_thinking: bool) -> Self {
+    fn from_resolved(r: &crate::config::ResolvedLlmConfig) -> Self {
         Self {
             client: crate::search::cache::http_client_20s(),
-            endpoint,
-            model,
-            disable_thinking,
+            endpoint: r.endpoint.clone(),
+            model: r.model.clone(),
+            disable_thinking: r.disable_thinking,
+            api_key: crate::extract::llm::resolved_api_key(r),
+            auth_header: r.auth_header,
+        }
+    }
+
+    fn authed(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.api_key {
+            Some(key) => rb.header(
+                self.auth_header.header_name(),
+                self.auth_header.header_value(key),
+            ),
+            None => rb,
         }
     }
 
@@ -135,13 +149,17 @@ impl OmlxReranker {
             body
         };
 
-        let text_body = match self.client.post(&url).json(&make_body(true)).send().await {
+        let text_body = match self
+            .authed(self.client.post(&url))
+            .json(&make_body(true))
+            .send()
+            .await
+        {
             Ok(resp) if resp.status().is_success() => resp.text().await?,
             _ => {
                 tracing::info!("OMLX rerank JSON mode failed, retrying without response_format");
                 let resp = self
-                    .client
-                    .post(&url)
+                    .authed(self.client.post(&url))
                     .json(&make_body(false))
                     .send()
                     .await?;
@@ -194,20 +212,13 @@ fn create_reranker(config: &ReinConfig) -> Option<RerankerKind> {
             // Codex R2 P2 fix — honor resolver's api_key_env first, fall back
             // to the v0.26.x `[query_expansion.google].api_key` location for
             // back-compat with operators not migrated to `[llm]`.
-            let api_key = r
-                .api_key_env
-                .as_deref()
-                .and_then(|env_name| std::env::var(env_name).ok())
+            let api_key = crate::extract::llm::resolved_api_key(&r)
                 .or_else(|| config.query_expansion.google.api_key.clone())?;
             Some(RerankerKind::Gemini(GeminiReranker::new(
                 api_key, r.endpoint, r.model,
             )))
         }
-        Provider::Omlx => Some(RerankerKind::Omlx(OmlxReranker::new(
-            r.endpoint,
-            r.model,
-            config.query_expansion.omlx.disable_thinking.unwrap_or(true),
-        ))),
+        Provider::Omlx => Some(RerankerKind::Omlx(OmlxReranker::from_resolved(&r))),
         Provider::None => None,
     }
 }
