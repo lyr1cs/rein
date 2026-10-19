@@ -71,22 +71,14 @@ pub fn extract_date_keywords(content: &str) -> Vec<String> {
                 let rest = &lower[search_from..];
                 let rest = rest.trim_start();
 
-                // Parse day number
-                let mut day_digits = String::new();
-                for ch in rest.chars() {
-                    if ch.is_ascii_digit() {
-                        day_digits.push(ch);
-                        if day_digits.len() == 2 {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-
-                if day_digits.is_empty() {
+                // Parse day number: the whole numeric token, so "March 2025"
+                // (a month-year) is not read as day 20 + year-less remainder
+                // and stamped with a fabricated current-year date.
+                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if digits.is_empty() || digits.len() > 2 {
                     continue;
                 }
+                let day_digits = digits;
 
                 let day: u32 = day_digits.parse().unwrap_or(0);
                 if !(1..=31).contains(&day) {
@@ -330,6 +322,14 @@ mod tests {
         assert_eq!(dates.len(), 1);
         assert!(dates[0].starts_with("date:"));
         assert!(dates[0].ends_with("-01-03"));
+    }
+
+    #[test]
+    fn month_year_does_not_fabricate_a_day() {
+        assert!(extract_date_keywords("Released in March 2025").is_empty());
+        assert!(extract_date_keywords("since Jan 2024 the API changed").is_empty());
+        let dates = extract_date_keywords("shipped on March 15th, 2025");
+        assert_eq!(dates, vec!["date:2025-03-15".to_string()]);
     }
 
     #[test]

@@ -161,14 +161,18 @@ fn month_from_str(name: &str) -> Option<u32> {
 /// Convert a unit string ("day"/"week"/...) into a chrono `Duration`.
 /// Months and years use 30/365-day approximations — good enough for
 /// dedup-driven supersede decisions.
-fn unit_duration(unit: &str, n: i64) -> Duration {
-    match unit {
-        "day" | "days" | "天" => Duration::days(n),
-        "week" | "weeks" | "周" => Duration::days(n * 7),
-        "month" | "months" | "月" => Duration::days(n * 30),
-        "year" | "years" | "年" => Duration::days(n * 365),
-        _ => Duration::days(n), // bootstrap: unknown unit defaults to day
-    }
+///
+/// Returns `None` when the span is not representable (`9223372036854775807
+/// days ago` used to panic inside `Duration::days` and abort the store call).
+fn unit_duration(unit: &str, n: i64) -> Option<Duration> {
+    let per_unit: i64 = match unit {
+        "day" | "days" | "天" => 1,
+        "week" | "weeks" | "周" => 7,
+        "month" | "months" | "月" => 30,
+        "year" | "years" | "年" => 365,
+        _ => 1, // bootstrap: unknown unit defaults to day
+    };
+    Duration::try_days(n.checked_mul(per_unit)?)
 }
 
 /// Resolve the prior ISO week (Mon..=Sun) relative to `now`. Returns
@@ -379,10 +383,16 @@ pub fn extract_temporal_rule_based(content: &str, now: DateTime<Utc>) -> Vec<Tem
         }
         let unit = &cap[2];
         let now_floor = floor_to_day(now);
-        let dur = unit_duration(unit, n);
-        let prev_unit = unit_duration(unit, n - 1);
-        let start = now_floor - dur;
-        let end = now_floor - prev_unit;
+        let (Some(dur), Some(prev_unit)) = (unit_duration(unit, n), unit_duration(unit, n - 1))
+        else {
+            continue;
+        };
+        let (Some(start), Some(end)) = (
+            now_floor.checked_sub_signed(dur),
+            now_floor.checked_sub_signed(prev_unit),
+        ) else {
+            continue;
+        };
         anchors.push(TemporalAnchor {
             kind: AnchorKind::Relative,
             start: Some(start),
@@ -411,10 +421,16 @@ pub fn extract_temporal_rule_based(content: &str, now: DateTime<Utc>) -> Vec<Tem
         }
         let unit = cap[2].to_lowercase();
         let now_floor = floor_to_day(now);
-        let dur = unit_duration(&unit, n);
-        let prev_dur = unit_duration(&unit, n - 1);
-        let start = now_floor - dur;
-        let end = now_floor - prev_dur;
+        let (Some(dur), Some(prev_dur)) = (unit_duration(&unit, n), unit_duration(&unit, n - 1))
+        else {
+            continue;
+        };
+        let (Some(start), Some(end)) = (
+            now_floor.checked_sub_signed(dur),
+            now_floor.checked_sub_signed(prev_dur),
+        ) else {
+            continue;
+        };
         anchors.push(TemporalAnchor {
             kind: AnchorKind::Relative,
             start: Some(start),
@@ -438,10 +454,18 @@ pub fn extract_temporal_rule_based(content: &str, now: DateTime<Utc>) -> Vec<Tem
         }
         let unit = cap[2].to_lowercase();
         let now_floor = floor_to_day(now);
-        let dur = unit_duration(&unit, n);
-        let next_dur = unit_duration(&unit, n + 1);
-        let start = now_floor + dur;
-        let end = now_floor + next_dur;
+        let (Some(dur), Some(next_dur)) = (
+            unit_duration(&unit, n),
+            n.checked_add(1).and_then(|m| unit_duration(&unit, m)),
+        ) else {
+            continue;
+        };
+        let (Some(start), Some(end)) = (
+            now_floor.checked_add_signed(dur),
+            now_floor.checked_add_signed(next_dur),
+        ) else {
+            continue;
+        };
         anchors.push(TemporalAnchor {
             kind: AnchorKind::Relative,
             start: Some(start),
@@ -1117,6 +1141,27 @@ mod tests {
         assert_eq!(anchors[0].kind, AnchorKind::Relative);
         assert_eq!(anchors[0].start, Some(dt(2026, 4, 24)));
         assert_eq!(anchors[0].end, Some(dt(2026, 4, 25)));
+    }
+
+    #[test]
+    fn unrepresentable_relative_spans_are_skipped_not_panicked() {
+        for text in [
+            "9223372036854775807 days ago we deployed",
+            "in 9223372036854775807 years we will see",
+            "it was 99999999999 years ago",
+            "9223372036854775807天前 上线",
+        ] {
+            let anchors = extract_temporal_rule_based(text, fixed_now());
+            assert!(
+                anchors.iter().all(|a| a.start.is_some() || a.end.is_some()),
+                "{text}"
+            );
+        }
+        // Ordinary spans still resolve.
+        assert_eq!(
+            extract_temporal_rule_based("2 days ago we deployed", fixed_now()).len(),
+            1
+        );
     }
 
     #[test]

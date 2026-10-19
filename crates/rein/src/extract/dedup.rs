@@ -1047,6 +1047,30 @@ fn maybe_temporal_supersede(
     ))
 }
 
+/// `vec_memories` rows are comparable with a cached vector only when the
+/// table is stamped for the same `model:dims`. After a same-dimension model
+/// swap whose migration has not completed, the rows are still old-model
+/// vectors; a cosine against a new-model vector is meaningless and used to
+/// authorize merges / supersedes (2026-10 audit U10-01). An unstamped
+/// (legacy) table carries no evidence of a mismatch and stays usable.
+fn stored_vectors_match_model(store: &SqliteStore, model: &str, dims: usize) -> bool {
+    use rusqlite::OptionalExtension;
+    let stamped: Option<String> = store
+        .conn()
+        .query_row(
+            "SELECT value FROM metadata WHERE key = ?1",
+            rusqlite::params![crate::store::schema::VEC_ROWS_PROVENANCE_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    match stamped {
+        Some(stamp) => stamp == format!("{model}:{dims}"),
+        None => true,
+    }
+}
+
 /// Look up embedding-based candidates for cross-topic dedup (zero API cost).
 /// Only uses cached embeddings — never triggers an embedding API call.
 /// Accepts a pre-resolved `model` name to avoid re-loading config on every call.
@@ -1061,6 +1085,9 @@ fn embedding_candidate_lookup(
     let emb = crate::embed::EmbedCache::get(store.conn(), &enriched, model)
         .ok()
         .flatten()?;
+    if !stored_vectors_match_model(store, model, emb.len()) {
+        return None;
+    }
     let results = crate::store::vec::search_vec(store.conn(), &emb, None, 5).ok()?;
     // A1: use the global shadow suggestion minus margin as a non-destructive
     // candidate-generation floor. The later merge decision still resolves a
@@ -1100,6 +1127,9 @@ fn embedding_cosine_check(
     let new_emb = crate::embed::EmbedCache::get(store.conn(), &enriched, model)
         .ok()
         .flatten()?;
+    if !stored_vectors_match_model(store, model, new_emb.len()) {
+        return None;
+    }
     // Check if candidate has a stored embedding
     let cand_emb: Vec<f32> = {
         let blob: Vec<u8> = store
@@ -1265,6 +1295,36 @@ mod tests {
             updated_at: Utc::now(),
             last_accessed: Utc::now(),
         }
+    }
+
+    #[test]
+    fn cached_vector_from_another_model_never_authorizes_vector_dedup() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::new(&dir.path().join("dedup-prov.db"), "model-a", 3).unwrap();
+        let mut candidate = test_memory("topic", "the candidate memory body");
+        candidate.embedding = Some(vec![1.0, 0.0, 0.0]);
+        let cand_id = candidate.id.clone();
+        store.store(candidate).unwrap();
+        // The table is now stamped "model-a:3". A model-b vector for the
+        // incoming text sits in the cache (same dimensions).
+        let enriched = crate::embed::prepend_metadata("topic", "sum", "incoming text");
+        crate::embed::EmbedCache::put(store.conn(), &enriched, "model-b", &[1.0, 0.0, 0.0])
+            .unwrap();
+        crate::embed::EmbedCache::put(store.conn(), &enriched, "model-a", &[1.0, 0.0, 0.0])
+            .unwrap();
+        assert!(
+            embedding_cosine_check(&store, "sum", "incoming text", &cand_id, "model-b", "topic")
+                .is_none(),
+            "cross-model cosine must not be used"
+        );
+        assert!(
+            embedding_candidate_lookup(&store, "sum", "incoming text", "model-b", "topic")
+                .is_none()
+        );
+        let sim =
+            embedding_cosine_check(&store, "sum", "incoming text", &cand_id, "model-a", "topic")
+                .expect("same-model vectors compare");
+        assert!((sim - 1.0).abs() < 1e-5);
     }
 
     #[test]

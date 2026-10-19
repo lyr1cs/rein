@@ -776,6 +776,30 @@ fn run_vec_dedup_inner(
             );
             continue;
         };
+        // 2026-10 audit U13-01: an earlier row of this same batch may have
+        // merged INTO this one (changing its content, deleting its vector
+        // and re-flagging it). The embedding above was computed from the
+        // pre-merge text; inserting it into HNSW and clearing the flag would
+        // leave the merged row with a stale vector and no retry. Leave such
+        // rows flagged for the next sweep.
+        {
+            use rusqlite::OptionalExtension;
+            let current: Option<String> = conn
+                .query_row(
+                    "SELECT content FROM memories WHERE id = ?1",
+                    rusqlite::params![id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .ok()
+                .flatten();
+            if current.as_deref() != Some(content.as_str()) {
+                tracing::debug!(
+                    "vec_dedup: {id} changed since its embedding was computed; preserving flag for retry"
+                );
+                continue;
+            }
+        }
 
         // Codex round-5 H-3: `apply_resummerize` evicts the stale HNSW
         // entry so recall doesn't serve pre-rewrite semantics; after
@@ -1170,13 +1194,17 @@ pub fn run_dedup_scoped(
 
                     if matches!(relation, DedupRelation::Duplicate | DedupRelation::Update) {
                         dups_found += 1;
-                        // Determine winner (longer/newer) and loser
-                        let (winner_idx, loser_idx) =
-                            if mems[j].content.len() >= mems[i].content.len() {
-                                (j, i)
-                            } else {
-                                (i, j)
-                            };
+                        // Determine winner and loser. The LLM saw `mems[i]`
+                        // as Text A and `mems[j]` as Text B, and `Update`
+                        // means "B materially updates or supersedes A"
+                        // (extract/llm.rs verdict contract): B must win
+                        // regardless of length, or the obsolete longer text
+                        // becomes canonical over its own replacement
+                        // (2026-10 audit U13-02). Duplicates keep the
+                        // longer-wins rule.
+                        let b_wins = matches!(relation, DedupRelation::Update)
+                            || mems[j].content.len() >= mems[i].content.len();
+                        let (winner_idx, loser_idx) = if b_wins { (j, i) } else { (i, j) };
                         if dry_run {
                             tracing::debug!(
                                 "dup: '{}' ~ '{}'",
