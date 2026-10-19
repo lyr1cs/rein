@@ -1056,10 +1056,12 @@ pub(crate) fn database_lock_path(db_path: &std::path::Path, suffix: &str) -> std
 /// exclusively created sentinel file, removed on drop. A sentinel older than
 /// [`crate::ops::pipeline_run::PIPELINE_RUN_STALE_RUNNING_MS`] is treated as
 /// left behind by a crashed pass and taken over.
+#[cfg_attr(unix, allow(dead_code))]
 pub(crate) struct SentinelLock {
     path: std::path::PathBuf,
 }
 
+#[cfg_attr(unix, allow(dead_code))]
 impl SentinelLock {
     pub(crate) fn try_acquire(
         path: &std::path::Path,
@@ -1091,34 +1093,72 @@ impl SentinelLock {
                     path = %path.display(),
                     "adaptive pipeline: taking over an abandoned single-flight sentinel"
                 );
-                // Claim the abandoned sentinel atomically (codex round-21
-                // P1): `rename` succeeds for exactly one contender. A peer
-                // that lost the rename sees NotFound and must not remove
-                // anything — by then the file at `path` may already be the
-                // winner's fresh sentinel — it just tries `create_new`,
-                // which fails once the winner has re-created it.
-                let claim = path.with_file_name(format!(
-                    "{}.stale.{}",
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("sentinel"),
-                    std::process::id()
-                ));
-                match std::fs::rename(path, &claim) {
-                    Ok(()) => {
-                        let _ = std::fs::remove_file(&claim);
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e),
-                }
-                match Self::create(path) {
-                    Ok(lock) => Ok(Some(lock)),
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
-                    Err(e) => Err(e),
-                }
+                Self::take_over_abandoned(path, now)
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Second half of a takeover, after the caller decided the sentinel at
+    /// `path` is abandoned. The claim is atomic (codex round-21 P1):
+    /// `rename` succeeds for exactly one contender, and a peer that lost it
+    /// sees NotFound and removes nothing. The decision itself can be stale by
+    /// the time the rename lands — a peer may have taken the abandoned file
+    /// over and re-created a fresh sentinel in between — so the claimed file
+    /// is inspected again: a claim that turns out to be a live holder's fresh
+    /// sentinel is put back and this contender yields instead of entering
+    /// alongside the holder. Residual window on these non-`flock` platforms:
+    /// a third contender creating its sentinel between the rename and the
+    /// restore is overwritten by the restore where `rename` replaces its
+    /// target.
+    fn take_over_abandoned(
+        path: &std::path::Path,
+        now: std::time::SystemTime,
+    ) -> std::io::Result<Option<Self>> {
+        let claim = path.with_file_name(format!(
+            "{}.stale.{}",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("sentinel"),
+            std::process::id()
+        ));
+        match std::fs::rename(path, &claim) {
+            Ok(()) => {
+                if Self::is_live(&claim, now) {
+                    let _ = std::fs::rename(&claim, path);
+                    return Ok(None);
+                }
+                let _ = std::fs::remove_file(&claim);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        match Self::create(path) {
+            Ok(lock) => Ok(Some(lock)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whether the sentinel at `path` belongs to a live holder: refreshed
+    /// within the stale threshold, or recorded by a process that is alive.
+    fn is_live(path: &std::path::Path, now: std::time::SystemTime) -> bool {
+        let stale_after = std::time::Duration::from_millis(
+            crate::ops::pipeline_run::PIPELINE_RUN_STALE_RUNNING_MS as u64,
+        );
+        let fresh = std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .is_some_and(|modified| match now.duration_since(modified) {
+                Ok(age) => age <= stale_after,
+                // Modified after `now`: written by a peer this instant.
+                Err(_) => true,
+            });
+        let holder_alive = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u32>().ok())
+            .is_some_and(process_is_alive);
+        fresh || holder_alive
     }
 
     fn create(path: &std::path::Path) -> std::io::Result<Self> {
@@ -1151,6 +1191,7 @@ impl SentinelLock {
 /// Whether `pid` is a running process. Unix uses `kill(pid, 0)` (EPERM
 /// still means alive); elsewhere the answer is unknown and treated as dead,
 /// so the heartbeat is the only protection for long holders there.
+#[cfg_attr(unix, allow(dead_code))]
 fn process_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
@@ -1170,7 +1211,74 @@ fn process_is_alive(pid: u32) -> bool {
 
 impl Drop for SentinelLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Remove only a sentinel recorded by this process: a file that a
+        // peer re-created at the same path meanwhile is theirs to remove.
+        let ours = std::fs::read_to_string(&self.path)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u32>().ok())
+            == Some(std::process::id());
+        if ours {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Cross-process single-flight guard for a long operation (a reindex). Unix
+/// holds an exclusive `flock` on the lock file for the guard's lifetime: the
+/// kernel releases it when the holder exits or dies, so no staleness
+/// heuristic, heartbeat or takeover is involved, and the file is left in
+/// place (unlinking it would let a waiter lock a dead inode while a newcomer
+/// locks the fresh one). Platforms without `flock` fall back to the
+/// [`SentinelLock`] sentinel.
+pub(crate) struct SingleFlightLock {
+    #[cfg(unix)]
+    _file: std::fs::File,
+    #[cfg(not(unix))]
+    sentinel: SentinelLock,
+}
+
+impl SingleFlightLock {
+    pub(crate) fn try_acquire(
+        path: &std::path::Path,
+        now: std::time::SystemTime,
+    ) -> std::io::Result<Option<Self>> {
+        #[cfg(unix)]
+        {
+            let _ = now;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(path)?;
+            use std::os::fd::AsRawFd;
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                return if err.kind() == std::io::ErrorKind::WouldBlock {
+                    Ok(None)
+                } else {
+                    Err(err)
+                };
+            }
+            // The holder's pid is recorded for diagnostics only; the lock
+            // itself is the kernel's.
+            use std::io::Write;
+            let _ = file.set_len(0);
+            let _ = write!(&file, "{}", std::process::id());
+            Ok(Some(Self { _file: file }))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(SentinelLock::try_acquire(path, now)?.map(|sentinel| Self { sentinel }))
+        }
+    }
+
+    /// Heartbeat for the sentinel fallback; a no-op where the kernel lock
+    /// carries liveness.
+    pub(crate) fn touch(&self) {
+        #[cfg(not(unix))]
+        self.sentinel.touch();
     }
 }
 
@@ -4662,7 +4770,16 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
     // events pin the cursor forever and starve later feedback events
     // behind the peek-window limit.
     let raw_access_max = raw_access_events.last().map(|e| e.id);
-    let raw_recall_max = raw_recall_events.last().map(|e| e.id);
+    // Replay-only drain target for the access stream (same rule as the
+    // recall stream below): the highest peeked id already covered by the
+    // durable watermark. The main path falls back to this, never to the raw
+    // peek max, so a post-water feedback event that is deliberately left in
+    // place (its recall has not been peeked yet) is not skipped.
+    let access_replay_drain_id = raw_access_events
+        .iter()
+        .filter(|e| e.id <= prior_access_water)
+        .map(|e| e.id)
+        .max();
     // Replay-only drain target for the recall stream: the highest event
     // id that's STRICTLY ≤ the durable watermark in the weights row
     // (i.e., already applied to a prior cycle's gradient). Early-return
@@ -4753,35 +4870,124 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
     // coordinating its dual access/recall consumer offsets (a first-class
     // negative event), deliberately deferred to a future slice rather than
     // special-cased into this replay machinery.
-    let used_ids: std::collections::HashSet<String> = feedback_events
+    // Feedback events carrying a memory id are the training signal. A
+    // feedback event without one is evaluated and consumed but never drives
+    // a gradient.
+    let signal_events: Vec<&crate::store::adaptive::StoredEvent> = feedback_events
         .iter()
-        .filter_map(|e| e.memory_id.clone())
+        .copied()
+        .filter(|e| e.memory_id.is_some())
         .collect();
 
-    if used_ids.is_empty() {
+    if signal_events.is_empty() {
         early_return_commit(conn);
         return;
     }
 
-    // Same raw-vs-filtered split as the access stream — `recall_max_id`
-    // drives the watermark bump (only events whose gradient was applied
-    // count); `recall_offset_id` drives the consumer offset (must
-    // advance past already-applied replays too). Recall events were
-    // peeked up front for the early-return drain logic above; here we
-    // consume them for the actual gradient computation.
+    // Recall events were peeked up front for the early-return drain logic
+    // above; here we consume them for the actual gradient computation.
     let recall_events: Vec<_> = raw_recall_events
         .into_iter()
         .filter(|e| e.id > prior_recall_water)
         .collect();
-    let recall_max_id = recall_events.last().map(|e| e.id);
-    let recall_offset_id = recall_max_id.or(raw_recall_max);
 
-    // Build training pairs: for each recall, which candidates were used (positive) vs not (negative)
-    // (`weights` already loaded above to capture prior watermarks)
+    // Join every feedback event to the recall it answers. A `request_id` on
+    // both sides is the strong key; when either side lacks one, fall back to
+    // the same 10-minute window the M2 learner uses. Feedback is never
+    // pooled across requests: a memory used for one request says nothing
+    // about another request that merely listed it as a candidate, and a
+    // recall nobody reported on carries no labels at all.
+    let parse_ts = |ts: &str| {
+        chrono::DateTime::parse_from_rfc3339(ts)
+            .ok()
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+    };
+    let correlates = |feedback: &crate::store::adaptive::StoredEvent,
+                      recall: &crate::store::adaptive::StoredEvent|
+     -> bool {
+        match (feedback.request_id.as_deref(), recall.request_id.as_deref()) {
+            (Some(f), Some(r)) => f == r,
+            _ => match (parse_ts(&feedback.ts), parse_ts(&recall.ts)) {
+                (Some(f), Some(r)) => (f - r).num_seconds().abs() < 600,
+                _ => false,
+            },
+        }
+    };
+    let now = chrono::Utc::now();
+    let expired = |event: &crate::store::adaptive::StoredEvent| {
+        parse_ts(&event.ts).is_some_and(|ts| now - ts > chrono::Duration::hours(24))
+    };
+    let recall_positives: Vec<Option<std::collections::HashSet<String>>> = recall_events
+        .iter()
+        .map(|recall| {
+            let mut positives = std::collections::HashSet::new();
+            let mut answered = false;
+            for feedback in &signal_events {
+                if correlates(feedback, recall) {
+                    answered = true;
+                    if let Some(memory_id) = &feedback.memory_id {
+                        positives.insert(memory_id.clone());
+                    }
+                }
+            }
+            answered.then_some(positives)
+        })
+        .collect();
+
+    // Train, and advance the recall cursor through, only the contiguous
+    // id-order prefix of answered or expired (> 24 h) recalls. A live recall
+    // without feedback keeps its slot — its feedback may still arrive — and
+    // because nothing past it is trained now, no recall is ever trained
+    // twice across cycles. `recall_max_id` drives the watermark bump,
+    // `recall_offset_id` the consumer offset (which must also drain pure
+    // replays).
+    let mut trainable: Vec<(
+        &crate::store::adaptive::StoredEvent,
+        &std::collections::HashSet<String>,
+    )> = Vec::new();
+    let mut advanced_recalls: Vec<&crate::store::adaptive::StoredEvent> = Vec::new();
+    for (recall, positives) in recall_events.iter().zip(&recall_positives) {
+        match positives {
+            Some(set) => trainable.push((recall, set)),
+            None if expired(recall) => {}
+            None => break,
+        }
+        advanced_recalls.push(recall);
+    }
+    let recall_max_id = advanced_recalls.last().map(|e| e.id);
+    let recall_offset_id = recall_max_id.or(recall_replay_drain_id);
+
+    // The access cursor likewise advances through the contiguous prefix of
+    // access events that are not a training signal, that answer a recall
+    // advanced above, or that are older than the expiry (their recall can
+    // never be trained). It stops at the first live feedback event whose
+    // recall has not been seen — typically one sitting behind the recall
+    // peek window — so that feedback is still there when its recall is.
+    let mut access_prefix_last: Option<i64> = None;
+    for event in &events {
+        let is_signal = signal_events.iter().any(|signal| signal.id == event.id);
+        let consumable = !is_signal
+            || expired(event)
+            || advanced_recalls
+                .iter()
+                .any(|recall| correlates(event, recall));
+        if !consumable {
+            break;
+        }
+        access_prefix_last = Some(event.id);
+    }
+    let weights_max_id = access_prefix_last;
+    let access_offset_id = weights_max_id.or(access_replay_drain_id);
+    let access_offset_pair: Option<(&str, i64)> =
+        access_offset_id.map(|id| ("reranker_weights", id));
+
+    // Build training pairs: for each answered recall, which candidates were
+    // used (positive) vs not (negative). (`weights` already loaded above to
+    // capture prior watermarks.)
     let lr: f32 = 0.005;
     let mut updates = 0;
 
-    for event in &recall_events {
+    for (event, positives) in &trainable {
         let payload = match event
             .payload
             .as_deref()
@@ -4831,8 +5037,8 @@ fn run_reranker_weight_learning(store: &SqliteStore) {
                 })
                 .unwrap_or(0.0);
 
-            // Target: 1.0 if used by agent, 0.0 if not
-            let target = if used_ids.contains(id) { 1.0_f32 } else { 0.0 };
+            // Target: 1.0 if used by the agent for THIS request, 0.0 if not
+            let target = if positives.contains(id) { 1.0_f32 } else { 0.0 };
             let predicted = weights.w_fts * bm25
                 + weights.w_vec * vec
                 + weights.w_kg * kg
@@ -5983,6 +6189,41 @@ mod tests {
         assert_eq!(adaptive_pipeline_lock_path(&dotted), via_real);
     }
 
+    /// The reindex guard is an OS lock on unix: exclusive across open file
+    /// descriptions, released by the kernel on drop (or death) with no age
+    /// heuristic in either direction, and the file stays on disk.
+    #[cfg(unix)]
+    #[test]
+    fn single_flight_lock_is_exclusive_and_needs_no_staleness_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reindex.lock");
+        let now = std::time::SystemTime::now();
+        let far_future = now
+            + std::time::Duration::from_millis(
+                crate::ops::pipeline_run::PIPELINE_RUN_STALE_RUNNING_MS as u64 + 60_000,
+            );
+        let first = SingleFlightLock::try_acquire(&path, now)
+            .unwrap()
+            .expect("first acquire succeeds");
+        assert!(SingleFlightLock::try_acquire(&path, now).unwrap().is_none());
+        assert!(
+            SingleFlightLock::try_acquire(&path, far_future)
+                .unwrap()
+                .is_none(),
+            "age never overrides a held kernel lock"
+        );
+        drop(first);
+        assert!(path.exists(), "the lock file is left in place");
+        // A file left behind by a dead holder carries no lock: taken at once.
+        std::fs::write(&path, b"999999999").unwrap();
+        let again = SingleFlightLock::try_acquire(&path, now).unwrap();
+        assert!(again.is_some());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            std::process::id().to_string()
+        );
+    }
+
     #[test]
     fn sentinel_lock_is_exclusive_released_on_drop_and_takes_over_stale_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -6042,6 +6283,36 @@ mod tests {
             "a fresh sentinel with a live holder is never taken over"
         );
         drop(winner);
+
+        // A contender whose "abandoned" decision is outdated — the file it
+        // renames is a live holder's fresh sentinel, not the stale one it
+        // inspected — must put the file back and yield (audit U14-02).
+        let holder = SentinelLock::try_acquire(&path, now).unwrap().unwrap();
+        let outdated = SentinelLock::take_over_abandoned(&path, far_future).unwrap();
+        assert!(
+            outdated.is_none(),
+            "a live holder's sentinel is never taken"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            std::process::id().to_string(),
+            "the holder's sentinel is restored in place"
+        );
+        let leftovers = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".stale."))
+            .count();
+        assert_eq!(leftovers, 0);
+        // The same protection by freshness alone: a sentinel written moments
+        // ago by a process this host cannot see is still live.
+        drop(holder);
+        std::fs::write(&path, b"999999999").unwrap();
+        assert!(SentinelLock::take_over_abandoned(&path, now)
+            .unwrap()
+            .is_none());
+        assert!(path.exists());
+        std::fs::remove_file(&path).unwrap();
 
         // An old sentinel whose holder is still alive (our own pid) is never
         // taken over, and a heartbeat makes it young again.
@@ -8944,6 +9215,173 @@ mod tests {
 
         assert!(after.w_canonical_support > before.w_canonical_support);
         assert!(after.w_source_diversity > before.w_source_diversity);
+    }
+
+    fn rerank_recall_event(request_id: &str, candidates: serde_json::Value) -> FeedbackEvent {
+        FeedbackEvent {
+            event_type: EventType::RecallComplete,
+            request_id: Some(request_id.to_string()),
+            memory_id: None,
+            concept_id: None,
+            query: Some("docker".into()),
+            query_type: Some("semantic".into()),
+            topic: None,
+            payload: Some(serde_json::json!({ "candidates": candidates })),
+        }
+    }
+
+    fn rerank_feedback_event(request_id: &str, memory_id: &str) -> FeedbackEvent {
+        FeedbackEvent {
+            event_type: EventType::RecallAccess,
+            request_id: Some(request_id.to_string()),
+            memory_id: Some(memory_id.to_string()),
+            concept_id: None,
+            query: None,
+            query_type: None,
+            topic: None,
+            payload: Some(serde_json::json!({ "source": "agent_feedback" })),
+        }
+    }
+
+    fn rerank_candidate(id: &str, bm25: f64, kg: f64) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "bm25_norm": bm25,
+            "vec_norm": 0.0,
+            "kg_norm": kg,
+            "episode_norm": 0.0,
+            "support_count": 0,
+            "source_diversity": 0.0
+        })
+    }
+
+    fn rerank_weights_tuple(store: &SqliteStore) -> [f32; 6] {
+        let w = crate::search::rerank::load_weights(store.conn());
+        [
+            w.w_fts,
+            w.w_vec,
+            w.w_kg,
+            w.w_episode,
+            w.w_canonical_support,
+            w.w_source_diversity,
+        ]
+    }
+
+    /// Feedback is joined to its own request. A second recall that merely
+    /// listed the used memory as a candidate — and that nobody reported on
+    /// — contributes nothing: the learned weights are identical to a run
+    /// where that recall never happened. (Before: every recall in the
+    /// window was labeled from one pooled set of used ids, so the second
+    /// recall trained its kg-only candidate as a positive.)
+    #[test]
+    fn test_reranker_feedback_is_attributed_per_request() {
+        let seed = |store: &SqliteStore, with_unanswered_recall: bool| {
+            emit(
+                store,
+                rerank_recall_event(
+                    "req-a",
+                    serde_json::json!([
+                        rerank_candidate("shared", 0.9, 0.0),
+                        rerank_candidate("only-a", 0.1, 0.0)
+                    ]),
+                ),
+            );
+            emit(store, rerank_feedback_event("req-a", "shared"));
+            if with_unanswered_recall {
+                emit(
+                    store,
+                    rerank_recall_event(
+                        "req-b",
+                        serde_json::json!([
+                            rerank_candidate("shared", 0.0, 0.9),
+                            rerank_candidate("only-b", 0.0, 0.1)
+                        ]),
+                    ),
+                );
+            }
+        };
+
+        let control = SqliteStore::in_memory().unwrap();
+        seed(&control, false);
+        let before = rerank_weights_tuple(&control);
+        run_reranker_weight_learning(&control);
+        let control_after = rerank_weights_tuple(&control);
+        assert!(
+            control_after[0] > before[0],
+            "the answered recall trains w_fts: {before:?} -> {control_after:?}"
+        );
+
+        let shared = SqliteStore::in_memory().unwrap();
+        seed(&shared, true);
+        run_reranker_weight_learning(&shared);
+        let shared_after = rerank_weights_tuple(&shared);
+        for (name, (a, b)) in ["fts", "vec", "kg", "episode", "support", "diversity"]
+            .iter()
+            .zip(control_after.iter().zip(shared_after.iter()))
+        {
+            assert!(
+                (a - b).abs() < 1e-9,
+                "w_{name} differs with an unanswered recall present: {a} vs {b}"
+            );
+        }
+    }
+
+    /// Feedback whose recall sits behind the 100-event recall peek window
+    /// is not consumed while its recall is unseen. Cycle 1 sees 100
+    /// expired, unanswered recalls and leaves the weights alone; cycle 2
+    /// peeks recall 101, joins the waiting feedback to it and learns.
+    /// (Before: cycle 1 trained recalls 1–100 as all-negative and consumed
+    /// the feedback, so recall 101 was never learned.)
+    #[test]
+    fn test_reranker_keeps_feedback_until_its_recall_is_peeked() {
+        let store = SqliteStore::in_memory().unwrap();
+        let mut last_stale_id = 0;
+        for i in 0..100 {
+            last_stale_id = emit(
+                &store,
+                rerank_recall_event(
+                    &format!("req-stale-{i}"),
+                    serde_json::json!([rerank_candidate(&format!("m-{i}"), 0.5, 0.5)]),
+                ),
+            );
+        }
+        let stale_ts = (chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339();
+        store
+            .conn()
+            .execute(
+                "UPDATE feedback_events SET ts = ?1 WHERE id <= ?2",
+                rusqlite::params![stale_ts, last_stale_id],
+            )
+            .unwrap();
+        emit(
+            &store,
+            rerank_recall_event(
+                "req-late",
+                serde_json::json!([
+                    rerank_candidate("used-late", 0.9, 0.0),
+                    rerank_candidate("unused-late", 0.1, 0.0)
+                ]),
+            ),
+        );
+        emit(&store, rerank_feedback_event("req-late", "used-late"));
+
+        let before = rerank_weights_tuple(&store);
+        run_reranker_weight_learning(&store);
+        let after_first = rerank_weights_tuple(&store);
+        assert_eq!(
+            before, after_first,
+            "no answered recall inside the first peek window: weights untouched"
+        );
+
+        run_reranker_weight_learning(&store);
+        let after_second = rerank_weights_tuple(&store);
+        assert!(
+            after_second[0] > after_first[0],
+            "the late recall is learned once it is peeked: {after_first:?} -> {after_second:?}"
+        );
+        let weights = crate::search::rerank::load_weights(store.conn());
+        assert!(weights.last_recall_event_id > last_stale_id);
+        assert!(weights.last_access_event_id > last_stale_id);
     }
 
     /// v0.25.2 — replay-safety: even if `commit_offset` fails after

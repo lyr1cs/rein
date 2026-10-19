@@ -271,7 +271,7 @@ pub async fn reindex_with_embedder(
     let _reindex_lock = if store.db_path().to_str() == Some(":memory:") {
         None
     } else {
-        match crate::ops::adaptive::SentinelLock::try_acquire(
+        match crate::ops::adaptive::SingleFlightLock::try_acquire(
             &reindex_lock_path(store.db_path()),
             std::time::SystemTime::now(),
         ) {
@@ -448,7 +448,7 @@ pub(crate) async fn stage_reindex_embeddings(
     config: &ReinConfig,
     embedder: &crate::embed::EmbedderKind,
     scope: ReindexScope,
-    heartbeat: Option<&crate::ops::adaptive::SentinelLock>,
+    heartbeat: Option<&crate::ops::adaptive::SingleFlightLock>,
 ) -> anyhow::Result<(usize, usize, usize)> {
     use crate::store::schema;
     use crate::types::Embedder as _;
@@ -654,9 +654,9 @@ mod tests {
         .unwrap();
         assert_eq!(all, 2);
 
-        // A concurrent reindex holding the sentinel makes this one bail out
+        // A concurrent reindex holding the lock makes this one bail out
         // before touching anything.
-        let held = crate::ops::adaptive::SentinelLock::try_acquire(
+        let held = crate::ops::adaptive::SingleFlightLock::try_acquire(
             &super::reindex_lock_path(&db_path),
             std::time::SystemTime::now(),
         )
