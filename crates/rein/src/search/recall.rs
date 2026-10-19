@@ -1098,7 +1098,7 @@ fn recall_temporal_with_execution_mode(
     } else if let Some(case) = loo_case {
         stored_loo_query_embedding(store, case)
     } else {
-        let model = config.embedding_model();
+        let model = config.embedding_query_cache_key();
         crate::embed::EmbedCache::get(store.conn(), query, &model)
             .ok()
             .flatten()
@@ -2748,7 +2748,7 @@ fn try_vector_search(
     topic: Option<&str>,
     limit: usize,
 ) -> Vec<(String, f32)> {
-    let model = config.embedding_model();
+    let model = config.embedding_query_cache_key();
 
     // Level 2: Check embedding cache
     if let Ok(Some(cached)) = EmbedCache::get(store.conn(), query, &model) {
@@ -2765,14 +2765,14 @@ fn try_vector_search(
     };
 
     let embedding = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(embedder.embed(query))),
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(embedder.embed_query(query))),
         Err(_) => {
             // No tokio runtime — create a temporary one
             match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
             {
-                Ok(rt) => rt.block_on(embedder.embed(query)),
+                Ok(rt) => rt.block_on(embedder.embed_query(query)),
                 Err(_) => return vec![],
             }
         }
@@ -2799,7 +2799,7 @@ fn try_vector_search_batch(
     topic: Option<&str>,
     limit: usize,
 ) -> std::collections::HashMap<String, f32> {
-    let model = config.embedding_model();
+    let model = config.embedding_query_cache_key();
     let mut merged: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
     let mut uncached: Vec<(usize, &str)> = Vec::new();
 
@@ -2827,12 +2827,14 @@ fn try_vector_search_batch(
 
     let texts: Vec<&str> = uncached.iter().map(|(_, q)| *q).collect();
     let embeddings = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(embedder.embed_batch(&texts))),
+        Ok(handle) => {
+            tokio::task::block_in_place(|| handle.block_on(embedder.embed_query_batch(&texts)))
+        }
         Err(_) => match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
         {
-            Ok(rt) => rt.block_on(embedder.embed_batch(&texts)),
+            Ok(rt) => rt.block_on(embedder.embed_query_batch(&texts)),
             Err(_) => return merged,
         },
     };
@@ -3514,6 +3516,18 @@ fn collect_episode_memory_scores(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_cache_key_is_isolated_for_asymmetric_models() {
+        let mut config = ReinConfig::default();
+        config.embedding.provider = "voyage".to_string();
+        config.embedding.omlx.model = "voyage-3".to_string();
+        assert_eq!(config.embedding_query_cache_key(), "voyage:voyage-3");
+        config.embedding.omlx.query_input_type = Some("query".to_string());
+        config.embedding.omlx.document_input_type = Some("document".to_string());
+        assert_eq!(config.embedding_query_cache_key(), "voyage:voyage-3#query");
+        assert_eq!(config.embedding_model(), "voyage:voyage-3");
+    }
     use crate::ops::a12_autocalibration::{
         A12LooCase, A12LooExclusion, A12LooPositive, A12OutcomeProvenance,
     };
