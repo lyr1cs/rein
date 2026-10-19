@@ -2126,9 +2126,7 @@ impl ReinConfig {
         };
 
         // Determine config file path
-        let config_path = std::env::var("REIN_CONFIG")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| dirs_config_path());
+        let config_path = config_file_path();
 
         // Merge TOML file if it exists
         if config_path.exists() {
@@ -3680,6 +3678,16 @@ fn none_resolved(sec: LlmSection, section: &str, llm: &LlmDefaultsConfig) -> Res
 ///   2. ~/.config/rein/config.toml   (XDG standard, works cross-platform)
 ///   3. ~/Library/Application Support/rein/config.toml  (macOS native via `directories`)
 /// If none exist, return the XDG path so that new users get the conventional location.
+/// The config file `load()` reads: `$REIN_CONFIG`, else the first existing
+/// candidate, else `~/.config/rein/config.toml`.
+pub fn config_file_path() -> PathBuf {
+    std::env::var("REIN_CONFIG")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(dirs_config_path)
+}
+
 fn dirs_config_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
 

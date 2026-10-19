@@ -37,6 +37,7 @@ pub const LICENSE_SPDX: &str = "AGPL-3.0-or-later";
 pub mod auth;
 pub mod compression;
 pub mod config;
+pub mod config_edit;
 pub mod doctor;
 pub mod embed;
 pub mod eval;
