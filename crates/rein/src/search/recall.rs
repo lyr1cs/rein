@@ -3043,6 +3043,35 @@ fn try_local_fts_read_only_loo(
     Ok((memories, ranked))
 }
 
+/// 2026-10 audit (U08 follow-up): a query embedding from this handle's model
+/// must not be compared with vector rows stamped for another model — the
+/// distances are noise. `populate_hnsw` already refuses such rows, but the
+/// dirty-HNSW fallback and the read-only eval path reached `vec_memories`
+/// directly. Logged once per process at WARN (the condition is per
+/// database, not per query), DEBUG afterwards; `rein migrate --reindex`
+/// re-embeds and restamps the table.
+fn vector_rows_are_foreign(store: &SqliteStore) -> bool {
+    let current = store.vector_provenance();
+    let Some(stamped) = crate::store::vec::foreign_provenance(store.conn(), &current) else {
+        return false;
+    };
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            stamped = %stamped,
+            current = %current,
+            "vector rows belong to another embedding model; vector search skipped until `rein migrate --reindex`"
+        );
+    } else {
+        tracing::debug!(
+            stamped = %stamped,
+            current = %current,
+            "vector rows belong to another embedding model; vector search skipped"
+        );
+    }
+    true
+}
+
 /// sqlite-vec-only acquisition for evaluation. HNSW is deliberately skipped
 /// because even a clean search creates `.usearch.lock` and dirty searches can
 /// claim/rewrite markers. Exclusions precede rank encoding and normalization.
@@ -3053,6 +3082,9 @@ fn vec_search_read_only_loo(
     limit: usize,
     execution_mode: RecallExecutionMode<'_>,
 ) -> Vec<(String, f32)> {
+    if vector_rows_are_foreign(store) {
+        return vec![];
+    }
     let fetch_limit = execution_mode.channel_fetch_limit(store, limit);
     let retained = crate::store::vec::search_vec(store.conn(), embedding, topic, fetch_limit)
         .unwrap_or_default()
@@ -3070,6 +3102,11 @@ fn vec_search_direct(
     limit: usize,
     config: Option<&ReinConfig>,
 ) -> Vec<(String, f32)> {
+    // Neither the on-disk HNSW index nor the sqlite-vec fallback holds
+    // vectors this handle's model can be compared with.
+    if vector_rows_are_foreign(store) {
+        return vec![];
+    }
     // Try HNSW first (O(log n) approximate nearest neighbor)
     let hnsw_path = store.db_path().with_extension("");
     if crate::store::hnsw::HnswIndex::is_dirty(&hnsw_path) {
@@ -3554,6 +3591,57 @@ mod tests {
             updated_at: Utc::now(),
             last_accessed: Utc::now(),
         }
+    }
+
+    /// 2026-10 audit U08 follow-up: the sqlite-vec fallback (and the HNSW
+    /// path in front of it) must not compare a query embedding with rows
+    /// stamped for another embedding model; a matching or missing stamp
+    /// keeps searching.
+    #[test]
+    fn vec_search_skips_rows_stamped_for_another_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("memories.db");
+        let store = SqliteStore::new(&db_path, "model-a", 3).unwrap();
+        let mut memory = test_memory("foreign-stamp", 1, 1.0);
+        memory.embedding = Some(vec![1.0, 0.0, 0.0]);
+        let id = store.store(memory).unwrap();
+        assert_eq!(
+            crate::store::vec::stamped_provenance(store.conn())
+                .unwrap()
+                .as_deref(),
+            Some("model-a:3"),
+            "the checked write stamps a fresh table for the handle's model"
+        );
+        let query = [1.0, 0.0, 0.0];
+        let hits = |store: &SqliteStore| vec_search_direct(store, &query, None, 5, None);
+        assert!(hits(&store).iter().any(|(hit, _)| hit == &id));
+
+        let restamp = |value: &str| {
+            store
+                .conn()
+                .execute(
+                    "UPDATE metadata SET value = ?1 WHERE key = ?2",
+                    rusqlite::params![value, crate::store::schema::VEC_ROWS_PROVENANCE_KEY],
+                )
+                .unwrap();
+        };
+        restamp("model-b:3");
+        assert!(
+            hits(&store).is_empty(),
+            "rows stamped for another model must not be searched"
+        );
+        restamp("model-a:3");
+        assert!(hits(&store).iter().any(|(hit, _)| hit == &id));
+
+        // An unstamped (legacy) table keeps the pre-existing behavior.
+        store
+            .conn()
+            .execute(
+                "DELETE FROM metadata WHERE key = ?1",
+                rusqlite::params![crate::store::schema::VEC_ROWS_PROVENANCE_KEY],
+            )
+            .unwrap();
+        assert!(hits(&store).iter().any(|(hit, _)| hit == &id));
     }
 
     fn a12_test_case(

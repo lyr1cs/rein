@@ -73,15 +73,32 @@ pub fn insert_embedding(conn: &Connection, id: &str, embedding: &[f32]) -> ReinR
 /// model change could never be detected and writers of different models
 /// could share the table. `rein warmup --trust-existing-vectors` attests the
 /// rows, `rein migrate --reindex` re-embeds them.
-fn check_vector_provenance(conn: &Connection, writer_provenance: &str) -> ReinResult<()> {
+/// The store's `vec_rows_provenance` stamp (`model:dims`), if any.
+pub fn stamped_provenance(conn: &Connection) -> ReinResult<Option<String>> {
     use rusqlite::OptionalExtension;
-    let stamped: Option<String> = conn
+    Ok(conn
         .query_row(
             "SELECT value FROM metadata WHERE key = ?1",
             rusqlite::params![crate::store::schema::VEC_ROWS_PROVENANCE_KEY],
             |row| row.get(0),
         )
-        .optional()?;
+        .optional()?)
+}
+
+/// The stamp when it names a model other than `reader_provenance`: vector
+/// rows of one model compared with a query embedding of another are noise,
+/// so a read path must not search them. `None` for a matching stamp, for an
+/// unstamped table (legacy rows warmup has not attested yet — the
+/// pre-existing read behavior) and for a read error.
+pub fn foreign_provenance(conn: &Connection, reader_provenance: &str) -> Option<String> {
+    match stamped_provenance(conn) {
+        Ok(Some(stamped)) if stamped != reader_provenance => Some(stamped),
+        _ => None,
+    }
+}
+
+fn check_vector_provenance(conn: &Connection, writer_provenance: &str) -> ReinResult<()> {
+    let stamped = stamped_provenance(conn)?;
     match stamped {
         Some(stamped) if stamped == writer_provenance => Ok(()),
         Some(stamped) => Err(crate::types::ReinError::VectorProvenance(format!(
