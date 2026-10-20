@@ -9,6 +9,128 @@ The full release notes (with audit-round breakdowns and operator-visible
 schema changes) live on the [GitHub Releases page](https://github.com/lyr1cs/rein/releases).
 This file is a condensed index intended for quick scanning.
 
+## [1.5.1] — 2026-10-20
+
+Maintenance patch from a whole-project review of v1.5.0. No schema or
+config changes; existing databases and configs load unchanged.
+
+### Fixed
+
+Data integrity
+
+- **Consolidation lost the evidence of earlier merges** — consolidating a
+  canonical that was itself the product of a merge (A+B → C, then C+D → E)
+  deleted the original texts and provenance C had inherited; they are now
+  carried over to the replacement inside the same transaction, and the
+  replacement's `related_ids` no longer point at deleted sources. The
+  inner savepoint is released on every failure path.
+- **Consolidation, `rein upgrade`, merge refinement and the manual
+  archive-summary refresh overwrote concurrent edits** — a memory edited
+  while the model ran was replaced with a result computed from the old
+  text; every one of these paths now verifies the source row (content,
+  `updated_at`, supersession) inside the write transaction and skips rows
+  that changed. The manual refresh also summarizes the archived original
+  instead of an already-compressed body.
+- **Merge refinement and group synthesis truncated their input and
+  replaced the whole memory** — refinement sent only the first 4,000
+  characters of a merged canonical; synthesis rendered only the first 50
+  memories of a group while every source was replaced. Both now send the
+  whole text when it fits the provider's input budget and otherwise leave
+  the memory as merged (refinement) or use the rule-based digest
+  (synthesis).
+- **Dedup compared vectors across embedding models** — cached vectors of
+  the configured model were compared with `vec_memories` rows stamped for
+  another model, and a cross-space match could merge or supersede
+  unrelated memories; both lookups now require the table stamp to match.
+  An `Update` verdict lets the replacement win instead of the longer
+  obsolete text; a row merged earlier in the same batch is no longer
+  re-inserted into HNSW from its pre-merge vector.
+- **Semantic edits dropped out of vector recall** — an edit without a new
+  embedding deleted the vector and left the row unflagged until a full
+  warmup; the row is re-flagged for the deferred embedding sweep.
+- **Concept dedup** advances the canonical's revision, archives the old
+  definition and invalidates the living summary like `refine_concept`;
+  `episodes.concept_ids` are repointed to the canonical.
+- **Session artifacts**: structured session ingest redacts the supplied
+  title and summary like the transcript.
+
+Schema and indexes
+
+- A legacy `episodes` table failed every open because the baseline DDL
+  created an index on a column the migration had not added yet; the index
+  is created by the migration. Grouped column migrations are probed and
+  added one column at a time, so an interrupted upgrade no longer leaves
+  the rest of a group missing.
+- HNSW: an interrupted save (index written, metadata not) is detected by a
+  `.usearch.saving` marker and the index rebuilt; an open without the
+  writer lock distinguishes a save in progress from an interrupted one.
+  The dirty-index rebuild refuses rows stamped for another embedding
+  model, and vector search returns no vector hits while the table stamp
+  names another model (until `rein migrate --reindex`).
+
+Recall and search
+
+- Topic, time-range, keyword and cold-tier filters are re-applied after
+  canonical collapse, so a superseded hit can no longer surface a
+  canonical outside the requested filters.
+- Convex-combination fusion keeps a channel whose scores tie (a query with
+  tied BM25 hits and no vector results returned nothing).
+- `recent()` filters deprecated and superseded revisions in SQL before the
+  limit; the LLM rerank cache key includes each candidate's `updated_at`.
+- English temporal phrases match at word boundaries (`recent_files.rs` no
+  longer injects a 30-day window); "N days ago" with an unrepresentable N
+  no longer panics; "March 2025" no longer yields a fabricated day keyword.
+- Sentences longer than the chunk budget are hard-split before embedding;
+  MCP recall output counts every omitted result and stays within budget.
+
+Extraction, hooks, proxy
+
+- The Stop hook ingests the newest turns of a long transcript instead of
+  re-submitting the oldest 500; episode concept names carry the full ULID
+  (same-minute episodes collided); same-agent duplicate suppression
+  fingerprints the tail of long events; the Quick async worker uses the
+  `[async_memory]` provider's input budget.
+- Proxy extraction accepts Responses `delta` as a string, buffers
+  multibyte UTF-8 split across transport chunks, and extracts each
+  WebSocket turn against its own query.
+- `extract.intelligent_merge` inherits from `[query_expansion]` as
+  documented, not from `[extract]`.
+
+Adaptive loop and judge
+
+- The reranker learner joins feedback to its own request, trains only
+  answered recalls, and consumes feedback whose recall is already settled,
+  so no feedback is consumed before its recall is learned or pins the
+  cursor afterwards.
+- The adaptive snapshot merge keeps the advancing writer's judge
+  calibration pairs and pending halves.
+- The activation report applies the online judge veto (`judge_untrusted`).
+- Judge parse failures record the reply length only; the nightly cron uses
+  the configured `max_input_chars` instead of a fixed 16,384-char ceiling.
+- Reindex single-flight is an exclusive `flock` on unix.
+
+Config, CLI, doctor
+
+- `[embedding.google]` with a plain-HTTP non-loopback endpoint disables the
+  embedder instead of warning and sending the key in cleartext.
+- `rein keys set|unset` serialize concurrent edits with a lock file.
+- `rein gui on` / `rein proxy on` report a child that exits during startup
+  instead of "Started".
+- `rein doctor --fix` leaves a running worker's inflight batch alone and
+  rebuilds an HNSW index whose live membership is incomplete.
+- `rein init` writes `servers.rein` for VS Code and `mcp.rein` for OpenCode
+  (neither reads `mcpServers`).
+- Dedup preflight logs and eval judge errors describe values by shape and
+  length only.
+
+GUI and packaging
+
+- Concept-summary votes latch only after the server accepts them, with the
+  refusal shown and retry enabled; Brain and Graph canvases follow their
+  container after a cold load.
+- `build-dxt.sh` packages the executable Cargo reports for
+  `aarch64-apple-darwin` instead of `target/release/rein`.
+
 ## [1.5.0] — 2026-10-19
 
 Feature release: any OpenAI-compatible vendor for embeddings and every LLM
