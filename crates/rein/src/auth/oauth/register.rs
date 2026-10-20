@@ -168,12 +168,31 @@ mod tests {
 
     #[test]
     fn dcr_rate_limit_allows_ten_per_hour_per_key() {
+        // A private bucket map: the process-global one is shared with the
+        // registration tests, whose real-clock calls pruned this test's
+        // `now = 1000` entries mid-run when the suite ran in parallel.
+        let mut buckets = HashMap::new();
         let key = format!("test-{}", ulid::Ulid::new());
         for offset in 0..DCR_LIMIT_PER_HOUR {
-            assert!(check_rate_limit(&key, 1000 + offset as i64));
+            assert!(check_rate_limit_in_buckets(
+                &mut buckets,
+                &key,
+                1000 + offset as i64,
+                DCR_RATE_LIMIT_MAX_KEYS
+            ));
         }
-        assert!(!check_rate_limit(&key, 1100));
-        assert!(check_rate_limit(&key, 1000 + 3601));
+        assert!(!check_rate_limit_in_buckets(
+            &mut buckets,
+            &key,
+            1100,
+            DCR_RATE_LIMIT_MAX_KEYS
+        ));
+        assert!(check_rate_limit_in_buckets(
+            &mut buckets,
+            &key,
+            1000 + 3601,
+            DCR_RATE_LIMIT_MAX_KEYS
+        ));
     }
 
     #[test]
