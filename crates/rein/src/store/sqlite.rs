@@ -2398,10 +2398,16 @@ impl SqliteStore {
             &incoming_snippet,
         )?;
 
+        // Length only: the model's reasoning quotes memory text (2026-10
+        // audit U10 follow-up); the full verdict is kept in the provenance
+        // record, not the log.
         tracing::info!(
             candidate_id,
             verdict = ?verdict.verdict,
-            reasoning = verdict.reasoning.as_deref().unwrap_or(""),
+            reasoning_chars = verdict
+                .reasoning
+                .as_deref()
+                .map_or(0, |reasoning| reasoning.chars().count()),
             "intelligent_merge preflight verdict"
         );
         Some((candidate_id, existing_hash, verdict))
