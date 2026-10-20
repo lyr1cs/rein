@@ -964,7 +964,9 @@ pub fn create_memory_worker_extractor(config: &ReinConfig) -> Option<ExtractorKi
 }
 
 /// Summarize a topic group into a single extracted memory using the configured LLM.
-/// Returns Ok(None) when no extractor is configured or no usable summary is produced.
+/// Returns Ok(None) when no extractor is configured, when the rendered group
+/// does not fit the extract section's input budget, or when no usable
+/// summary is produced.
 pub async fn summarize_topic_group(
     config: &ReinConfig,
     canonical_topic: &str,
@@ -974,27 +976,38 @@ pub async fn summarize_topic_group(
     let Some(extractor) = create_extractor(config) else {
         return Ok(None);
     };
+    let budget = resolve_max_input_for_section_kind(config, "extract", &extractor);
+    summarize_topic_group_with(&extractor, canonical_topic, source_topics, memories, budget).await
+}
 
-    let mut input = format!(
-        "TARGET_TOPIC: {canonical_topic}\nSOURCE_TOPICS: {}\nMEMORY_COUNT: {}\n\n",
-        source_topics.join(", "),
-        memories.len()
-    );
-
-    for memory in memories.iter().take(50) {
-        input.push_str(&format!(
-            "[topic={} created_at={} importance={}]\nsummary: {}\ncontent:\n{}\n\n",
-            memory.topic,
-            memory.created_at.to_rfc3339(),
-            memory.importance,
-            memory.summary,
-            memory.content
-        ));
+/// The whole group or nothing. The earlier code rendered the first 50
+/// memories and let `prepare_input_for_kind` cut the rest, while the caller
+/// replaced every source with the result — memories the model never saw
+/// were consolidated away (2026-10 audit U13 follow-up). A group that does
+/// not fit `budget` chars (0 = unlimited) returns `Ok(None)`; the caller
+/// then builds the rule-based digest, which names the whole group and keeps
+/// every source as evidence.
+async fn summarize_topic_group_with(
+    extractor: &ExtractorKind,
+    canonical_topic: &str,
+    source_topics: &[String],
+    memories: &[Memory],
+    budget: usize,
+) -> ReinResult<Option<ExtractedMemory>> {
+    let input = render_topic_group(canonical_topic, source_topics, memories);
+    let chars = input.chars().count();
+    if budget > 0 && chars > budget {
+        tracing::info!(
+            memories = memories.len(),
+            chars,
+            budget,
+            "consolidation: group exceeds the LLM input budget; using the rule-based digest"
+        );
+        return Ok(None);
     }
 
-    let prepared = prepare_input_for_kind(config, &input, &extractor);
     let mut extracted = extractor
-        .extract_with_prompt(CONSOLIDATE_SYSTEM_PROMPT, &prepared)
+        .extract_with_prompt(CONSOLIDATE_SYSTEM_PROMPT, &input)
         .await?;
     if extracted.is_empty() {
         return Ok(None);
@@ -1020,6 +1033,30 @@ pub async fn summarize_topic_group(
     }
 
     Ok(Some(best))
+}
+
+/// Render every memory of a consolidation group for the synthesis prompt.
+fn render_topic_group(
+    canonical_topic: &str,
+    source_topics: &[String],
+    memories: &[Memory],
+) -> String {
+    let mut input = format!(
+        "TARGET_TOPIC: {canonical_topic}\nSOURCE_TOPICS: {}\nMEMORY_COUNT: {}\n\n",
+        source_topics.join(", "),
+        memories.len()
+    );
+    for memory in memories {
+        input.push_str(&format!(
+            "[topic={} created_at={} importance={}]\nsummary: {}\ncontent:\n{}\n\n",
+            memory.topic,
+            memory.created_at.to_rfc3339(),
+            memory.importance,
+            memory.summary,
+            memory.content
+        ));
+    }
+    input
 }
 
 /// Ask the configured LLM for a structured dedup verdict between two texts.
@@ -1857,6 +1894,83 @@ pub fn strip_code_fences(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "test-support")]
+    fn group_memory(index: usize) -> Memory {
+        use crate::types::{Importance, MemoryLayer, MemoryStatus, MemoryTier, Source};
+        Memory {
+            id: format!("group-{index}"),
+            layer: MemoryLayer::LTM,
+            topic: "docker".to_string(),
+            summary: format!("summary {index}"),
+            content: format!("fact number {index} MARK-{index}-END"),
+            keywords: vec![],
+            importance: Importance::High,
+            source: Source::Manual,
+            strength: 1.0,
+            decay_lambda: 0.02,
+            access_count: 0,
+            superseded_by: None,
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: 1.0,
+            source_diversity: 1.0,
+            contradiction_score: 0.0,
+            related_ids: vec![],
+            concept_ids: vec![],
+            status: MemoryStatus::default(),
+            embedding: None,
+            tier: MemoryTier::Warm,
+            cluster_id: None,
+            archival_summary: None,
+            archival_summary_at: None,
+            archival_summary_version: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_accessed: chrono::Utc::now(),
+        }
+    }
+
+    /// 2026-10 audit U13 follow-up: synthesis sees every memory the caller
+    /// is about to replace, or none — never a silent prefix.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn summarize_topic_group_sends_every_memory_or_nothing() {
+        let memories: Vec<Memory> = (0..60).map(group_memory).collect();
+        let topics = vec!["docker".to_string()];
+        let response = r#"[{"topic":"docker","summary":"merged","content":"merged content","keywords":["docker"],"importance":"high","should_store":true,"quality_confidence":0.9}]"#;
+
+        let (mock, probe) = MockExtractor::with_fixed_response_and_probe(response);
+        let ex = ExtractorKind::Mock(mock);
+        let merged = summarize_topic_group_with(&ex, "docker", &topics, &memories, 0)
+            .await
+            .unwrap()
+            .expect("synthesized");
+        assert_eq!(merged.content, "merged content");
+        let sent = probe.last_text_prompt().unwrap();
+        assert!(sent.contains("MEMORY_COUNT: 60"), "{sent}");
+        for index in 0..60 {
+            assert!(
+                sent.contains(&format!("MARK-{index}-END")),
+                "memory {index} was not sent to the model"
+            );
+        }
+
+        // Over budget: nothing is sent, the caller falls back to the digest.
+        let (mock, probe) = MockExtractor::with_fixed_response_and_probe(response);
+        let ex = ExtractorKind::Mock(mock);
+        assert!(
+            summarize_topic_group_with(&ex, "docker", &topics, &memories, 500)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            probe.last_text_prompt().is_none(),
+            "no truncated prompt may be sent"
+        );
+    }
 
     #[cfg(feature = "test-support")]
     #[tokio::test]
