@@ -4722,6 +4722,65 @@ enabled = true
         assert_eq!(consolidated.len(), 1);
     }
 
+    /// 2026-10 audit U13 follow-up: a failure after `SAVEPOINT
+    /// consolidate_by_ids` — here the archive-evidence insert, forced by a
+    /// temporary trigger — must roll back and release the savepoint. The
+    /// late `?` paths used to return with the savepoint still open and the
+    /// sources already deleted inside it.
+    #[test]
+    fn consolidate_by_ids_atomic_releases_its_savepoint_on_a_late_failure() {
+        let store = SqliteStore::in_memory().unwrap();
+        let first_id = store
+            .store(test_memory("topic-a", "first", Importance::Medium))
+            .unwrap();
+        let second_id = store
+            .store(test_memory("topic-a", "second", Importance::Medium))
+            .unwrap();
+        store
+            .conn()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_archive BEFORE INSERT ON memory_evidence
+                 WHEN NEW.memory_id IS NULL
+                 BEGIN SELECT RAISE(ABORT, 'injected archive failure'); END",
+            )
+            .unwrap();
+
+        let replacement = test_memory("topic-a", "merged", Importance::High);
+        let replacement_id = replacement.id.clone();
+        let err = store
+            .consolidate_by_ids_atomic(&[first_id.clone(), second_id.clone()], replacement)
+            .expect_err("the injected failure must surface");
+        assert!(
+            err.to_string().contains("injected archive failure"),
+            "{err}"
+        );
+        assert!(
+            store.conn().is_autocommit(),
+            "the savepoint must be released, not left open on the connection"
+        );
+        assert!(
+            store.get(&first_id).is_ok(),
+            "first source must be restored"
+        );
+        assert!(
+            store.get(&second_id).is_ok(),
+            "second source must be restored"
+        );
+        assert!(
+            store.get(&replacement_id).is_err(),
+            "the replacement must not survive the rollback"
+        );
+
+        store
+            .conn()
+            .execute_batch("DROP TRIGGER fail_archive")
+            .unwrap();
+        let replacement = test_memory("topic-a", "merged", Importance::High);
+        store
+            .consolidate_by_ids_atomic(&[first_id, second_id], replacement)
+            .expect("the connection is usable after the rollback");
+    }
+
     #[test]
     fn consolidate_by_ids_atomic_strips_related_ids_from_survivors() {
         // Verifies that when consolidate_by_ids_atomic deletes M1 + M2, any OTHER

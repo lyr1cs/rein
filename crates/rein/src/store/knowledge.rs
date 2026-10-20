@@ -968,7 +968,38 @@ impl SqliteStore {
         replacement: Memory,
     ) -> ReinResult<Vec<Memory>> {
         self.conn.execute_batch("SAVEPOINT consolidate_by_ids")?;
+        // Every failure inside the savepoint rolls back and releases here —
+        // including the late evidence/concept/refresh steps whose `?` used to
+        // return with the savepoint still open on the connection (2026-10
+        // audit U13 follow-up). `consolidate_snapshots_atomic` masked that
+        // with its outer savepoint; a direct caller inherited the dangling
+        // transaction.
+        let old_memories = match self.consolidate_by_ids_in_savepoint(memory_ids, replacement) {
+            Ok(old_memories) => old_memories,
+            Err(e) => {
+                let _ = self
+                    .conn
+                    .execute_batch("ROLLBACK TO consolidate_by_ids; RELEASE consolidate_by_ids");
+                return Err(e);
+            }
+        };
+        self.conn.execute_batch("RELEASE consolidate_by_ids")?;
 
+        for memory in &old_memories {
+            self.remove_from_tantivy(&memory.id);
+            self.remove_from_hnsw(&memory.id);
+        }
+
+        Ok(old_memories)
+    }
+
+    /// Body of [`Self::consolidate_by_ids_atomic`]: runs inside its
+    /// savepoint and may fail at any step; the caller rolls back.
+    fn consolidate_by_ids_in_savepoint(
+        &self,
+        memory_ids: &[String],
+        replacement: Memory,
+    ) -> ReinResult<Vec<Memory>> {
         // Collect old memories by ID
         let mut old_memories = Vec::new();
         for id in memory_ids {
@@ -985,18 +1016,11 @@ impl SqliteStore {
         // archives the source itself.
         let mut inherited_evidence: Vec<MemoryEvidence> = Vec::new();
         for id in memory_ids {
-            match self.list_all_memory_evidence_oldest_first(id) {
-                Ok(rows) => inherited_evidence.extend(
-                    rows.into_iter()
-                        .filter(|row| row.memory_id.as_deref() != Some(id.as_str())),
-                ),
-                Err(e) => {
-                    let _ = self.conn.execute_batch(
-                        "ROLLBACK TO consolidate_by_ids; RELEASE consolidate_by_ids",
-                    );
-                    return Err(e);
-                }
-            }
+            inherited_evidence.extend(
+                self.list_all_memory_evidence_oldest_first(id)?
+                    .into_iter()
+                    .filter(|row| row.memory_id.as_deref() != Some(id.as_str())),
+            );
         }
 
         // Delete only the specified IDs. For each id, scrub it out of related_ids
@@ -1007,7 +1031,7 @@ impl SqliteStore {
             let quoted = format!("\"{id}\"");
             let like = format!("%{quoted}%");
 
-            if let Err(e) = self.conn.execute(
+            self.conn.execute(
                 "UPDATE memories
                  SET related_ids = COALESCE(
                     (SELECT json_group_array(value)
@@ -1016,12 +1040,7 @@ impl SqliteStore {
                     '[]')
                  WHERE related_ids LIKE ?2 AND id != ?1",
                 rusqlite::params![id, like],
-            ) {
-                let _ = self
-                    .conn
-                    .execute_batch("ROLLBACK TO consolidate_by_ids; RELEASE consolidate_by_ids");
-                return Err(e.into());
-            }
+            )?;
 
             let has_episodes: bool = self
                 .conn
@@ -1032,7 +1051,7 @@ impl SqliteStore {
                 )
                 .unwrap_or(false);
             if has_episodes {
-                if let Err(e) = self.conn.execute(
+                self.conn.execute(
                     "UPDATE episodes
                      SET memory_ids = COALESCE(
                         (SELECT json_group_array(value)
@@ -1041,29 +1060,12 @@ impl SqliteStore {
                         '[]')
                      WHERE memory_ids LIKE ?2",
                     rusqlite::params![id, like],
-                ) {
-                    let _ = self.conn.execute_batch(
-                        "ROLLBACK TO consolidate_by_ids; RELEASE consolidate_by_ids",
-                    );
-                    return Err(e.into());
-                }
+                )?;
             }
 
-            if let Err(e) = self
-                .conn
-                .execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])
-            {
-                let _ = self
-                    .conn
-                    .execute_batch("ROLLBACK TO consolidate_by_ids; RELEASE consolidate_by_ids");
-                return Err(e.into());
-            }
-            if let Err(e) = crate::store::vec::delete_embedding(&self.conn, id) {
-                let _ = self
-                    .conn
-                    .execute_batch("ROLLBACK TO consolidate_by_ids; RELEASE consolidate_by_ids");
-                return Err(e);
-            }
+            self.conn
+                .execute("DELETE FROM memories WHERE id = ?1", rusqlite::params![id])?;
+            crate::store::vec::delete_embedding(&self.conn, id)?;
         }
 
         // Insert replacement. Its `related_ids` were built from the sources
@@ -1074,21 +1076,11 @@ impl SqliteStore {
             .related_ids
             .retain(|related| !memory_ids.contains(related));
         let replacement_id = replacement.id.clone();
-        if let Err(e) = self.store(replacement) {
-            let _ = self
-                .conn
-                .execute_batch("ROLLBACK TO consolidate_by_ids; RELEASE consolidate_by_ids");
-            return Err(e);
-        }
+        self.store(replacement)?;
 
         for mut evidence in inherited_evidence {
             evidence.canonical_id = replacement_id.clone();
-            if let Err(e) = self.add_memory_evidence(evidence) {
-                let _ = self
-                    .conn
-                    .execute_batch("ROLLBACK TO consolidate_by_ids; RELEASE consolidate_by_ids");
-                return Err(e);
-            }
+            self.add_memory_evidence(evidence)?;
         }
 
         for old_id in memory_ids {
@@ -1138,14 +1130,6 @@ impl SqliteStore {
             })?;
         }
         self.refresh_canonical_state(&replacement_id)?;
-
-        self.conn.execute_batch("RELEASE consolidate_by_ids")?;
-
-        for memory in &old_memories {
-            self.remove_from_tantivy(&memory.id);
-            self.remove_from_hnsw(&memory.id);
-        }
-
         Ok(old_memories)
     }
 
