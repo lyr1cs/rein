@@ -156,6 +156,8 @@ struct OmlxExpander {
     endpoint: String,
     model: String,
     disable_thinking: bool,
+    /// Canonical vendor name; selects the request dialect.
+    provider_name: String,
     api_key: Option<String>,
     auth_header: crate::vendors::AuthHeader,
 }
@@ -167,6 +169,7 @@ impl OmlxExpander {
             endpoint: r.endpoint.clone(),
             model: r.model.clone(),
             disable_thinking: r.disable_thinking,
+            provider_name: r.provider_name.clone(),
             api_key: crate::extract::llm::resolved_api_key(r),
             auth_header: r.auth_header,
         }
@@ -199,23 +202,15 @@ impl OmlxExpander {
         let url = format!("{}/chat/completions", self.endpoint);
         let disable_thinking = self.disable_thinking;
         let make_body = |use_json_mode: bool| {
-            let system_msg = if disable_thinking {
-                format!("/no_think\n{}", EXPAND_SYSTEM_PROMPT)
-            } else {
-                EXPAND_SYSTEM_PROMPT.to_string()
-            };
-            let mut body = json!({
-                "model": &self.model,
-                "messages": [
-                    {"role": "system", "content": &system_msg},
-                    {"role": "user", "content": &user_msg}
-                ],
-                "temperature": 0.3
-            });
-            if use_json_mode {
-                body["response_format"] = json!({"type": "json_object"});
-            }
-            body
+            crate::vendors::chat_request_body(
+                &self.provider_name,
+                &self.model,
+                EXPAND_SYSTEM_PROMPT,
+                &user_msg,
+                0.3,
+                use_json_mode,
+                disable_thinking,
+            )
         };
 
         // Try with JSON mode first; retry without if model rejects it

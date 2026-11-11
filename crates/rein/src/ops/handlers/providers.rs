@@ -553,6 +553,12 @@ async fn run_probe(cfg: &ReinConfig, target: &ProbeTarget) -> ProbeResult {
         }
         ProbeTarget::OpenAiModels { endpoint, key } => {
             let mut rb = client.get(format!("{endpoint}/models"));
+            // Anthropic's model list answers 400 without a version header,
+            // which would read as a bad key. Its chat endpoint does not need
+            // it; other vendors ignore the header.
+            if endpoint.contains("api.anthropic.com") {
+                rb = rb.header("anthropic-version", "2023-06-01");
+            }
             if let Some((header, value)) = key {
                 rb = rb.header(header.header_name(), header.header_value(value));
             }

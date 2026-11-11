@@ -108,6 +108,86 @@ pub struct VendorPreset {
     pub embeddings: bool,
 }
 
+/// How a vendor's chat-completions endpoint deviates from the OpenAI request
+/// shape rein sends by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatDialect {
+    /// Accepts a non-default `temperature`. Anthropic's current models
+    /// reject it (`temperature is deprecated for this model`).
+    pub sampling: bool,
+    /// Accepts `response_format = {"type": "json_object"}`. Anthropic's
+    /// endpoint rejects that value, so the JSON-mode attempt would only add
+    /// a failed round trip before the plain retry.
+    pub json_object_mode: bool,
+    /// How "disable thinking" is expressed.
+    pub thinking: ThinkingControl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingControl {
+    /// `/no_think` on the first line of the system prompt (Qwen-style local
+    /// servers; other vendors read it as text).
+    NoThinkPrefix,
+    /// A request field: `"thinking": {"type": "disabled"}`.
+    DisabledField,
+}
+
+/// The dialect for a vendor name as it appears in config (`omlx`, `openai`,
+/// `anthropic`, …). Unknown names get the plain OpenAI shape.
+pub fn chat_dialect(vendor: &str) -> ChatDialect {
+    match vendor {
+        "anthropic" => ChatDialect {
+            sampling: false,
+            json_object_mode: false,
+            thinking: ThinkingControl::DisabledField,
+        },
+        _ => ChatDialect {
+            sampling: true,
+            json_object_mode: true,
+            thinking: ThinkingControl::NoThinkPrefix,
+        },
+    }
+}
+
+/// One system + user chat-completions request body in `vendor`'s dialect.
+///
+/// `temperature` is sent only where the vendor accepts it; `json_mode` only
+/// where `json_object` is accepted; `disable_thinking` becomes the prompt
+/// prefix or the request field the vendor understands.
+pub fn chat_request_body(
+    vendor: &str,
+    model: &str,
+    system_prompt: &str,
+    user_text: &str,
+    temperature: f64,
+    json_mode: bool,
+    disable_thinking: bool,
+) -> serde_json::Value {
+    let dialect = chat_dialect(vendor);
+    let system = if disable_thinking && dialect.thinking == ThinkingControl::NoThinkPrefix {
+        format!("/no_think\n{system_prompt}")
+    } else {
+        system_prompt.to_string()
+    };
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_text}
+        ]
+    });
+    if dialect.sampling {
+        body["temperature"] = serde_json::json!(temperature);
+    }
+    if json_mode && dialect.json_object_mode {
+        body["response_format"] = serde_json::json!({"type": "json_object"});
+    }
+    if disable_thinking && dialect.thinking == ThinkingControl::DisabledField {
+        body["thinking"] = serde_json::json!({"type": "disabled"});
+    }
+    body
+}
+
 const fn preset(
     name: &'static str,
     chat_endpoint: Option<&'static str>,
@@ -444,6 +524,56 @@ mod tests {
             );
             assert!(seen.insert(p.name), "duplicate preset {}", p.name);
             assert!(p.chat || p.embeddings, "{} has no capability", p.name);
+        }
+    }
+
+    #[test]
+    fn anthropic_chat_bodies_carry_no_sampling_or_json_object_mode() {
+        let plain = chat_request_body(
+            "anthropic",
+            "claude-haiku-5-5",
+            "SYS",
+            "USER",
+            0.1,
+            true,
+            false,
+        );
+        assert!(plain.get("temperature").is_none());
+        assert!(plain.get("response_format").is_none());
+        assert!(plain.get("thinking").is_none());
+        assert_eq!(plain["messages"][0]["content"], "SYS");
+        assert_eq!(plain["messages"][1]["content"], "USER");
+
+        // "Disable thinking" is a request field there, not a prompt line.
+        let quiet = chat_request_body(
+            "anthropic",
+            "claude-haiku-5-5",
+            "SYS",
+            "USER",
+            0.1,
+            true,
+            true,
+        );
+        assert_eq!(quiet["thinking"], serde_json::json!({"type": "disabled"}));
+        assert_eq!(quiet["messages"][0]["content"], "SYS");
+        assert!(!chat_dialect("anthropic").json_object_mode);
+    }
+
+    #[test]
+    fn other_vendors_keep_the_openai_request_shape() {
+        for vendor in ["omlx", "openai", "perplexity", "some-unknown-vendor"] {
+            let body = chat_request_body(vendor, "m", "SYS", "USER", 0.3, true, true);
+            assert_eq!(body["temperature"], serde_json::json!(0.3), "{vendor}");
+            assert_eq!(
+                body["response_format"],
+                serde_json::json!({"type": "json_object"}),
+                "{vendor}"
+            );
+            assert!(body.get("thinking").is_none(), "{vendor}");
+            assert_eq!(body["messages"][0]["content"], "/no_think\nSYS", "{vendor}");
+            let prose = chat_request_body(vendor, "m", "SYS", "USER", 0.3, false, false);
+            assert!(prose.get("response_format").is_none(), "{vendor}");
+            assert_eq!(prose["messages"][0]["content"], "SYS", "{vendor}");
         }
     }
 

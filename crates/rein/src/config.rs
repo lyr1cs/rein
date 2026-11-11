@@ -2417,10 +2417,19 @@ impl ReinConfig {
                 }
             }
             Provider::Omlx => {
-                eprintln!(
-                    "rein: using OMLX extract backend at {}",
-                    self.extract.omlx.endpoint
-                );
+                // Name the vendor and endpoint the resolver actually picked:
+                // for a hosted vendor the `[extract.openai]` table usually
+                // has no endpoint of its own and the preset supplies it.
+                match self.resolve_llm_for("extract") {
+                    Ok(r) => eprintln!(
+                        "rein: using {} extract backend at {}",
+                        r.provider_name, r.endpoint
+                    ),
+                    Err(_) => eprintln!(
+                        "rein: using OpenAI-compatible extract backend at {}",
+                        self.extract.omlx.endpoint
+                    ),
+                }
             }
             Provider::None => {}
         }

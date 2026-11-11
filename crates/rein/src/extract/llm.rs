@@ -319,24 +319,25 @@ fn build_gemini_body(system_prompt: &str, text: &str, force_json_mime: bool) -> 
     })
 }
 
+/// Chat-completions body for the OpenAI-compatible path, in `vendor`'s
+/// dialect (see [`crate::vendors::chat_request_body`]).
 fn build_omlx_body(
+    vendor: &str,
     model: &str,
-    prefixed_system_prompt: &str,
+    system_prompt: &str,
     user_text: &str,
     use_json_mode: bool,
+    disable_thinking: bool,
 ) -> Value {
-    let mut body = json!({
-        "model": model,
-        "messages": [
-            {"role": "system", "content": prefixed_system_prompt},
-            {"role": "user", "content": user_text}
-        ],
-        "temperature": 0.1
-    });
-    if use_json_mode {
-        body["response_format"] = json!({"type": "json_object"});
-    }
-    body
+    crate::vendors::chat_request_body(
+        vendor,
+        model,
+        system_prompt,
+        user_text,
+        0.1,
+        use_json_mode,
+        disable_thinking,
+    )
 }
 
 #[cfg(test)]
@@ -377,7 +378,7 @@ mod body_tests {
 
     #[test]
     fn omlx_no_json_mode_omits_response_format() {
-        let body = build_omlx_body("llama-3", "sys", "user", false);
+        let body = build_omlx_body("omlx", "llama-3", "sys", "user", false, false);
         assert!(
             body.get("response_format").is_none(),
             "prose-mode OMLX bodies must never force response_format=json_object"
@@ -386,13 +387,13 @@ mod body_tests {
 
     #[test]
     fn omlx_json_mode_sets_response_format() {
-        let body = build_omlx_body("llama-3", "sys", "user", true);
+        let body = build_omlx_body("omlx", "llama-3", "sys", "user", true, false);
         assert_eq!(body["response_format"], json!({"type": "json_object"}));
     }
 
     #[test]
     fn omlx_body_has_two_messages_system_then_user() {
-        let body = build_omlx_body("m", "SYSTEM", "USER", false);
+        let body = build_omlx_body("omlx", "m", "SYSTEM", "USER", false, false);
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][0]["content"], "SYSTEM");
         assert_eq!(body["messages"][1]["role"], "user");
@@ -619,14 +620,20 @@ impl OmlxExtractor {
         prefer_json: bool,
     ) -> ReinResult<String> {
         let url = format!("{}/chat/completions", self.endpoint);
-        let prefixed_prompt = if self.disable_thinking {
-            format!("/no_think\n{}", system_prompt)
-        } else {
-            system_prompt.to_string()
-        };
         let make_body = |use_json_mode: bool| {
-            build_omlx_body(&self.model, &prefixed_prompt, text, use_json_mode)
+            build_omlx_body(
+                &self.provider_name,
+                &self.model,
+                system_prompt,
+                text,
+                use_json_mode,
+                self.disable_thinking,
+            )
         };
+        // A vendor that rejects `json_object` gets the plain request first:
+        // the JSON-mode attempt would be a guaranteed failed round trip.
+        let prefer_json =
+            prefer_json && crate::vendors::chat_dialect(&self.provider_name).json_object_mode;
 
         // Acquire a global LLM permit before either HTTP attempt (Agent D
         // Q9). A single permit covers both the JSON-mode primary and any
@@ -2320,6 +2327,29 @@ mod tests {
             .to_string();
         assert!(!sys0.starts_with("/no_think"));
         assert!(sys1.starts_with("/no_think"));
+    }
+
+    // An Anthropic extractor sends one request per call, in that vendor's
+    // dialect: no `temperature`, no `response_format`, and "disable
+    // thinking" as a request field instead of a `/no_think` prompt line.
+    #[tokio::test]
+    async fn anthropic_extractor_sends_its_dialect_in_a_single_request() {
+        let stub = crate::stub_http::StubServer::start(vec![(200, chat_ok_body("a"))]);
+        let ex = OmlxExtractor::new(stub.url.clone(), "claude-haiku-5-5".into(), true).with_auth(
+            "anthropic".into(),
+            Some("sk-ant-test-0000".into()),
+            crate::vendors::AuthHeader::Bearer,
+        );
+        // A structured (JSON-preferring) call: other vendors would try
+        // `response_format` first and retry on rejection.
+        ex.call_and_extract_content("x", "SYS").await.unwrap();
+        let reqs = stub.requests();
+        assert_eq!(reqs.len(), 1, "no rejected JSON-mode attempt first");
+        let body = reqs[0].json();
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("response_format").is_none());
+        assert_eq!(body["thinking"], json!({"type": "disabled"}));
+        assert_eq!(body["messages"][0]["content"], "SYS");
     }
 
     #[test]
