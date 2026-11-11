@@ -175,11 +175,7 @@ pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
     let env_token = std::env::var("REIN_PROXY_TOKEN")
         .ok()
         .filter(|token| !token.trim().is_empty())
-        .or_else(|| {
-            std::env::var("REIN_HTTP_TOKEN")
-                .ok()
-                .filter(|token| !token.trim().is_empty())
-        });
+        .or_else(|| config.http_token());
     let auth_token = resolve_proxy_startup_auth(&config, env_token)?;
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;

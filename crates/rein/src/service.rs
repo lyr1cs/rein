@@ -269,7 +269,7 @@ impl ServiceStatus {
 }
 
 /// Fetch proxy metrics from the metrics endpoint.
-fn fetch_proxy_metrics(port: u16) -> Option<(u64, u64, u64)> {
+fn fetch_proxy_metrics(config: &crate::config::ReinConfig, port: u16) -> Option<(u64, u64, u64)> {
     let mut stream = TcpStream::connect_timeout(
         &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
         Duration::from_millis(300),
@@ -280,11 +280,7 @@ fn fetch_proxy_metrics(port: u16) -> Option<(u64, u64, u64)> {
     let token = std::env::var("REIN_PROXY_TOKEN")
         .ok()
         .filter(|token| !token.trim().is_empty())
-        .or_else(|| {
-            std::env::var("REIN_HTTP_TOKEN")
-                .ok()
-                .filter(|token| !token.trim().is_empty())
-        });
+        .or_else(|| config.http_token());
     let auth_header = token
         .map(|t| format!("x-rein-token: {t}\r\n"))
         .unwrap_or_default();
@@ -363,7 +359,7 @@ pub fn print_dashboard(config: &crate::config::ReinConfig) {
 
     // Proxy metrics
     if proxy_status.port_open {
-        if let Some((requests, errors, extractions)) = fetch_proxy_metrics(proxy_port) {
+        if let Some((requests, errors, extractions)) = fetch_proxy_metrics(config, proxy_port) {
             println!("\nProxy");
             println!(
                 "  Requests: {}  Errors: {}  Extractions: {}",

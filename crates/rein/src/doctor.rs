@@ -1679,9 +1679,7 @@ fn check_http_auth(config: &ReinConfig) -> DoctorCheck {
         );
     }
 
-    let token_present = std::env::var("REIN_HTTP_TOKEN")
-        .ok()
-        .is_some_and(|token| !token.trim().is_empty());
+    let token_present = config.http_token().is_some();
     if let Some(policy) = config.server.auth {
         let policy = crate::auth::AuthPolicy::from(policy);
         return match policy {
@@ -1694,7 +1692,7 @@ fn check_http_auth(config: &ReinConfig) -> DoctorCheck {
                 DoctorCategory::Configuration,
                 "http_auth",
                 "explicit auth policy bearer_required requires REIN_HTTP_TOKEN",
-                "set REIN_HTTP_TOKEN=<secret> or choose [server].auth = \"loopback_only\" / \"oauth\" / \"public\"",
+                "store one with `rein keys set REIN_HTTP_TOKEN` (or set it in the environment), or choose [server].auth = \"loopback_only\" / \"oauth\" / \"public\"",
             ),
             crate::auth::AuthPolicy::OAuth if token_present => ok_in(
                 DoctorCategory::Configuration,
@@ -1705,7 +1703,7 @@ fn check_http_auth(config: &ReinConfig) -> DoctorCheck {
                 DoctorCategory::Configuration,
                 "http_auth",
                 "explicit auth policy oauth requires REIN_HTTP_TOKEN for owner approval",
-                "set REIN_HTTP_TOKEN=<secret>; OAuth clients will not need this token, but the owner approval page will",
+                "store one with `rein keys set REIN_HTTP_TOKEN` (or set it in the environment); OAuth clients will not need this token, but the owner approval page will",
             ),
             crate::auth::AuthPolicy::LoopbackOnly => ok_in(
                 DoctorCategory::Configuration,
@@ -1758,9 +1756,7 @@ fn check_auth_policy_consistency(config: &ReinConfig) -> DoctorCheck {
         );
     }
 
-    let token_present = std::env::var("REIN_HTTP_TOKEN")
-        .ok()
-        .is_some_and(|token| !token.trim().is_empty());
+    let token_present = config.http_token().is_some();
     let policy = match config.resolve_auth_policy() {
         Ok(policy) => policy,
         Err(err) => {
@@ -1919,11 +1915,7 @@ fn check_proxy_auth(config: &ReinConfig) -> DoctorCheck {
     let token_present = std::env::var("REIN_PROXY_TOKEN")
         .ok()
         .filter(|token| !token.trim().is_empty())
-        .or_else(|| {
-            std::env::var("REIN_HTTP_TOKEN")
-                .ok()
-                .filter(|token| !token.trim().is_empty())
-        })
+        .or_else(|| config.http_token())
         .is_some();
     let is_loopback = is_loopback_bind(&config.proxy.bind);
     // v1.2 Phase 3: explicit `[proxy].auth = "public"` (loopback bind only)
@@ -2070,7 +2062,7 @@ fn check_gui_runtime(config: &ReinConfig) -> DoctorCheck {
         port_open,
         pid,
         std::process::id(),
-        || match probe_gui_health(port) {
+        || match probe_gui_health(config, port) {
             Ok(200) => RuntimeProbe::Ok("/api/health returned 200".to_string()),
             Ok(401) => RuntimeProbe::Warn("/api/health returned 401 (token mismatch?)".to_string()),
             Ok(status) => RuntimeProbe::Warn(format!("/api/health returned {status}")),
@@ -2108,7 +2100,7 @@ fn check_proxy_runtime(config: &ReinConfig) -> DoctorCheck {
     let pid = crate::service::is_running("proxy");
     let port_open = localhost_port_open(port);
     let probe = if port_open {
-        match probe_proxy_metrics(port) {
+        match probe_proxy_metrics(config, port) {
             Ok(Some((requests, errors, extractions))) => RuntimeProbe::Ok(format!(
                 "metrics requests={requests} errors={errors} extractions={extractions}"
             )),
@@ -2129,19 +2121,20 @@ fn localhost_port_open(port: u16) -> bool {
     .is_ok()
 }
 
-fn probe_gui_health(port: u16) -> anyhow::Result<u16> {
+fn probe_gui_health(config: &ReinConfig, port: u16) -> anyhow::Result<u16> {
     let mut headers = Vec::new();
-    if let Ok(token) = std::env::var("REIN_HTTP_TOKEN") {
+    if let Some(token) = config.http_token() {
         headers.push(("Authorization".to_string(), format!("Bearer {token}")));
     }
     let (status, _) = http_get_local(port, "/api/health?limit=1", &headers)?;
     Ok(status)
 }
 
-fn probe_proxy_metrics(port: u16) -> anyhow::Result<Option<(u64, u64, u64)>> {
+fn probe_proxy_metrics(config: &ReinConfig, port: u16) -> anyhow::Result<Option<(u64, u64, u64)>> {
     let mut headers = Vec::new();
-    if let Ok(token) =
-        std::env::var("REIN_PROXY_TOKEN").or_else(|_| std::env::var("REIN_HTTP_TOKEN"))
+    if let Some(token) = std::env::var("REIN_PROXY_TOKEN")
+        .ok()
+        .or_else(|| config.http_token())
     {
         headers.push(("x-rein-token".to_string(), token));
     }
@@ -4663,6 +4656,38 @@ provider = "inherit"
         assert!(check.message.contains("refuse to start"));
     }
 
+    // A token stored in the secrets file satisfies the auth checks when the
+    // command line has none in its environment.
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn test_doctor_accepts_owner_token_from_the_secrets_file() {
+        let _guard = EnvRestore {
+            key: "REIN_HTTP_TOKEN",
+            value: std::env::var("REIN_HTTP_TOKEN").ok(),
+        };
+        std::env::remove_var("REIN_HTTP_TOKEN");
+        let mut config = ReinConfig::default();
+        config.server.sse_enabled = true;
+        config.server.auth = Some(crate::config::AuthPolicyConfig::OAuth);
+
+        assert_eq!(check_http_auth(&config).status, CheckStatus::Fail);
+        assert_eq!(
+            check_auth_policy_consistency(&config).status,
+            CheckStatus::Fail
+        );
+        let hint = check_http_auth(&config).repair_hint.unwrap_or_default();
+        assert!(hint.contains("rein keys set REIN_HTTP_TOKEN"), "{hint}");
+
+        config
+            .secrets
+            .insert("REIN_HTTP_TOKEN".into(), "file-owner-secret".into());
+        assert_eq!(check_http_auth(&config).status, CheckStatus::Ok);
+        assert_eq!(
+            check_auth_policy_consistency(&config).status,
+            CheckStatus::Ok
+        );
+    }
+
     #[test]
     #[serial_test::serial(global_state)]
     fn test_doctor_fails_wildcard_oauth_policy_without_allowed_hosts() {
@@ -4827,7 +4852,7 @@ provider = "inherit"
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}"
                 .to_string(),
         );
-        let status = probe_gui_health(port).unwrap();
+        let status = probe_gui_health(&ReinConfig::default(), port).unwrap();
         assert_eq!(status, 200);
     }
 
@@ -4837,7 +4862,7 @@ provider = "inherit"
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 58\r\n\r\n{\"request_count\":12,\"error_count\":1,\"extraction_count\":5}"
                 .to_string(),
         );
-        let metrics = probe_proxy_metrics(port).unwrap();
+        let metrics = probe_proxy_metrics(&ReinConfig::default(), port).unwrap();
         assert_eq!(metrics, Some((12, 1, 5)));
     }
 

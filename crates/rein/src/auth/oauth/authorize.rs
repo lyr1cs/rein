@@ -215,12 +215,8 @@ fn redirect_or_bad_request(
     }
 }
 
-pub(crate) fn owner_authorized(headers: &hyper::HeaderMap) -> bool {
-    let Some(token) = std::env::var("REIN_HTTP_TOKEN")
-        .ok()
-        .map(|token| token.trim().to_string())
-        .filter(|token| !token.is_empty())
-    else {
+pub(crate) fn owner_authorized(config: &ReinConfig, headers: &hyper::HeaderMap) -> bool {
+    let Some(token) = config.http_token() else {
         return false;
     };
     request_has_valid_static_bearer(headers, &token)
@@ -229,8 +225,11 @@ pub(crate) fn owner_authorized(headers: &hyper::HeaderMap) -> bool {
         })
 }
 
-fn require_owner_authorization(headers: &hyper::HeaderMap) -> Option<OAuthResponse> {
-    if owner_authorized(headers) {
+fn require_owner_authorization(
+    config: &ReinConfig,
+    headers: &hyper::HeaderMap,
+) -> Option<OAuthResponse> {
+    if owner_authorized(config, headers) {
         None
     } else {
         Some(oauth_error(
@@ -270,10 +269,7 @@ fn csrf_cookie_secure_suffix(config: &ReinConfig) -> &'static str {
 /// "claude.ai connector keeps showing ofid_*" footgun documented in
 /// `docs/devlog/2026-05-11-v0.30.1.md`).
 pub(crate) fn owner_cookie_renewal_header(config: &ReinConfig) -> Option<(&'static str, String)> {
-    let token = std::env::var("REIN_HTTP_TOKEN")
-        .ok()
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())?;
+    let token = config.http_token()?;
     let secure = csrf_cookie_secure_suffix(config);
     Some((
         hyper::header::SET_COOKIE.as_str(),
@@ -303,7 +299,7 @@ pub fn handle_authorize_get(
         }
         Err(AuthorizeRejection::Internal { step, error }) => return internal_error(&error, step),
     };
-    if let Some(response) = require_owner_authorization(headers) {
+    if let Some(response) = require_owner_authorization(config, headers) {
         return response;
     }
     let (csrf_token, nonce) = match make_csrf(
@@ -396,7 +392,7 @@ pub fn handle_authorize_post(
             "redirect_uri mismatch",
         );
     }
-    if let Some(response) = require_owner_authorization(headers) {
+    if let Some(response) = require_owner_authorization(config, headers) {
         return response;
     }
     let key = match store::current_signing_key(store.conn()) {
@@ -701,6 +697,46 @@ mod tests {
     // is unset (no token to renew), and a Set-Cookie line with Max-Age=600
     // when set. The Max-Age must be the literal 600 so claude.ai's broker
     // gets a sliding 10-minute window on each authorize visit.
+    // Owner approval accepts the token stored in the secrets file and
+    // nothing else.
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn owner_approval_uses_the_token_from_the_secrets_file() {
+        let _token = EnvGuard::remove("REIN_HTTP_TOKEN");
+        let (_dir, mut config) = temp_config();
+        let bearer = |token: &str| {
+            let mut headers = hyper::HeaderMap::new();
+            headers.insert(
+                hyper::header::AUTHORIZATION,
+                format!("Bearer {token}").parse().unwrap(),
+            );
+            headers
+        };
+        // No token configured: nobody is the owner.
+        assert!(!owner_authorized(&config, &bearer("file-owner-secret")));
+        assert!(require_owner_authorization(&config, &bearer("file-owner-secret")).is_some());
+
+        config
+            .secrets
+            .insert("REIN_HTTP_TOKEN".into(), "file-owner-secret".into());
+        assert!(owner_authorized(&config, &bearer("file-owner-secret")));
+        assert!(!owner_authorized(&config, &bearer("wrong-secret")));
+        assert!(!owner_authorized(&config, &hyper::HeaderMap::new()));
+        assert!(require_owner_authorization(&config, &bearer("wrong-secret")).is_some());
+        assert!(require_owner_authorization(&config, &bearer("file-owner-secret")).is_none());
+
+        let mut cookie = hyper::HeaderMap::new();
+        cookie.insert(
+            hyper::header::COOKIE,
+            format!("{OAUTH_OWNER_COOKIE}=file-owner-secret")
+                .parse()
+                .unwrap(),
+        );
+        assert!(owner_authorized(&config, &cookie));
+        let (_, renewal) = owner_cookie_renewal_header(&config).expect("renewal header");
+        assert!(renewal.starts_with(&format!("{OAUTH_OWNER_COOKIE}=file-owner-secret;")));
+    }
+
     #[test]
     #[serial_test::serial(global_state)]
     fn owner_cookie_renewal_returns_none_when_token_unset() {

@@ -2078,7 +2078,7 @@ impl ReinConfig {
             if matches!(
                 policy,
                 crate::auth::AuthPolicy::BearerRequired | crate::auth::AuthPolicy::OAuth
-            ) && nonempty_env("REIN_HTTP_TOKEN").is_none()
+            ) && self.http_token().is_none()
             {
                 let purpose = match policy {
                     crate::auth::AuthPolicy::BearerRequired => "bearer auth",
@@ -2093,7 +2093,7 @@ impl ReinConfig {
             return Ok(policy);
         }
 
-        let has_http_token = nonempty_env("REIN_HTTP_TOKEN").is_some();
+        let has_http_token = self.http_token().is_some();
         if has_http_token {
             return Ok(crate::auth::AuthPolicy::BearerRequired);
         }
@@ -2218,6 +2218,17 @@ impl ReinConfig {
     /// The embedding model name (for cache keying and model-change detection).
     /// Look up an API key by env-var name: non-blank process env first, then
     /// the secrets file. Blank values count as unset.
+    /// The owner token (`REIN_HTTP_TOKEN`): the static bearer for
+    /// `bearer_required`, and the credential for owner approval and the
+    /// owner-only routes under `oauth`. Resolved like every other secret —
+    /// process environment first, then `~/.rein/secrets.env` — so the
+    /// server, `rein doctor` and every other command see the same token
+    /// without it having to be exported into a shell. Trimmed; an empty
+    /// value counts as unset.
+    pub fn http_token(&self) -> Option<String> {
+        self.secret("REIN_HTTP_TOKEN")
+    }
+
     pub fn secret(&self, env_name: &str) -> Option<String> {
         if let Some(v) = nonempty_env(env_name) {
             return Some(v);
@@ -4586,6 +4597,46 @@ auth = "oauth"
             .resolve_auth_policy()
             .expect_err("oauth without owner token must fail");
         assert!(err.to_string().contains("OAuth owner approval"));
+    }
+
+    // The owner token may live in the secrets file instead of the process
+    // environment; the policy resolves the same way.
+    #[test]
+    #[serial_test::serial(global_state)]
+    fn owner_token_from_the_secrets_file_satisfies_the_auth_policy() {
+        let _token = EnvGuard::remove("REIN_HTTP_TOKEN");
+        let mut cfg = ReinConfig::load_from_str("[server]\nauth = \"oauth\"\n").unwrap();
+        assert!(cfg.resolve_auth_policy().is_err());
+        assert_eq!(cfg.http_token(), None);
+
+        cfg.secrets
+            .insert("REIN_HTTP_TOKEN".into(), "  file-owner-secret\n".into());
+        assert_eq!(cfg.http_token().as_deref(), Some("file-owner-secret"));
+        assert_eq!(
+            cfg.resolve_auth_policy().unwrap(),
+            crate::auth::AuthPolicy::OAuth
+        );
+
+        // Without an explicit policy a stored token means bearer auth, as an
+        // exported one does.
+        let mut implicit = ReinConfig::default();
+        implicit
+            .secrets
+            .insert("REIN_HTTP_TOKEN".into(), "file-owner-secret".into());
+        assert_eq!(
+            implicit.resolve_auth_policy().unwrap(),
+            crate::auth::AuthPolicy::BearerRequired
+        );
+
+        // An empty stored value is no token.
+        cfg.secrets.insert("REIN_HTTP_TOKEN".into(), "   ".into());
+        assert!(cfg.resolve_auth_policy().is_err());
+
+        // The environment wins over the file.
+        let _env = EnvGuard::set("REIN_HTTP_TOKEN", "env-owner-secret");
+        cfg.secrets
+            .insert("REIN_HTTP_TOKEN".into(), "file-owner-secret".into());
+        assert_eq!(cfg.http_token().as_deref(), Some("env-owner-secret"));
     }
 
     // v0.35 Phase 3 — legacy `[server].allow_unauthenticated_loopback`

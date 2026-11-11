@@ -534,10 +534,7 @@ fn require_read_token<B>(req: &Request<B>, config: &ReinConfig) -> Result<(), Bo
     {
         return Ok(());
     }
-    let expected = std::env::var("REIN_HTTP_TOKEN")
-        .ok()
-        .filter(|t| !t.trim().is_empty());
-    let Some(expected) = expected else {
+    let Some(expected) = config.http_token() else {
         return Ok(());
     };
     if request_has_static_read_token(req.headers(), expected.trim()) {
@@ -551,11 +548,8 @@ fn require_read_token<B>(req: &Request<B>, config: &ReinConfig) -> Result<(), Bo
 }
 
 #[allow(clippy::result_large_err)] // BoxedResponse is already a boxed body.
-fn require_owner_token<B>(req: &Request<B>) -> Result<(), BoxedResponse> {
-    let expected = std::env::var("REIN_HTTP_TOKEN")
-        .ok()
-        .filter(|t| !t.trim().is_empty());
-    let Some(expected) = expected else {
+fn require_owner_token<B>(config: &ReinConfig, req: &Request<B>) -> Result<(), BoxedResponse> {
+    let Some(expected) = config.http_token() else {
         return Err(error_response(
             StatusCode::UNAUTHORIZED,
             "REIN_HTTP_TOKEN is not configured for owner-only endpoint",
@@ -642,13 +636,13 @@ async fn handle_api<B>(
             StatusCode::OK,
             json!({ "version": env!("CARGO_PKG_VERSION") }),
         ),
-        (&Method::GET, "/api/oauth/clients") => match require_owner_token(req) {
+        (&Method::GET, "/api/oauth/clients") => match require_owner_token(config, req) {
             Ok(()) => api_oauth_clients(config),
             Err(response) => response,
         },
         (&Method::POST, p) if p.starts_with("/api/oauth/clients/") && p.ends_with("/revoke") => {
             match require_mutation_marker(req) {
-                Ok(()) => match require_owner_token(req) {
+                Ok(()) => match require_owner_token(config, req) {
                     Ok(()) => {
                         let rest = &p["/api/oauth/clients/".len()..p.len() - "/revoke".len()];
                         let client_id = percent_decode_lossy(rest.trim_end_matches('/'));
@@ -665,14 +659,14 @@ async fn handle_api<B>(
         // H5 JSON body carries the `network` flag. GUI/curl clients must
         // send body instead of `?fix=true` query string.
         (&Method::POST, "/api/providers/reveal") => match require_mutation_marker(req) {
-            Ok(()) => match require_owner_token(req) {
+            Ok(()) => match require_owner_token(config, req) {
                 Ok(()) => api_providers_reveal(config, literal_body.as_deref()),
                 Err(response) => response,
             },
             Err(response) => response,
         },
         (&Method::POST, "/api/session") => match require_mutation_marker(req) {
-            Ok(()) => match require_owner_token(req) {
+            Ok(()) => match require_owner_token(config, req) {
                 Ok(()) => api_create_session(config),
                 Err(response) => response,
             },
@@ -1095,6 +1089,13 @@ fn api_providers_reveal(config: &ReinConfig, body: Option<&[u8]>) -> BoxedRespon
     let Some(id) = parsed.get("credential").and_then(|v| v.as_str()) else {
         return error_response(StatusCode::BAD_REQUEST, "missing credential id");
     };
+    // The owner token and the proxy token authenticate callers to this
+    // server; they are never provider credentials. Even if a surface's
+    // `api_key_env` is pointed at one of them, this route does not hand
+    // them out.
+    if matches!(id, "env:REIN_HTTP_TOKEN" | "env:REIN_PROXY_TOKEN") {
+        return error_response(StatusCode::NOT_FOUND, "unknown or absent credential");
+    }
     let report = crate::ops::handlers::providers::collect(config, None);
     let Some(cred) = report.credentials.iter().find(|c| c.id == id && c.present) else {
         return error_response(StatusCode::NOT_FOUND, "unknown or absent credential");
@@ -1112,10 +1113,7 @@ fn api_providers_reveal(config: &ReinConfig, body: Option<&[u8]>) -> BoxedRespon
 }
 
 fn api_create_session(config: &ReinConfig) -> BoxedResponse {
-    let token = std::env::var("REIN_HTTP_TOKEN")
-        .ok()
-        .filter(|token| !token.trim().is_empty());
-    match token {
+    match config.http_token() {
         Some(token) => {
             let secure_session_cookies = session_cookies_should_be_secure(config);
             let cookies = [
@@ -2152,16 +2150,16 @@ mod tests {
         }
 
         let missing: Request<String> = req_with(None);
-        assert!(require_owner_token(&missing).is_err());
+        assert!(require_owner_token(&ReinConfig::default(), &missing).is_err());
 
         let ok: Request<String> = req_with(Some(("authorization", "Bearer owner-secret")));
-        assert!(require_owner_token(&ok).is_ok());
+        assert!(require_owner_token(&ReinConfig::default(), &ok).is_ok());
 
         unsafe {
             std::env::remove_var("REIN_HTTP_TOKEN");
         }
         let unset: Request<String> = req_with(None);
-        assert!(require_owner_token(&unset).is_err());
+        assert!(require_owner_token(&ReinConfig::default(), &unset).is_err());
 
         match original {
             Some(v) => unsafe {
@@ -2221,6 +2219,126 @@ mod tests {
     async fn read_json(response: BoxedResponse) -> serde_json::Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    // The owner token stored in the secrets file (no environment variable)
+    // gates every route the environment variable gates: a missing or wrong
+    // credential is rejected, the right one is accepted, and surrounding
+    // whitespace in the stored value does not matter.
+    #[tokio::test]
+    #[serial_test::serial(rein_http_token_env)]
+    async fn owner_token_from_the_secrets_file_gates_owner_and_read_routes() {
+        let _guard = env_lock().lock().await;
+        let original = std::env::var("REIN_HTTP_TOKEN").ok();
+        unsafe {
+            std::env::remove_var("REIN_HTTP_TOKEN");
+        }
+        let dir = tempdir().unwrap();
+        let mut config = test_config(&dir.path().join("owner-token-file.db"));
+        config
+            .secrets
+            .insert("REIN_HTTP_TOKEN".into(), "  file-owner-secret \n".into());
+
+        let request = |method: &str, uri: &str, bearer: Option<&str>| {
+            let mut builder = Request::builder().method(method).uri(uri);
+            if method == "POST" {
+                builder = builder.header("x-rein-action", "1");
+            }
+            if let Some(token) = bearer {
+                builder = builder.header("authorization", format!("Bearer {token}"));
+            }
+            builder.body(()).unwrap()
+        };
+        async fn status(req: Request<()>, config: &ReinConfig) -> StatusCode {
+            handle_rest_request(&req, config).await.unwrap().status()
+        }
+
+        // Owner-only route.
+        for bearer in [None, Some("wrong-secret"), Some("")] {
+            assert_eq!(
+                status(request("GET", "/api/oauth/clients", bearer), &config).await,
+                StatusCode::UNAUTHORIZED,
+                "{bearer:?}"
+            );
+        }
+        assert_eq!(
+            status(
+                request("GET", "/api/oauth/clients", Some("file-owner-secret")),
+                &config
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        // Protected-read route.
+        assert_eq!(
+            status(request("GET", "/api/artifacts", None), &config).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(
+                request("GET", "/api/artifacts", Some("wrong-secret")),
+                &config
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(
+                request("GET", "/api/artifacts", Some("file-owner-secret")),
+                &config
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        // Session cookie creation.
+        let denied = handle_rest_request(&request("POST", "/api/session", None), &config)
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        assert!(denied.headers().get(hyper::header::SET_COOKIE).is_none());
+        let granted = handle_rest_request(
+            &request("POST", "/api/session", Some("file-owner-secret")),
+            &config,
+        )
+        .await
+        .unwrap();
+        assert_eq!(granted.status(), StatusCode::OK);
+        assert!(granted.headers().get(hyper::header::SET_COOKIE).is_some());
+
+        // No token anywhere: owner routes stay closed.
+        config.secrets.clear();
+        assert_eq!(
+            status(
+                request("GET", "/api/oauth/clients", Some("file-owner-secret")),
+                &config
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        if let Some(v) = original {
+            unsafe {
+                std::env::set_var("REIN_HTTP_TOKEN", v);
+            }
+        }
+    }
+
+    // The reveal route hands out provider credentials only: never the owner
+    // token, even when a surface's `api_key_env` is pointed at it.
+    #[test]
+    fn reveal_refuses_the_owner_and_proxy_tokens() {
+        let mut config = ReinConfig::default();
+        config
+            .secrets
+            .insert("REIN_HTTP_TOKEN".into(), "file-owner-secret".into());
+        config.embedding.google.api_key_env = Some("REIN_HTTP_TOKEN".into());
+        for id in ["env:REIN_HTTP_TOKEN", "env:REIN_PROXY_TOKEN"] {
+            let body = serde_json::to_vec(&json!({ "credential": id })).unwrap();
+            let response = api_providers_reveal(&config, Some(&body));
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{id}");
+        }
     }
 
     #[tokio::test]

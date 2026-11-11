@@ -1125,9 +1125,7 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
     let config_clone = config.clone();
 
     // Bearer token authentication
-    let auth_token = std::env::var("REIN_HTTP_TOKEN")
-        .ok()
-        .filter(|token| !token.trim().is_empty());
+    let auth_token = config.http_token();
     let auth_policy = config.resolve_auth_policy()?;
     match startup_auth_policy_warning(auth_token.is_some(), &config, auth_policy) {
         Some(StartupAuthPolicyWarning::ExplicitTokenIgnored) => {
@@ -1345,7 +1343,7 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
                             )
                         }
                         (hyper::Method::POST, "/oauth/authorize") => {
-                            if !crate::auth::oauth::authorize::owner_authorized(&headers) {
+                            if !crate::auth::oauth::authorize::owner_authorized(&cfg, &headers) {
                                 return Ok::<_, std::convert::Infallible>(oauth_http_response(
                                     crate::auth::oauth::oauth_error(
                                         hyper::StatusCode::UNAUTHORIZED,
