@@ -9,6 +9,36 @@ The full release notes (with audit-round breakdowns and operator-visible
 schema changes) live on the [GitHub Releases page](https://github.com/lyr1cs/rein/releases).
 This file is a condensed index intended for quick scanning.
 
+## [1.5.4] — 2026-11-12
+
+Patch for Anthropic as an LLM vendor. No schema or config change.
+
+### Fixed
+
+- **An Anthropic model failed on every LLM surface** — rein sent
+  `temperature` on every chat request, tried `response_format =
+  json_object` first, and expressed "disable thinking" as a `/no_think`
+  prompt line. Anthropic's OpenAI-compatible endpoint rejects a non-default
+  `temperature` on its current models and rejects `json_object`, and takes
+  "no thinking" as a request field. Chat requests are now built per vendor
+  (`vendors::chat_request_body`): `temperature` and `json_object` mode only
+  where accepted, and `disable_thinking` as the prompt line or the
+  `thinking` field. The extractor, query expander and reranker use it; for a
+  vendor without `json_object` mode the plain request is sent first instead
+  of a guaranteed failed attempt. Other vendors' requests are unchanged.
+- **`rein providers status --probe` reported a valid Anthropic key as
+  unauthorized** — its model list answers 400 without an `anthropic-version`
+  header; the probe now sends it.
+- The startup note for an OpenAI-compatible extract backend named the
+  unresolved default endpoint; it names the resolved vendor and endpoint.
+
+### Notes
+
+- With an Anthropic model the reranker runs at the provider's default
+  sampling, so its ordering is not guaranteed to repeat between calls.
+- OpenAI-compatible LLM tables default to `max_input_chars = 16000`; set it
+  explicitly for a hosted vendor with a large context window.
+
 ## [1.5.3] — 2026-11-12
 
 Patch for the owner token. No schema or config change.
