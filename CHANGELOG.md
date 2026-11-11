@@ -9,6 +9,106 @@ The full release notes (with audit-round breakdowns and operator-visible
 schema changes) live on the [GitHub Releases page](https://github.com/lyr1cs/rein/releases).
 This file is a condensed index intended for quick scanning.
 
+## [1.5.2] — 2026-11-12
+
+Maintenance patch for two reported issues ([#5], [#6]) and the defects found
+while reviewing the code around them. Config schema and the database schema
+version are unchanged; the OAuth tables move to their own version 2 on first
+open. Two defaults change (see Changed).
+
+### Fixed
+
+Embedding
+
+- **`rein warmup` never converged when a page held very large memories**
+  ([#5]) — warmup, the reindex staging loop and the vector-dedup sweep sent
+  one request per page of memories with the full text of each. A page with a
+  few very large memories exceeded the provider's per-minute quota or the
+  five-second client timeout as a whole, failed as a whole, and was rebuilt
+  identically on the next run. Requests are now packed by a character budget,
+  a failed request is split down to single texts, a rate limit is waited out
+  for the quota window, and document batches get a timeout that grows with
+  the request.
+- **A memory the provider refuses was re-sent on every run** — a text
+  refused on its own (HTTP 400, 413 or 422) is recorded per memory, model and
+  text hash and not sent again until the text or the model changes. A refusal
+  is only recorded when the provider embedded other texts in the same run and
+  still embeds at the end of it, so a revoked key records nothing.
+- **One refused memory discarded a whole re-embedding** — `rein migrate
+  --reindex` and the automatic model migration publish the new index around
+  recorded refusals. Outages, rate limits and caller-side errors still abort
+  with the old index intact.
+- **The vector-dedup sweep could stall behind memories that fail to embed** —
+  pending rows are swept shortest first and failing texts are isolated.
+- OpenAI-compatible embedders retry transient failures; a provider
+  `Retry-After` is capped; query embedding for recall retries once.
+
+OAuth
+
+- **Client registration failed with a UNIQUE constraint on `client_name`**
+  ([#6]) — a database whose `oauth_clients` table carried that constraint
+  rejected every second registration under one name (claude.ai registers
+  every connector as `Claude`). Opening such a database rebuilds the table
+  without the constraint; clients, grants and authorization codes are kept.
+- Registration, token and authorize endpoints, and REST handlers, answer
+  internal failures with a fixed message and log the detail on the server.
+  Validation errors keep their text.
+- The registration rate limit no longer puts every caller behind a reverse
+  proxy in one bucket, is charged only for well-formed requests, and has a
+  ceiling across all callers.
+
+Store and ingest
+
+- Opening an up-to-date database took the write lock and failed with
+  `database is locked` behind a long write; it is read-only now.
+- `rein_recall` with `limit: 0` aborted the server process.
+- Dedup merges and evolution refines grew a memory without bound; they never
+  shorten existing content and bound what they append.
+- The pattern fallback stored whole documents as one memory when the text
+  had no ASCII sentence punctuation; it splits on CJK sentence terminators
+  and paragraph breaks and skips oversized blobs.
+- Extracted items over the `rein_store` size limit are not admitted;
+  `rein_update` applies the same limit to content that grows.
+- Auto-memory file matching works for CJK queries and ranks by overlap.
+- QMD migration cut CJK text into chunks about three times the budget.
+
+Maintenance passes
+
+- **Consolidation turned a failed LLM call into a lossy merge** — a group
+  whose synthesis call fails is left untouched, reported as skipped, and kept
+  out of the cleanup dedup scope.
+- A judge drift alert never cleared; it clears after a full recovered window.
+  An incomplete structural-anchor run is retried on a later pass instead of
+  after a full interval.
+- Cold-archive summaries retried failing rows first on every pass and marked
+  a row done on blank model output; failed rows back off and blank output
+  counts against the strike limit.
+- `rein doctor` reported a completed pipeline pass as healthy however old it
+  was and left the merge-refinement queue out of the queue check.
+
+Proxy
+
+- A streamed response longer than five minutes was cut by a total request
+  deadline; the upstream client uses connect and idle timeouts.
+- Responses on unrouted paths were buffered and failed with 502 above 1 MiB;
+  they are relayed as a stream.
+- `Accept-Encoding` is not forwarded upstream, so response bodies stay
+  readable for extraction.
+
+### Changed
+
+- `[proxy].max_request_body` defaults to 64 MiB (was 1 MiB).
+- A full OAuth client table answers 503 instead of 400.
+- Warmup and reindex report memories the provider refuses separately from
+  errors.
+- `rein consolidate` and `rein cleanup` list groups skipped because the LLM
+  call failed.
+- `rein doctor` warns when the last completed pipeline pass is overdue and
+  names the command that drains a resummerize backlog.
+
+[#5]: https://github.com/lyr1cs/rein/issues/5
+[#6]: https://github.com/lyr1cs/rein/issues/6
+
 ## [1.5.1] — 2026-10-20
 
 Maintenance patch from a whole-project review of v1.5.0. No schema or
