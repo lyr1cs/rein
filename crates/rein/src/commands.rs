@@ -503,6 +503,15 @@ pub fn handle_keys_set(name: &str, value: Option<String>, stdin: bool) -> anyhow
     {
         println!("note: {name} is also set in this process environment, which takes precedence");
     }
+    // The owner token is not a provider key: no surface "uses" it, and the
+    // provider hints below would send the operator the wrong way.
+    if name == "REIN_HTTP_TOKEN" {
+        println!(
+            "used by: HTTP auth (static bearer under `bearer_required`, owner approval under `oauth`)"
+        );
+        println!("verify with: rein doctor");
+        return Ok(());
+    }
     // Reporting which surfaces use the key needs the config; tolerate a
     // config that does not load (the key is already stored).
     match ReinConfig::load() {
