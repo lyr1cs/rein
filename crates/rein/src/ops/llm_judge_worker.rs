@@ -239,11 +239,24 @@ fn structural_surface_due(
         return true;
     }
     let interval = i64::try_from(interval_secs).unwrap_or(i64::MAX);
-    now >= started_at && now.saturating_sub(started_at) >= interval
+    // A run that is still `Collecting` once its events are folded did not
+    // get all of its probes (provider error, unparseable reply, call cap).
+    // It can never complete, because the run tokens are gone, so it is due
+    // again as soon as it can no longer be in flight: the ledger's
+    // stale-claim bound is the longest a judge call is allowed to take.
+    // Without this the surface would stay `Collecting` for a full interval.
+    let wait = if surface_state.status == contract::JudgeStructuralStatus::Collecting {
+        interval.min(contract::LLM_JUDGE_STALE_CLAIM_SECS)
+    } else {
+        interval
+    };
+    now >= started_at && now.saturating_sub(started_at) >= wait
 }
 
-/// Run at most one sealed four-probe suite per enabled surface and interval.
-/// Every actual LLM call uses the existing judge-call ledger before dispatch.
+/// Run at most one sealed four-probe suite per enabled surface and interval;
+/// a suite that did not collect all four probes is started again on a later
+/// pass. Every actual LLM call uses the existing judge-call ledger before
+/// dispatch, so retries are bounded by the daily call cap.
 pub fn run_structural_anchor_suite(
     store: &SqliteStore,
     config: &crate::config::ReinConfig,
@@ -259,22 +272,12 @@ pub fn run_structural_anchor_suite(
             "judge structural anchor run requires positive time and interval".to_string(),
         ));
     }
-    let loaded =
-        crate::store::judge_structural_calibration::load_judge_structural_calibration(store.conn());
-    let state = match loaded.status {
-        crate::store::judge_structural_calibration::JudgeStructuralCalibrationLoadStatus::Missing => {
-            crate::store::judge_structural_calibration::JudgeStructuralCalibrationState::default()
-        }
-        crate::store::judge_structural_calibration::JudgeStructuralCalibrationLoadStatus::Loaded => {
-            loaded.state
-        }
-        status => {
-            return Err(ReinError::Config(format!(
-                "judge structural anchor runner preserved unhealthy state {status:?}: {}",
-                loaded.error.unwrap_or_else(|| "no detail".to_string())
-            )));
-        }
-    };
+    // Fold the probe events already emitted before judging what is due. The
+    // state only reflects a probe once the consumer has applied its event,
+    // so without this a complete run whose events are still unconsumed would
+    // look incomplete and be started again. An unhealthy state is an error
+    // here as well, and the runner leaves it untouched.
+    let state = crate::ops::judge_calibration::run_judge_structural_anchor_consumer(store)?;
 
     let model_fingerprint = structural_model_fingerprint(extractor);
     let mut stats = StructuralAnchorRunStats::default();
@@ -296,6 +299,16 @@ pub fn run_structural_anchor_suite(
         {
             continue;
         }
+        // Reserve the first call before sealing: when the daily cap is
+        // already used up the pass leaves the stored state as it is instead
+        // of replacing it with an empty run that cannot make a single call.
+        let Some(first_reservation) =
+            contract::reserve_call(store.conn(), config.ars.llm_judge.daily_call_cap)?
+        else {
+            stats.cap_dropped += 1;
+            continue;
+        };
+        let mut first_reservation = Some(first_reservation);
         let surface_label = structural_surface_label(surface);
         let run_id = format!("jsa-{surface_label}-{}", ulid::Ulid::new());
         let Some(credentials) = crate::ops::judge_calibration::start_judge_structural_probe_run(
@@ -309,17 +322,27 @@ pub fn run_structural_anchor_suite(
             now,
         )?
         else {
+            // No call was made on the reservation taken above; it stays
+            // `reserved` and the ledger reaps it as stale, which keeps it
+            // out of the daily count.
             tracing::debug!(?surface, "judge structural run already claimed by peer");
             continue;
         };
         stats.runs_started += 1;
 
         for kind in JudgeStructuralProbeKind::ALL {
-            let Some(reservation) =
-                contract::reserve_call(store.conn(), config.ars.llm_judge.daily_call_cap)?
-            else {
-                stats.cap_dropped += 1;
-                break;
+            let reservation = match first_reservation.take() {
+                Some(reservation) => reservation,
+                None => {
+                    match contract::reserve_call(store.conn(), config.ars.llm_judge.daily_call_cap)?
+                    {
+                        Some(reservation) => reservation,
+                        None => {
+                            stats.cap_dropped += 1;
+                            break;
+                        }
+                    }
+                }
             };
             stats.attempted += 1;
             let probe = build_structural_anchor_probe(&run_id, surface, kind);
@@ -329,7 +352,10 @@ pub fn run_structural_anchor_suite(
                     let _ = reservation.fail(store.conn());
                     stats.failed += 1;
                     tracing::warn!(?surface, ?kind, error = %error, "judge structural probe failed");
-                    continue;
+                    // The run needs every probe to reach `Ready`, so the
+                    // remaining probes of this run would be wasted calls.
+                    // The surface is retried as a whole on a later pass.
+                    break;
                 }
             };
             let Some((observed_hit, _reason)) = parse_judge_output(&raw) else {
@@ -340,7 +366,7 @@ pub fn run_structural_anchor_suite(
                     ?kind,
                     "judge structural probe output was unparseable"
                 );
-                continue;
+                break;
             };
             let payload = JudgeStructuralAnchorPayload {
                 surface,
@@ -1779,6 +1805,88 @@ mod tests {
             8,
             "interval gate must prevent extra spend"
         );
+    }
+
+    #[test]
+    fn structural_anchor_incomplete_run_is_retried_without_waiting_a_full_interval() {
+        use crate::judge::contract::{JudgeStructuralStatus, LLM_JUDGE_STALE_CLAIM_SECS};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = temp_judge_config(&dir);
+        config.ars.llm_judge.structural_anchors.mode = JudgeStructuralAnchorMode::Monitor;
+        config.ars.llm_judge.structural_anchors.interval_secs = 86_400;
+        config.ars.llm_judge.daily_call_cap = 100;
+        let store = SqliteStore::in_memory().unwrap();
+        let verdict = |hit: bool| -> Result<String, String> {
+            Ok(format!(
+                "HIT: {}\nWHY: scripted structural verdict",
+                if hit { "yes" } else { "no" }
+            ))
+        };
+
+        // Pass 1: the first synthesis probe fails at the provider; the
+        // concept-summary suite gets its four expected verdicts.
+        let extractor = ExtractorKind::Mock(MockExtractor::with_responses(vec![
+            Err("provider unavailable".to_string()),
+            verdict(true),
+            verdict(true),
+            verdict(false),
+            verdict(false),
+        ]));
+        let first = run_structural_anchor_suite(&store, &config, &extractor, 1_000).unwrap();
+        assert_eq!(first.runs_started, 2);
+        assert_eq!(first.failed, 1);
+        assert_eq!(
+            first.attempted, 5,
+            "a failed probe ends its run instead of spending the other three calls"
+        );
+        assert_eq!(first.emitted, 4);
+        let state =
+            crate::ops::judge_calibration::run_judge_structural_anchor_consumer(&store).unwrap();
+        assert_eq!(state.synthesis.status, JudgeStructuralStatus::Collecting);
+        assert_eq!(state.concept_summary.status, JudgeStructuralStatus::Ready);
+
+        // While the failed run could still be in flight nothing is retried.
+        let extractor = ExtractorKind::Mock(MockExtractor::with_responses(vec![]));
+        let early = run_structural_anchor_suite(
+            &store,
+            &config,
+            &extractor,
+            1_000 + LLM_JUDGE_STALE_CLAIM_SECS - 1,
+        )
+        .unwrap();
+        assert_eq!(early.runs_started, 0);
+        assert_eq!(mock_call_count(&extractor), 0);
+
+        // Past the stale-claim bound, long before the daily interval, the
+        // incomplete surface runs again; the complete one is left alone.
+        let retry_at = 1_000 + LLM_JUDGE_STALE_CLAIM_SECS;
+        assert!(retry_at < 1_000 + 86_400);
+        let extractor = ExtractorKind::Mock(MockExtractor::with_responses(vec![
+            verdict(true),
+            verdict(true),
+            verdict(false),
+            verdict(false),
+        ]));
+        let retry = run_structural_anchor_suite(&store, &config, &extractor, retry_at).unwrap();
+        assert_eq!(retry.runs_started, 1);
+        assert_eq!(retry.emitted, 4);
+        assert_eq!(mock_call_count(&extractor), 4);
+        let state =
+            crate::ops::judge_calibration::run_judge_structural_anchor_consumer(&store).unwrap();
+        assert_eq!(state.synthesis.status, JudgeStructuralStatus::Ready);
+        assert_eq!(state.concept_summary.status, JudgeStructuralStatus::Ready);
+
+        // Every call, failed or not, went through the ledger.
+        let ledger: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM judge_call_ledger WHERE status IN ('done', 'failed')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ledger, 9);
     }
 
     #[test]

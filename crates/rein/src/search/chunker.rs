@@ -1,6 +1,11 @@
 /// Split text into chunks by Markdown headings, then by paragraph, then by sentence.
-/// Each chunk <= max_tokens (estimated at 4 chars per token).
+/// Each chunk <= max_tokens, estimated at 4 bytes per token.
 /// Overlap: overlap_percent of max_tokens carried from end of previous chunk.
+///
+/// The budget (`max_chars` below and in the helpers) is measured in UTF-8
+/// bytes at every level — headings, paragraphs, sentences and the hard split —
+/// so a chunk of CJK text (3 bytes per character) holds a third as many
+/// characters as a chunk of ASCII text, not three times the bytes.
 pub fn semantic_chunk(text: &str, max_tokens: usize, overlap_percent: usize) -> Vec<String> {
     let max_chars = max_tokens * 4;
     let overlap_chars = max_chars * overlap_percent / 100;
@@ -116,9 +121,9 @@ fn split_by_sentences(text: &str, max_chars: usize) -> Vec<String> {
     for sentence in &sentences {
         if sentence.len() > max_chars {
             // One sentence over the budget (minified JSON, code, CJK prose
-            // with no ". " boundaries): hard-split it at char boundaries.
-            // Accepting it as `current` used to pass it through as a single
-            // oversized chunk, which the embedding batch then rejected.
+            // with no ". " boundaries): hard-split it at char boundaries,
+            // by the same byte budget the comparison above uses, so no
+            // chunk exceeds what the embedding batch accepts.
             if !current.is_empty() {
                 chunks.push(std::mem::take(&mut current));
             }
@@ -147,17 +152,28 @@ fn split_by_sentences(text: &str, max_chars: usize) -> Vec<String> {
     chunks
 }
 
-/// Split at char boundaries into pieces of at most `max_chars` chars.
-fn hard_split(text: &str, max_chars: usize) -> Vec<String> {
-    let max_chars = max_chars.max(1);
-    let chars: Vec<char> = text.chars().collect();
-    (0..chars.len())
-        .step_by(max_chars)
-        .map(|start| {
-            let end = (start + max_chars).min(chars.len());
-            chars[start..end].iter().collect()
-        })
-        .collect()
+/// Split into pieces of at most `max_bytes` bytes, cutting only at char
+/// boundaries. A budget smaller than one character still makes progress: that
+/// character becomes a piece of its own.
+fn hard_split(text: &str, max_bytes: usize) -> Vec<String> {
+    let max_bytes = max_bytes.max(1);
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = (start + max_bytes).min(text.len());
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            end = start + 1;
+            while end < text.len() && !text.is_char_boundary(end) {
+                end += 1;
+            }
+        }
+        pieces.push(text[start..end].to_string());
+        start = end;
+    }
+    pieces
 }
 
 /// Extract sentences from text, splitting on . ! ? followed by whitespace.
@@ -317,6 +333,25 @@ mod tests {
         assert!(chunks.len() > 1);
         assert!(chunks.iter().all(|c| c.chars().count() <= 512));
         assert_eq!(chunks.concat(), cjk);
+    }
+
+    #[test]
+    fn hard_split_budget_is_bytes_for_multibyte_text() {
+        // 7,650 bytes of CJK in one "sentence"; budget 128 tokens = 512 bytes.
+        let cjk = "这是一个没有英文句号的很长的段落。".repeat(150);
+        let chunks = semantic_chunk(&cjk, 128, 0);
+        assert!(
+            chunks.iter().all(|c| c.len() <= 512),
+            "largest chunk is {} bytes",
+            chunks.iter().map(|c| c.len()).max().unwrap_or(0)
+        );
+        assert!(chunks.len() >= cjk.len() / 512);
+        assert_eq!(chunks.concat(), cjk);
+
+        // A budget below one character still advances, one char per piece.
+        assert_eq!(hard_split("记忆", 1), vec!["记", "忆"]);
+        // ASCII is unaffected: bytes and chars coincide.
+        assert_eq!(hard_split("abcdef", 4), vec!["abcd", "ef"]);
     }
 
     #[test]

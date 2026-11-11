@@ -123,6 +123,38 @@ fn error_response(status: StatusCode, msg: &str) -> BoxedResponse {
     json_response(status, json!({ "error": msg }))
 }
 
+const INTERNAL_ERROR_MESSAGE: &str = "internal server error";
+
+/// 500 answer for a failure inside the server (store open, SQLite, search).
+/// The error text can name filesystem paths, tables and SQL, so it goes to
+/// the server log and the caller gets a fixed message. `context` names the
+/// handler and step; nothing from the request is logged.
+fn internal_error_response(context: &str, err: &dyn std::fmt::Display) -> BoxedResponse {
+    tracing::warn!(error = %err, context, "REST request failed inside the server");
+    error_response(StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_ERROR_MESSAGE)
+}
+
+/// Answer for an error that carries its own status: 4xx text is feedback for
+/// the caller and is returned as is, 5xx text is replaced by the generic
+/// message and logged.
+fn kinded_error_response(
+    context: &str,
+    status: StatusCode,
+    err: &dyn std::fmt::Display,
+) -> BoxedResponse {
+    if status.is_server_error() {
+        tracing::warn!(
+            error = %err,
+            context,
+            status = status.as_u16(),
+            "REST request failed inside the server"
+        );
+        error_response(status, INTERNAL_ERROR_MESSAGE)
+    } else {
+        error_response(status, &err.to_string())
+    }
+}
+
 fn secure_cookie_suffix(secure: bool) -> &'static str {
     if secure {
         "; Secure"
@@ -729,7 +761,7 @@ fn handle_memoir_path(
 fn api_oauth_clients(config: &ReinConfig) -> BoxedResponse {
     let store = match config.open_store() {
         Ok(store) => store,
-        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+        Err(err) => return internal_error_response("oauth clients: open store", &err),
     };
     match crate::auth::oauth::store::list_clients(store.conn()) {
         Ok(clients) => json_response(
@@ -747,14 +779,14 @@ fn api_oauth_clients(config: &ReinConfig) -> BoxedResponse {
                 }).collect::<Vec<_>>()
             }),
         ),
-        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+        Err(err) => internal_error_response("oauth clients: list", &err),
     }
 }
 
 fn api_oauth_revoke_client(config: &ReinConfig, client_id: &str) -> BoxedResponse {
     let store = match config.open_store() {
         Ok(store) => store,
-        Err(err) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+        Err(err) => return internal_error_response("oauth revoke: open store", &err),
     };
     match crate::auth::oauth::store::revoke_client(store.conn(), client_id) {
         Ok(()) => {
@@ -766,7 +798,7 @@ fn api_oauth_revoke_client(config: &ReinConfig, client_id: &str) -> BoxedRespons
             crate::auth::oauth::bearer_cache_clear();
             json_response(StatusCode::OK, json!({ "revoked": true }))
         }
-        Err(err) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &err.to_string()),
+        Err(err) => internal_error_response("oauth revoke: revoke client", &err),
     }
 }
 
@@ -787,7 +819,7 @@ fn api_activity(
     };
     let store = match config.open_store() {
         Ok(s) => s,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_error_response("activity: open store", &e),
     };
     let conn = store.conn();
     let offset = format!("-{days} days");
@@ -814,7 +846,7 @@ fn api_activity(
 
     let mut recall_stmt = match conn.prepare(&recall_sql) {
         Ok(s) => s,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_error_response("activity: prepare recall query", &e),
     };
     let recall_rows: Vec<(String, i64)> = recall_stmt
         .query_map(rusqlite::params![offset], |row| {
@@ -826,7 +858,7 @@ fn api_activity(
 
     let mut store_stmt = match conn.prepare(&store_sql) {
         Ok(s) => s,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_error_response("activity: prepare store query", &e),
     };
     let store_rows: Vec<(String, i64)> = store_stmt
         .query_map(rusqlite::params![offset], |row| {
@@ -1036,8 +1068,9 @@ async fn try_dispatch_inventory_rest<B>(
             // that tag BadRequest / NotFound / Forbidden / Conflict surface
             // the right HTTP status to REST clients. Pre-H4 this was a
             // hardcoded 500 regardless of error kind.
+            // Server-side failures answer with a generic message.
             let status = e.kind().status_code();
-            Some(error_response(status, &e.to_string()))
+            Some(kinded_error_response(entry.path_template, status, &e))
         }
     }
 }
@@ -1275,12 +1308,7 @@ fn run_recall_query(
 
     let store = match config.open_store() {
         Ok(s) => s,
-        Err(e) => {
-            return Err(error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &e.to_string(),
-            ))
-        }
+        Err(e) => return Err(internal_error_response("recall: open store", &e)),
     };
 
     // Generate a request_id here so feedback submitted against this recall
@@ -1300,7 +1328,7 @@ fn run_recall_query(
         false,
         Some(request_id.clone()),
     )
-    .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?;
+    .map_err(|e| internal_error_response("recall: search", &e))?;
     Ok((
         results,
         request_id,
@@ -1416,7 +1444,7 @@ fn api_memoir_inspect(
 ) -> BoxedResponse {
     let store = match config.open_store() {
         Ok(s) => s,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_error_response("memoir inspect: open store", &e),
     };
     match store.inspect_concept(memoir, concept, depth) {
         Ok((center, neighbors, links)) => json_response(
@@ -1427,7 +1455,7 @@ fn api_memoir_inspect(
                 "links": links,
             }),
         ),
-        Err(e) => error_response(e.kind().status_code(), &e.to_string()),
+        Err(e) => kinded_error_response("memoir inspect", e.kind().status_code(), &e),
     }
 }
 
@@ -1444,7 +1472,7 @@ fn api_timeline(
 
     let store = match config.open_store() {
         Ok(s) => s,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_error_response("timeline: open store", &e),
     };
 
     // Collect episodes in window
@@ -1476,7 +1504,7 @@ fn api_timeline(
             "SELECT * FROM memories WHERE created_at >= ?1 AND created_at <= ?2 ORDER BY created_at DESC LIMIT ?3",
         ) {
             Ok(stmt) => stmt,
-            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            Err(e) => return internal_error_response("timeline: prepare memory query", &e),
         };
         let rows = match stmt.query_map(
             rusqlite::params![from_bound.to_rfc3339(), to_bound.to_rfc3339(), limit],
@@ -1491,12 +1519,12 @@ fn api_timeline(
             },
         ) {
             Ok(rows) => rows,
-            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            Err(e) => return internal_error_response("timeline: run memory query", &e),
         };
         let memories: Vec<crate::types::Memory> = rows.filter_map(|r| r.ok()).collect();
         match store.collapse_to_canonicals(memories, limit) {
             Ok(memories) => memories,
-            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            Err(e) => return internal_error_response("timeline: collapse to canonicals", &e),
         }
     } else {
         store.recent(limit).unwrap_or_default()
@@ -1542,11 +1570,11 @@ fn api_episodes(
     };
     let store = match config.open_store() {
         Ok(s) => s,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_error_response("episodes: open store", &e),
     };
     match store.list_episodes(limit) {
         Ok(episodes) => json_response(StatusCode::OK, json!({ "episodes": episodes })),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => internal_error_response("episodes: list", &e),
     }
 }
 
@@ -1564,7 +1592,7 @@ fn api_artifacts(
     };
     let store = match config.open_store() {
         Ok(s) => s,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_error_response("artifacts: open store", &e),
     };
 
     // Pagination response shape:
@@ -1617,7 +1645,7 @@ fn api_artifacts(
                 }),
             )
         }
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => internal_error_response("artifacts: list", &e),
     }
 }
 
@@ -1646,7 +1674,7 @@ fn api_artifact_detail(
 ) -> BoxedResponse {
     let store = match config.open_store() {
         Ok(s) => s,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => return internal_error_response("artifact detail: open store", &e),
     };
     let include_transcript = matches!(
         query.get("include_transcript").map(|v| v.as_str()),
@@ -3097,6 +3125,61 @@ mod tests {
             "returned body must be <= cap, got {}",
             returned.len()
         );
+    }
+
+    #[tokio::test]
+    async fn store_failure_answers_with_a_generic_internal_error() {
+        // A database path below a regular file can never be opened; the
+        // resulting error text names that path.
+        let dir = tempdir().unwrap();
+        let blocker = dir.path().join("blocker-file");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let config = test_config(&blocker.join("memories.db"));
+
+        let response = api_episodes(&config, &std::collections::HashMap::new());
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json = read_json(response).await;
+        assert_eq!(json["error"].as_str(), Some(INTERNAL_ERROR_MESSAGE));
+        assert!(!json.to_string().contains("blocker-file"), "{json}");
+
+        // The same rule holds for errors that carry their own status.
+        let response = kinded_error_response(
+            "test",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &"no such table: memories",
+        );
+        let json = read_json(response).await;
+        assert_eq!(json["error"].as_str(), Some(INTERNAL_ERROR_MESSAGE));
+        let response =
+            kinded_error_response("test", StatusCode::NOT_FOUND, &"memoir 'x' not found");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let json = read_json(response).await;
+        assert_eq!(json["error"].as_str(), Some("memoir 'x' not found"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(global_state)]
+    async fn op_route_store_failure_answers_with_a_generic_internal_error() {
+        let _guard = env_lock().lock().await;
+        std::env::remove_var("REIN_HTTP_TOKEN");
+        // `/api/stats` is served by the op dispatcher and opens the store,
+        // which cannot exist below a regular file.
+        let dir = tempdir().unwrap();
+        let blocker = dir.path().join("blocker-file");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let config = test_config(&blocker.join("memories.db"));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/api/stats")
+            .body(())
+            .unwrap();
+        let response = handle_rest_request(&req, &config).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json = read_json(response).await;
+        assert_eq!(json["error"].as_str(), Some(INTERNAL_ERROR_MESSAGE));
     }
 
     // ---- Phase 2.2 H3/H5 real-consumer parity matrix ----

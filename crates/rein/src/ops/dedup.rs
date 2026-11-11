@@ -117,23 +117,45 @@ fn merge_memory_into_winner(
             })
             .filter(|facts: &Vec<String>| !facts.is_empty());
 
-        if let Some(facts) = llm_novel {
-            winner.content.push_str(&format!(
+        // What the loser adds, if anything.
+        let addition = if let Some(facts) = llm_novel {
+            Some(format!(
                 "\n\n[merged from {} on {}]\n{}",
                 loser.id,
                 loser.created_at.format("%Y-%m-%d"),
                 facts.join("\n"),
-            ));
+            ))
         } else {
             let unique = extract_unique_lines(&loser.content, &winner.content);
-            if !unique.is_empty() {
-                winner.content.push_str(&format!(
+            (!unique.is_empty()).then(|| {
+                format!(
                     "\n\n[merged from {} on {}]\n{}",
                     loser.id,
                     loser.created_at.format("%Y-%m-%d"),
                     unique,
-                ));
-            }
+                )
+            })
+        };
+        // The loser is superseded by this merge, so what it adds must stay
+        // readable in the winner: the bound is the size a memory may have at
+        // admission, not the smaller store-time merge cap. The winner's own
+        // text is never shortened; an addition that would take it past the
+        // bound is cut (the loser's evidence snapshot keeps the rest) and
+        // the canonical is flagged for the resummerize pass. Without the
+        // bound every merge grows the winner, and one oversized loser is
+        // copied into it whole.
+        let content_capped = addition.as_deref().is_some_and(|addition| {
+            crate::store::knowledge::append_within_cap(
+                &mut winner.content,
+                addition,
+                crate::ops::handlers::memory::MAX_MEMORY_CONTENT_BYTES,
+            )
+        });
+        if content_capped {
+            tracing::warn!(
+                canonical_id = %winner_id,
+                "dedup merge addition exceeded the memory size limit and was cut (resummerize pending)"
+            );
         }
 
         // Use LLM merged_summary for the winner's summary if provided.
@@ -168,6 +190,12 @@ fn merge_memory_into_winner(
                 .collect()
         });
         store.update(&winner)?;
+        if content_capped {
+            store.conn().execute(
+                "UPDATE memories SET needs_resummerize = 1 WHERE id = ?1",
+                rusqlite::params![winner_id],
+            )?;
+        }
         store.mark_superseded(&loser.id, winner_id)?;
         record_dedup_artifacts(
             store,
@@ -404,10 +432,6 @@ fn vec_dedup_run_limit(config: &ReinConfig) -> usize {
     config.async_memory.batch_size.max(1).saturating_mul(2)
 }
 
-fn vec_dedup_embed_batch_size(config: &ReinConfig) -> usize {
-    config.async_memory.batch_size.max(1)
-}
-
 fn vec_dedup_llm_budget(config: &ReinConfig) -> usize {
     config.cleanup.llm_budget.max(1)
 }
@@ -439,25 +463,70 @@ fn take_vec_dedup_window(
     (pending, skipped)
 }
 
-fn embed_vec_dedup_batch(
+/// Take a memory whose text the provider refuses out of the sweep, but only
+/// while the row still holds exactly the refused text (`enriched`, the
+/// [`crate::embed::prepend_metadata`] form). An edit made while the request
+/// was in flight has set the flag for its new text; clearing it on the old
+/// text's verdict would leave the edited memory without a vector and
+/// without a retry.
+fn clear_vec_dedup_flag_if_text_unchanged(conn: &rusqlite::Connection, id: &str, enriched: &str) {
+    let _ = conn.execute(
+        "UPDATE memories SET needs_vec_dedup = 0
+         WHERE id = ?1 AND ('topic:' || topic || ' | ' || summary || ' | ' || content) = ?2",
+        rusqlite::params![id, enriched],
+    );
+}
+
+/// Embed `texts` for a dedup pass: one result per text, and whether a
+/// refusal among them is a verdict on its text (the provider embedded other
+/// texts in this call and still embeds after it).
+///
+/// Requests are packed by size and a request the provider refuses is split
+/// down to single texts, so one memory it cannot embed fails alone instead
+/// of taking its neighbours with it on every pass. Nothing is waited out
+/// here: this runs inside the periodic adaptive pass, and the next pass is
+/// the retry.
+fn embed_vec_dedup_texts(
     embedder: &crate::embed::EmbedderKind,
     texts: &[String],
-) -> Option<Vec<Vec<f32>>> {
+) -> (Vec<crate::embed::BulkEmbedResult>, bool) {
     if texts.is_empty() {
-        return Some(Vec::new());
+        return (Vec::new(), false);
     }
 
     let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                use crate::types::traits::Embedder;
-                embedder.embed_batch(&text_refs).await
+                let mut session = crate::embed::BulkEmbedSession::new(embedder).for_periodic_pass();
+                let results = session.embed(&text_refs).await;
+                // A refusal only counts when the provider embedded something
+                // in this call and still embeds after it; ask only when
+                // there is a refusal to settle.
+                let refused_any = results
+                    .iter()
+                    .any(|r| r.as_ref().is_err_and(|f| f.rejected_alone));
+                let provider_answered =
+                    refused_any && session.any_success() && session.provider_still_embeds().await;
+                (results, provider_answered)
             })
         })
     }));
 
-    result.ok().and_then(|value| value.ok())
+    result.unwrap_or_else(|_| {
+        let failed = texts
+            .iter()
+            .map(|_| {
+                Err(crate::embed::BulkEmbedFailure {
+                    error: crate::types::ReinError::Embedding(
+                        "embedding call panicked".to_string(),
+                    ),
+                    rejected_alone: false,
+                })
+            })
+            .collect();
+        (failed, false)
+    })
 }
 
 fn none_bucket_ann_threshold(config: &ReinConfig) -> usize {
@@ -517,6 +586,13 @@ fn bucket_embeddings(
             }
             continue;
         }
+        // A text the provider already refused under this model is not sent
+        // again; it simply has no embedding in this bucket.
+        if crate::embed::unembeddable::verdict(conn, &mems[idx].id, &vector_provenance, &enriched)
+            == crate::embed::unembeddable::Verdict::Refused
+        {
+            continue;
+        }
         uncached.push((idx, enriched));
     }
 
@@ -528,31 +604,27 @@ fn bucket_embeddings(
         return embeddings;
     };
 
-    for chunk in uncached.chunks(vec_dedup_embed_batch_size(config)) {
-        let texts: Vec<String> = chunk.iter().map(|(_, text)| text.clone()).collect();
-        let Some(batch) = embed_vec_dedup_batch(&embedder, &texts) else {
+    let texts: Vec<String> = uncached.iter().map(|(_, text)| text.clone()).collect();
+    let (batch, _) = embed_vec_dedup_texts(&embedder, &texts);
+    for ((idx, enriched), emb) in uncached.iter().zip(batch) {
+        let Ok(emb) = emb else {
             continue;
         };
-        if batch.len() != chunk.len() {
-            continue;
-        }
-        for ((idx, enriched), emb) in chunk.iter().zip(batch) {
-            let _ = crate::embed::EmbedCache::put(conn, enriched, &model, &emb);
-            match crate::store::vec::insert_embedding_checked(
-                conn,
-                &mems[*idx].id,
-                &emb,
-                &vector_provenance,
-            ) {
-                Ok(()) => {
-                    embeddings.insert(*idx, emb);
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        "bucket_embeddings: vector write rejected for {}: {e}",
-                        mems[*idx].id
-                    );
-                }
+        let _ = crate::embed::EmbedCache::put(conn, enriched, &model, &emb);
+        match crate::store::vec::insert_embedding_checked(
+            conn,
+            &mems[*idx].id,
+            &emb,
+            &vector_provenance,
+        ) {
+            Ok(()) => {
+                embeddings.insert(*idx, emb);
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "bucket_embeddings: vector write rejected for {}: {e}",
+                    mems[*idx].id
+                );
             }
         }
     }
@@ -644,11 +716,19 @@ fn run_vec_dedup_inner(
     // states represent live canonicals and `needs_vec_dedup = 1` must be
     // swept regardless of which state the row is in or a resummerize +
     // subsequent merge can strand `needs_vec_dedup = 1` forever.
+    //
+    // Shortest first: the window below is small, and without an order the
+    // same rows come back every pass. Memories that keep failing to embed
+    // (very large ones against a quota or a timeout) would then hold the
+    // window and nothing behind them would ever be swept. Ordered by size,
+    // they are reached last and only hold the window once everything else
+    // is done.
     let pending: Vec<VecDedupItem> = match conn.prepare(
         "SELECT id, topic, summary, content FROM memories
          WHERE needs_vec_dedup = 1
            AND status IN ('active', 'updated')
            AND superseded_by IS NULL
+         ORDER BY LENGTH(content), id
          LIMIT ?1",
     ) {
         Ok(mut stmt) => stmt
@@ -720,41 +800,70 @@ fn run_vec_dedup_inner(
                     }
                 }
             }
-            _ => pending_embeddings.push((id.clone(), enriched)),
+            _ => {
+                // The provider already refused exactly this text under this
+                // model: sending it again gives the same answer. Take the
+                // row out of the sweep; an edit re-flags it and makes the
+                // record stale.
+                if crate::embed::unembeddable::verdict(conn, id, &vector_provenance, &enriched)
+                    == crate::embed::unembeddable::Verdict::Refused
+                {
+                    clear_vec_dedup_flag_if_text_unchanged(conn, id, &enriched);
+                    continue;
+                }
+                pending_embeddings.push((id.clone(), enriched));
+            }
         }
     }
 
-    for chunk in pending_embeddings.chunks(vec_dedup_embed_batch_size(config)) {
-        let chunk_texts: Vec<String> = chunk.iter().map(|(_, text)| text.clone()).collect();
-        let Some(batch_embeddings) = embed_vec_dedup_batch(&embedder, &chunk_texts) else {
-            tracing::debug!(
-                "vec_dedup: failed to batch-embed {} pending memories",
-                chunk.len()
-            );
-            continue;
+    let pending_texts: Vec<String> = pending_embeddings
+        .iter()
+        .map(|(_, text)| text.clone())
+        .collect();
+    let (batch_embeddings, provider_answered) = embed_vec_dedup_texts(&embedder, &pending_texts);
+    for ((id, enriched), emb) in pending_embeddings.iter().zip(batch_embeddings) {
+        let emb = match emb {
+            // Refused on its own while the provider embedded other texts:
+            // record it and stop sweeping the row, so it cannot hold the
+            // window pass after pass. When the provider embedded nothing
+            // (a revoked key answers everything with a client error) the
+            // refusal says nothing about the text and the flag stays.
+            Err(failure) if failure.rejected_alone && provider_answered => {
+                tracing::warn!(
+                    id,
+                    chars = enriched.chars().count(),
+                    "vec_dedup: the embedding provider refuses this memory; it stays \
+                     full-text only until its text or the embedding model changes: {}",
+                    failure.error
+                );
+                if crate::embed::unembeddable::record(conn, id, &vector_provenance, enriched)
+                    .is_ok()
+                {
+                    clear_vec_dedup_flag_if_text_unchanged(conn, id, enriched);
+                }
+                continue;
+            }
+            Err(failure) => {
+                tracing::debug!(
+                    "vec_dedup: failed to embed {id}: {}; preserving flag for retry",
+                    failure.error
+                );
+                continue;
+            }
+            Ok(emb) => emb,
         };
-
-        if batch_embeddings.len() != chunk.len() {
-            tracing::debug!(
-                "vec_dedup: batch embedding returned {} embeddings for {} inputs",
-                batch_embeddings.len(),
-                chunk.len()
-            );
-            continue;
-        }
-
-        for ((id, enriched), emb) in chunk.iter().zip(batch_embeddings) {
-            let _ = crate::embed::EmbedCache::put(conn, enriched, &model_name, &emb);
-            match crate::store::vec::insert_embedding_checked(conn, id, &emb, &vector_provenance) {
-                Ok(()) => {
-                    embeddings_by_id.insert(id.clone(), emb);
-                }
-                Err(e) => {
-                    rejected_writes += 1;
-                    tracing::debug!(
-                        "vec_dedup: vector write rejected for {id}: {e}; preserving flag for retry"
-                    );
-                }
+        // Embedded after all: an older refusal record no longer applies.
+        let _ = crate::embed::unembeddable::clear(conn, id);
+        let _ = crate::embed::EmbedCache::put(conn, enriched, &model_name, &emb);
+        match crate::store::vec::insert_embedding_checked(conn, id, &emb, &vector_provenance) {
+            Ok(()) => {
+                embeddings_by_id.insert(id.clone(), emb);
+            }
+            Err(e) => {
+                rejected_writes += 1;
+                tracing::debug!(
+                    "vec_dedup: vector write rejected for {id}: {e}; preserving flag for retry"
+                );
             }
         }
     }
@@ -1843,6 +1952,112 @@ mod tests {
             loser_after.superseded_by.as_deref(),
             Some(winner_id.as_str())
         );
+    }
+
+    // A merge never shortens the winner and never grows it past the size a
+    // memory may have at admission: an oversized loser is cut, not copied
+    // whole, and an ordinary loser's facts are always kept.
+    #[test]
+    fn test_merge_memory_into_winner_bounds_the_addition() {
+        let limit = crate::ops::handlers::memory::MAX_MEMORY_CONTENT_BYTES;
+        let store = SqliteStore::in_memory().unwrap();
+
+        // A winner larger than the store-time merge cap still takes in what
+        // an ordinary loser adds: the loser is superseded, so its facts
+        // must remain readable somewhere.
+        let big_text = "x".repeat(crate::store::sqlite::MERGE_CONTENT_CAP + 500);
+        let big_id = store.store(test_memory("big", &big_text)).unwrap();
+        let other_id = store
+            .store(test_memory("big", "an unrelated extra line"))
+            .unwrap();
+        let other = store.get(&other_id).unwrap();
+        merge_memory_into_winner(&store, None, &big_id, &other, Some(0.85), None, "t", None)
+            .unwrap();
+        let merged = store.get(&big_id).unwrap();
+        assert!(merged.content.starts_with(&big_text));
+        assert!(merged.content.ends_with("an unrelated extra line"));
+
+        // An oversized loser (one line, multi-byte text at the cut) is cut
+        // at the limit; the winner's own text is kept.
+        let winner_text = "deploy with docker compose up";
+        let winner_id = store.store(test_memory("docker", winner_text)).unwrap();
+        let blob = "记忆".repeat(limit);
+        let loser_id = store.store(test_memory("docker", &blob)).unwrap();
+        let loser = store.get(&loser_id).unwrap();
+        merge_memory_into_winner(
+            &store,
+            None,
+            &winner_id,
+            &loser,
+            Some(0.85),
+            None,
+            "test_merge_cap",
+            None,
+        )
+        .unwrap();
+
+        let winner = store.get(&winner_id).unwrap();
+        assert!(winner.content.len() <= limit);
+        assert!(
+            winner.content.len() > limit - 4,
+            "cut at the limit, not before"
+        );
+        assert!(winner.content.starts_with(winner_text));
+        assert!(winner.content.contains("[merged from"));
+        let flagged: i64 = store
+            .conn()
+            .query_row(
+                "SELECT needs_resummerize FROM memories WHERE id = ?1",
+                rusqlite::params![&winner_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flagged, 1);
+    }
+
+    // The flag of a refused memory is cleared only while the row still holds
+    // the refused text; an edit that landed in the meantime keeps its retry.
+    #[test]
+    fn refused_memory_flag_is_kept_when_the_text_changed_meanwhile() {
+        let store = SqliteStore::in_memory().unwrap();
+        let id = store.store(test_memory("docker", "original text")).unwrap();
+        let flag = |store: &SqliteStore| -> i64 {
+            store
+                .conn()
+                .query_row(
+                    "SELECT needs_vec_dedup FROM memories WHERE id = ?1",
+                    rusqlite::params![&id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        store
+            .conn()
+            .execute(
+                "UPDATE memories SET needs_vec_dedup = 1 WHERE id = ?1",
+                rusqlite::params![&id],
+            )
+            .unwrap();
+        let row = store.get(&id).unwrap();
+        let refused = crate::embed::prepend_metadata(&row.topic, &row.summary, &row.content);
+
+        // Edited while the request was in flight: the verdict is about the
+        // old text, the flag stays.
+        store
+            .conn()
+            .execute(
+                "UPDATE memories SET content = 'edited text' WHERE id = ?1",
+                rusqlite::params![&id],
+            )
+            .unwrap();
+        clear_vec_dedup_flag_if_text_unchanged(store.conn(), &id, &refused);
+        assert_eq!(flag(&store), 1);
+
+        // Unchanged: the row leaves the sweep.
+        let row = store.get(&id).unwrap();
+        let current = crate::embed::prepend_metadata(&row.topic, &row.summary, &row.content);
+        clear_vec_dedup_flag_if_text_unchanged(store.conn(), &id, &current);
+        assert_eq!(flag(&store), 0);
     }
 
     #[test]

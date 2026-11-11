@@ -59,7 +59,7 @@ impl GeminiEmbedder {
             }
         };
         let client = Client::builder()
-            .timeout(Duration::from_secs(5))
+            .timeout(CLIENT_TIMEOUT)
             .build()
             .expect("reqwest client build failed for gemini (likely TLS backend)");
         Self {
@@ -88,8 +88,19 @@ impl GeminiEmbedder {
 
 /// Max retry attempts for transient Gemini failures (429, 5xx, network).
 const MAX_RETRIES: u32 = 3;
+/// Retries for query-side batches (recall embedding its query variants).
+/// Recall falls back to full-text search when the embedding fails, so a
+/// slow provider should cost it one extra attempt, not four.
+const QUERY_MAX_RETRIES: u32 = 1;
+/// Client-wide request timeout (connect, send and body read together).
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Base backoff in ms; doubled each attempt, plus jitter up to half.
 const BACKOFF_BASE_MS: u64 = 400;
+/// Upper bound of the per-request timeout for document-side
+/// `batchEmbedContents` (backfill, reindex, dedup); the actual allowance is
+/// [`crate::embed::batch_request_timeout`]. Single embeds and query batches
+/// (the interactive recall / store path) keep the client-wide limit.
+const BATCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Send a Gemini request with exponential backoff on transient failures.
 /// Respects `Retry-After` on 429 when provided (seconds form only).
@@ -98,15 +109,23 @@ async fn send_with_retry(
     url: &str,
     api_key: &str,
     body: &Value,
+    timeout: Option<Duration>,
+    max_retries: u32,
 ) -> ReinResult<(reqwest::StatusCode, String)> {
+    // A provider-supplied `Retry-After` is honoured only up to the time one
+    // request of this kind may take: an interactive call must not sleep for
+    // as long as a header says.
+    let retry_after_cap_ms = timeout.unwrap_or(CLIENT_TIMEOUT).as_millis() as u64;
     let mut attempt: u32 = 0;
     loop {
-        let send_result = client
+        let mut request = client
             .post(url)
             .header("x-goog-api-key", api_key)
-            .json(body)
-            .send()
-            .await;
+            .json(body);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        let send_result = request.send().await;
 
         match send_result {
             Ok(resp) => {
@@ -117,15 +136,33 @@ async fn send_with_retry(
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u64>().ok());
                 let transient = status.as_u16() == 429 || status.is_server_error();
-                let text_body = resp
-                    .text()
-                    .await
-                    .map_err(|e| ReinError::Embedding(e.to_string()))?;
-                if !transient || attempt >= MAX_RETRIES {
+                // A body that fails mid-read (timeout, reset) is as
+                // transient as a failed send.
+                let text_body = match resp.text().await {
+                    Ok(text) => text,
+                    Err(e) => {
+                        if attempt >= max_retries {
+                            return Err(ReinError::Embedding(format!(
+                                "Gemini response body read failed after {max_retries} retries: {e}"
+                            )));
+                        }
+                        let backoff = exponential_backoff_ms(attempt);
+                        tracing::warn!(
+                            attempt,
+                            err = %e,
+                            backoff_ms = backoff,
+                            "Gemini response body read failed, retrying"
+                        );
+                        tokio::time::sleep(Duration::from_millis(backoff)).await;
+                        attempt += 1;
+                        continue;
+                    }
+                };
+                if !transient || attempt >= max_retries {
                     return Ok((status, text_body));
                 }
                 let backoff = retry_after_secs
-                    .map(|s| s.saturating_mul(1000))
+                    .map(|s| s.saturating_mul(1000).min(retry_after_cap_ms))
                     .unwrap_or_else(|| exponential_backoff_ms(attempt));
                 tracing::warn!(
                     attempt,
@@ -137,9 +174,9 @@ async fn send_with_retry(
                 attempt += 1;
             }
             Err(e) => {
-                if attempt >= MAX_RETRIES {
+                if attempt >= max_retries {
                     return Err(ReinError::Embedding(format!(
-                        "Gemini request failed after {MAX_RETRIES} retries: {e}"
+                        "Gemini request failed after {max_retries} retries: {e}"
                     )));
                 }
                 let backoff = exponential_backoff_ms(attempt);
@@ -188,7 +225,8 @@ impl Embedder for GeminiEmbedder {
             "outputDimensionality": self.dimensions
         });
 
-        let (status, text_body) = send_with_retry(&self.client, &url, &self.api_key, &body).await?;
+        let (status, text_body) =
+            send_with_retry(&self.client, &url, &self.api_key, &body, None, MAX_RETRIES).await?;
 
         if !status.is_success() {
             return Err(ReinError::Embedding(crate::types::provider_status_error(
@@ -214,6 +252,26 @@ impl Embedder for GeminiEmbedder {
     }
 
     async fn embed_batch(&self, texts: &[&str]) -> ReinResult<Vec<Vec<f32>>> {
+        let timeout =
+            crate::embed::batch_request_timeout(texts, CLIENT_TIMEOUT, BATCH_REQUEST_TIMEOUT);
+        self.batch(texts, Some(timeout), MAX_RETRIES).await
+    }
+
+    /// Recall embeds its query variants through this method. It stays on the
+    /// short client-wide timeout: an interactive call must not inherit the
+    /// bulk-document allowance.
+    async fn embed_query_batch(&self, texts: &[&str]) -> ReinResult<Vec<Vec<f32>>> {
+        self.batch(texts, None, QUERY_MAX_RETRIES).await
+    }
+}
+
+impl GeminiEmbedder {
+    async fn batch(
+        &self,
+        texts: &[&str],
+        timeout: Option<Duration>,
+        max_retries: u32,
+    ) -> ReinResult<Vec<Vec<f32>>> {
         self.check_endpoint()?;
         let url = format!(
             "{}/v1beta/models/{}:batchEmbedContents",
@@ -233,7 +291,15 @@ impl Embedder for GeminiEmbedder {
 
         let body = json!({ "requests": requests });
 
-        let (status, text_body) = send_with_retry(&self.client, &url, &self.api_key, &body).await?;
+        let (status, text_body) = send_with_retry(
+            &self.client,
+            &url,
+            &self.api_key,
+            &body,
+            timeout,
+            max_retries,
+        )
+        .await?;
 
         if !status.is_success() {
             return Err(ReinError::Embedding(crate::types::provider_status_error(

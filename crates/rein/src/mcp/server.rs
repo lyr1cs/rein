@@ -610,6 +610,55 @@ fn has_proxy_forwarding_headers(headers: &hyper::HeaderMap) -> bool {
     .any(|name| headers.contains_key(*name))
 }
 
+/// Address of one `X-Forwarded-For` entry or `Forwarded: for=` value:
+/// a bare IP, `ip:port`, `[v6]` or `[v6]:port`, optionally quoted.
+fn parse_forwarded_ip(raw: &str) -> Option<std::net::IpAddr> {
+    let value = raw.trim().trim_matches('"');
+    if let Ok(ip) = value.parse::<std::net::IpAddr>() {
+        return Some(ip);
+    }
+    if let Ok(addr) = value.parse::<std::net::SocketAddr>() {
+        return Some(addr.ip());
+    }
+    value.strip_prefix('[')?.strip_suffix(']')?.parse().ok()
+}
+
+/// Client address recorded by the proxy directly in front of this server.
+/// A proxy appends the address it accepted the connection from, so only the
+/// last entry is its own statement; earlier entries are whatever the caller
+/// sent. `X-Forwarded-For` is read first, `Forwarded: for=` when it is
+/// absent. An entry that does not parse yields `None`.
+fn forwarded_client_ip(headers: &hyper::HeaderMap) -> Option<std::net::IpAddr> {
+    if let Some(value) = headers.get_all("x-forwarded-for").iter().next_back() {
+        return parse_forwarded_ip(value.to_str().ok()?.rsplit(',').next()?);
+    }
+    let value = headers.get_all("forwarded").iter().next_back()?;
+    let element = value.to_str().ok()?.rsplit(',').next()?;
+    element.split(';').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("for") {
+            return None;
+        }
+        parse_forwarded_ip(value)
+    })
+}
+
+/// Bucket key for the dynamic client registration rate limit.
+///
+/// Behind a local reverse proxy or tunnel every remote caller arrives from
+/// the same loopback peer, so the forwarded client address identifies the
+/// caller there. Forwarding headers are honored only when the TCP peer is
+/// loopback: a caller connecting directly cannot choose its own bucket by
+/// sending them. The key is the parsed address, never raw header text.
+fn registration_rate_limit_key(peer: std::net::IpAddr, headers: &hyper::HeaderMap) -> String {
+    if peer.is_loopback() {
+        if let Some(forwarded) = forwarded_client_ip(headers) {
+            return forwarded.to_string();
+        }
+    }
+    peer.to_string()
+}
+
 fn request_is_direct_loopback_client(
     peer_is_loopback: bool,
     request_host: Option<&HttpRequestHost>,
@@ -1287,7 +1336,7 @@ pub async fn run_http(config: ReinConfig) -> anyhow::Result<()> {
                             crate::auth::oauth::register::handle_register(
                                 &body,
                                 &cfg,
-                                &peer_addr.ip().to_string(),
+                                &registration_rate_limit_key(peer_addr.ip(), &headers),
                             )
                         }
                         (hyper::Method::GET, "/oauth/authorize") => {
@@ -1867,6 +1916,73 @@ mod tests {
             ),
             "loopback_only must not grant a proxied public deployment just because the proxy rewrote Host to loopback"
         );
+    }
+
+    fn forwarding_headers(pairs: &[(&'static str, &'static str)]) -> hyper::HeaderMap {
+        let mut headers = hyper::HeaderMap::new();
+        for (name, value) in pairs {
+            headers.append(*name, hyper::header::HeaderValue::from_static(value));
+        }
+        headers
+    }
+
+    #[test]
+    fn registration_rate_limit_key_uses_forwarded_address_behind_loopback_proxy() {
+        let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let headers = forwarding_headers(&[("x-forwarded-for", "203.0.113.10")]);
+        assert_eq!(
+            registration_rate_limit_key(loopback, &headers),
+            "203.0.113.10"
+        );
+
+        // Entries before the last one are supplied by the caller; the proxy
+        // appends the address it saw.
+        let headers = forwarding_headers(&[("x-forwarded-for", "198.51.100.1, 203.0.113.11:4711")]);
+        assert_eq!(
+            registration_rate_limit_key(loopback, &headers),
+            "203.0.113.11"
+        );
+
+        let headers = forwarding_headers(&[(
+            "forwarded",
+            "for=198.51.100.1, for=\"[2001:db8::1]:4711\";proto=https",
+        )]);
+        assert_eq!(
+            registration_rate_limit_key("::1".parse().unwrap(), &headers),
+            "2001:db8::1"
+        );
+    }
+
+    #[test]
+    fn registration_rate_limit_key_ignores_forwarding_headers_from_remote_peer() {
+        let remote: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+        let headers = forwarding_headers(&[
+            ("x-forwarded-for", "203.0.113.10"),
+            ("forwarded", "for=203.0.113.10"),
+        ]);
+        assert_eq!(
+            registration_rate_limit_key(remote, &headers),
+            "198.51.100.7"
+        );
+    }
+
+    #[test]
+    fn registration_rate_limit_key_falls_back_to_peer_on_malformed_or_absent_header() {
+        let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        for headers in [
+            hyper::HeaderMap::new(),
+            forwarding_headers(&[("x-forwarded-for", "not-an-address")]),
+            forwarding_headers(&[("x-forwarded-for", "203.0.113.10, unknown")]),
+            forwarding_headers(&[("x-forwarded-for", "")]),
+            forwarding_headers(&[("forwarded", "for=_hidden;proto=https")]),
+            forwarding_headers(&[("forwarded", "proto=https")]),
+        ] {
+            assert_eq!(
+                registration_rate_limit_key(loopback, &headers),
+                "127.0.0.1",
+                "{headers:?}"
+            );
+        }
     }
 
     #[test]

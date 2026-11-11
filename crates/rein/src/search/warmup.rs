@@ -6,7 +6,6 @@ use crate::config::ReinConfig;
 use crate::embed::{create_embedder, prepend_metadata, EmbedCache};
 use crate::store::SqliteStore;
 use crate::types::traits::MemoryStore as _;
-use crate::types::Embedder as _;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +51,11 @@ pub struct WarmupReport {
     /// A model migration replaced the vector table (even if it published no
     /// rows), so the HNSW index must be rebuilt.
     pub vector_table_replaced: bool,
+    /// Live memories the embedding provider refuses (see
+    /// [`crate::embed::unembeddable`]). They stay full-text only, are not
+    /// re-sent until their text or the embedding model changes, and are not
+    /// counted as errors.
+    pub unembeddable: usize,
 }
 
 /// Operator choices for [`warmup_with_options`].
@@ -344,6 +348,7 @@ pub async fn backfill_missing_vec_rows(
             Ok(reindex) => {
                 // Provenance was stamped inside the swap savepoint.
                 report.embedded = reindex.embedded.saturating_sub(reindex.skipped_changed);
+                report.unembeddable = reindex.unembeddable;
                 report.revalidation_skipped = reindex.skipped_changed;
                 report.vector_table_replaced = true;
                 if reindex.flagged_for_retry > 0 {
@@ -382,10 +387,24 @@ pub async fn backfill_missing_vec_rows(
     // One page of ids at a time: read the text, fill from the cache, and
     // embed the page's cache misses right away (or count them as skipped
     // when there is no provider) so nothing corpus-sized is ever retained.
+    //
+    // A page is a read unit, not a request: the session packs the page's
+    // texts into requests by size and isolates a text the provider rejects,
+    // so a few very large memories cannot keep the rest of their page from
+    // being embedded run after run.
     const PAGE: usize = 100;
     let mut fill_errors = 0_usize;
+    let mut session = embedder.map(crate::embed::BulkEmbedSession::new);
+    // Lone texts the provider refused, as (memory id, refusal fingerprint).
+    let mut refused: Vec<(String, String, usize)> = Vec::new();
+    if let Err(e) = crate::embed::unembeddable::prune_orphans(store.conn()) {
+        tracing::debug!("warmup: failed to prune records of deleted memories: {e}");
+    }
     for page in pending.chunks(PAGE) {
         let mut to_embed: Vec<(String, String)> = Vec::new();
+        // Memories of this page whose refusal record no longer matches their
+        // text or the model; the record is dropped once they embed.
+        let mut stale_records: std::collections::HashSet<String> = std::collections::HashSet::new();
         for id in page {
             let text = match warmup_text_for(store, id) {
                 Ok(Some(text)) => text,
@@ -418,63 +437,141 @@ pub async fn backfill_missing_vec_rows(
                         }
                     }
                 }
-                _ => to_embed.push((id.clone(), text)),
+                _ => {
+                    use crate::embed::unembeddable::Verdict;
+                    match crate::embed::unembeddable::verdict(store.conn(), id, &provenance, &text)
+                    {
+                        // The provider already refused exactly this text.
+                        Verdict::Refused => {
+                            report.unembeddable += 1;
+                            continue;
+                        }
+                        Verdict::Stale => {
+                            stale_records.insert(id.clone());
+                        }
+                        Verdict::Unknown => {}
+                    }
+                    to_embed.push((id.clone(), text));
+                }
             }
         }
         if to_embed.is_empty() {
             continue;
         }
-        let Some(embedder) = embedder else {
+        let Some(session) = session.as_mut() else {
             report.skipped_no_provider += to_embed.len();
             continue;
         };
         let texts: Vec<&str> = to_embed.iter().map(|(_, text)| text.as_str()).collect();
-        match embedder.embed_batch(&texts).await {
-            Ok(embeddings) if embeddings.len() == to_embed.len() => {
-                for ((id, text), embedding) in to_embed.iter().zip(embeddings.iter()) {
-                    if embedding.len() != dims {
-                        tracing::warn!(
-                            id,
-                            got = embedding.len(),
-                            expected = dims,
-                            "warmup: provider returned an embedding of the wrong size"
-                        );
-                        fill_errors += 1;
-                        continue;
-                    }
-                    if let Err(e) = EmbedCache::put(store.conn(), text, &model, embedding) {
-                        tracing::warn!(id, "warmup: failed to cache embedding: {e}");
-                    }
-                    match write_validated_row(
-                        store,
-                        id,
-                        text,
-                        embedding,
-                        existing.contains(id),
-                        &provenance,
-                    ) {
-                        Ok(true) => report.embedded += 1,
-                        Ok(false) => report.revalidation_skipped += 1,
-                        Err(e) => {
-                            tracing::warn!(id, "warmup: failed to insert vector row: {e}");
-                            fill_errors += 1;
-                        }
-                    }
-                }
-            }
-            Ok(embeddings) => {
-                tracing::warn!(
-                    requested = to_embed.len(),
-                    returned = embeddings.len(),
-                    "warmup: provider returned a mismatched embedding count"
-                );
-                fill_errors += to_embed.len();
-            }
-            Err(e) => {
-                tracing::warn!("warmup batch failed: {e}");
-                fill_errors += to_embed.len();
+        let results = session.embed(&texts).await;
+        // While the provider is unavailable a whole page fails for one
+        // shared reason: one line for the page, not one per memory.
+        if let Some(reason) = session.degraded() {
+            let failed = results.iter().filter(|r| r.is_err()).count();
+            if failed > 0 {
+                tracing::warn!(failed, reason, "warmup: page not embedded");
             }
         }
+        let per_memory_log = session.degraded().is_none();
+        for ((id, text), result) in to_embed.iter().zip(results) {
+            let embedding = match result {
+                Ok(embedding) => embedding,
+                Err(failure) if failure.rejected_alone => {
+                    // Refused on its own; whether that is a verdict on
+                    // the text is settled once the run is over.
+                    refused.push((
+                        id.clone(),
+                        crate::embed::unembeddable::fingerprint(&provenance, text),
+                        text.chars().count(),
+                    ));
+                    continue;
+                }
+                Err(failure) => {
+                    if per_memory_log {
+                        // Id and size only: the text itself stays out of logs.
+                        tracing::warn!(
+                            id,
+                            chars = text.chars().count(),
+                            "warmup: memory could not be embedded: {}",
+                            failure.error
+                        );
+                    }
+                    fill_errors += 1;
+                    continue;
+                }
+            };
+            if stale_records.contains(id) {
+                let _ = crate::embed::unembeddable::clear(store.conn(), id);
+            }
+            if embedding.len() != dims {
+                tracing::warn!(
+                    id,
+                    got = embedding.len(),
+                    expected = dims,
+                    "warmup: provider returned an embedding of the wrong size"
+                );
+                fill_errors += 1;
+                continue;
+            }
+            if let Err(e) = EmbedCache::put(store.conn(), text, &model, &embedding) {
+                tracing::warn!(id, "warmup: failed to cache embedding: {e}");
+            }
+            match write_validated_row(
+                store,
+                id,
+                text,
+                &embedding,
+                existing.contains(id),
+                &provenance,
+            ) {
+                Ok(true) => report.embedded += 1,
+                Ok(false) => report.revalidation_skipped += 1,
+                Err(e) => {
+                    tracing::warn!(id, "warmup: failed to insert vector row: {e}");
+                    fill_errors += 1;
+                }
+            }
+        }
+    }
+    // A refusal is a verdict on the text only if the provider embedded
+    // something in this run and still embeds now. A revoked key or a wrong
+    // endpoint answers every request with a client error — from the start
+    // or from some point in the run — and then the refusals are ordinary
+    // failures and nothing is recorded.
+    let provider_answered = match session.as_mut() {
+        Some(session) if !refused.is_empty() => {
+            session.any_success() && session.provider_still_embeds().await
+        }
+        _ => false,
+    };
+    for (id, fingerprint, chars) in &refused {
+        if !provider_answered {
+            fill_errors += 1;
+            continue;
+        }
+        match crate::embed::unembeddable::record_fingerprint(store.conn(), id, fingerprint) {
+            Ok(()) => {
+                // Id and size only: the text itself stays out of logs.
+                tracing::warn!(
+                    id,
+                    chars,
+                    "warmup: the embedding provider refuses this memory; it stays full-text \
+                     only until its text or the embedding model changes"
+                );
+                report.unembeddable += 1;
+            }
+            Err(e) => {
+                tracing::warn!(id, "warmup: failed to record the refusal: {e}");
+                fill_errors += 1;
+            }
+        }
+    }
+    if !refused.is_empty() && !provider_answered {
+        tracing::warn!(
+            refused = refused.len(),
+            "warmup: the provider answered every request with a client error; check the \
+             embedding API key and endpoint"
+        );
     }
     report.errors += fill_errors;
 
@@ -2867,6 +2964,185 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!((replaced[0] - 0.3).abs() < 1e-6);
+    }
+
+    // A page that holds a few very large memories is embedded around them in
+    // one run instead of failing as a whole on every run (GitHub #5).
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn warmup_embeds_a_page_despite_very_large_memories() {
+        use crate::types::MemoryStore;
+        let (_dir, store) = test_store();
+        let config = ReinConfig::default();
+        let dims = config.embedding.dimensions;
+        let mut small_ids = Vec::new();
+        let mut huge_ids = Vec::new();
+        for i in 0..30 {
+            if i == 4 || i == 19 {
+                let content = format!("huge {i} ").repeat(10_000);
+                huge_ids.push(store.store(live_memory("big", &content)).unwrap());
+            } else {
+                let content = format!("ordinary memory number {i}");
+                small_ids.push(store.store(live_memory("small", &content)).unwrap());
+            }
+        }
+        // The provider refuses any request over 100k characters: each huge
+        // memory alone is over it, all 28 ordinary ones together are not.
+        let embedder = crate::embed::EmbedderKind::Mock(
+            crate::embed::MockEmbedder::always(dims, vec![0.25; dims])
+                .rejecting_batches_over(100_000),
+        );
+
+        let report =
+            backfill_missing_vec_rows(&store, &config, Some(&embedder), WarmupOptions::default())
+                .await;
+
+        assert_eq!(report.embedded, 28, "every ordinary memory gets its vector");
+        assert_eq!(report.errors, 2, "only the two oversized memories fail");
+        for id in &small_ids {
+            assert!(crate::store::vec::get_embedding(store.conn(), id)
+                .unwrap()
+                .is_some());
+        }
+        for id in &huge_ids {
+            assert!(crate::store::vec::get_embedding(store.conn(), id)
+                .unwrap()
+                .is_none());
+        }
+
+        // The next run only has the two oversized memories left to try.
+        let again =
+            backfill_missing_vec_rows(&store, &config, Some(&embedder), WarmupOptions::default())
+                .await;
+        assert_eq!(again.embedded, 0);
+        assert_eq!(again.errors, 2);
+    }
+
+    // A memory the provider refuses on its own is recorded, reported apart
+    // from errors, and not sent again until its text changes.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn warmup_records_refused_memories_and_does_not_resend_them() {
+        use crate::types::MemoryStore;
+        let (_dir, store) = test_store();
+        let config = ReinConfig::default();
+        let dims = config.embedding.dimensions;
+        let good = store
+            .store(live_memory("ok", "an ordinary memory"))
+            .unwrap();
+        let refused = store
+            .store(live_memory("bad", "refuse-me payload"))
+            .unwrap();
+        let embedder = crate::embed::EmbedderKind::Mock(
+            crate::embed::MockEmbedder::always(dims, vec![0.25; dims])
+                .rejecting_texts_containing("refuse-me")
+                .rejecting_with_status(reqwest::StatusCode::BAD_REQUEST),
+        );
+        let requests = |e: &crate::embed::EmbedderKind| match e {
+            crate::embed::EmbedderKind::Mock(m) => m.batch_char_sizes().len(),
+            _ => unreachable!(),
+        };
+
+        let first =
+            backfill_missing_vec_rows(&store, &config, Some(&embedder), WarmupOptions::default())
+                .await;
+        assert_eq!(first.embedded, 1);
+        assert_eq!(first.unembeddable, 1);
+        assert_eq!(first.errors, 0, "a refusal is not an error");
+        assert!(crate::store::vec::get_embedding(store.conn(), &good)
+            .unwrap()
+            .is_some());
+        assert!(
+            read_metadata(&store, VEC_ROWS_PROVENANCE_KEY).is_some(),
+            "a pass whose only gaps are refused memories is complete"
+        );
+
+        // Second run: nothing is sent for the refused memory.
+        let sent = requests(&embedder);
+        let second =
+            backfill_missing_vec_rows(&store, &config, Some(&embedder), WarmupOptions::default())
+                .await;
+        assert_eq!(second.unembeddable, 1);
+        assert_eq!(second.errors, 0);
+        assert_eq!(requests(&embedder), sent);
+
+        // Editing the memory makes the record stale: it is tried again,
+        // embeds, and the record is dropped.
+        let mut edited = store.get(&refused).unwrap();
+        edited.content = "now acceptable".to_string();
+        edited.summary = "now acceptable".to_string();
+        store.update(&edited).unwrap();
+        let third =
+            backfill_missing_vec_rows(&store, &config, Some(&embedder), WarmupOptions::default())
+                .await;
+        assert_eq!(third.embedded, 1);
+        assert_eq!(third.unembeddable, 0);
+        let records: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM metadata WHERE key LIKE 'unembeddable:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(records, 0);
+    }
+
+    // A provider that answers every request with a client error (a revoked
+    // key on a provider that reports it as 400) refuses nothing in
+    // particular: nothing is recorded, and the memories are embedded once
+    // the provider works again.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn warmup_records_no_refusals_when_the_provider_embeds_nothing() {
+        use crate::types::MemoryStore;
+        let (_dir, store) = test_store();
+        let config = ReinConfig::default();
+        let dims = config.embedding.dimensions;
+        let a = store.store(live_memory("a", "first memory")).unwrap();
+        let b = store.store(live_memory("b", "second memory")).unwrap();
+        let broken = crate::embed::EmbedderKind::Mock(
+            crate::embed::MockEmbedder::always(dims, vec![0.25; dims])
+                .rejecting_texts_containing("")
+                .rejecting_with_status(reqwest::StatusCode::BAD_REQUEST),
+        );
+
+        let report =
+            backfill_missing_vec_rows(&store, &config, Some(&broken), WarmupOptions::default())
+                .await;
+        match &broken {
+            crate::embed::EmbedderKind::Mock(m) => assert_eq!(
+                m.batch_char_sizes().len(),
+                2,
+                "the page and one probe, no splitting"
+            ),
+            _ => unreachable!(),
+        }
+        assert_eq!(report.unembeddable, 0);
+        assert_eq!(report.errors, 2);
+        let records: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM metadata WHERE key LIKE 'unembeddable:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(records, 0);
+
+        let working = crate::embed::EmbedderKind::Mock(crate::embed::MockEmbedder::always(
+            dims,
+            vec![0.25; dims],
+        ));
+        let report =
+            backfill_missing_vec_rows(&store, &config, Some(&working), WarmupOptions::default())
+                .await;
+        assert_eq!(report.embedded, 2);
+        for id in [&a, &b] {
+            assert!(crate::store::vec::get_embedding(store.conn(), id)
+                .unwrap()
+                .is_some());
+        }
     }
 
     #[cfg(feature = "test-support")]

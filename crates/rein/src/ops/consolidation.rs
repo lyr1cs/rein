@@ -72,6 +72,9 @@ pub struct ConsolidationGroupReport {
     pub source_topics: Vec<String>,
     pub memory_count: usize,
     pub created_id: Option<String>,
+    /// Set when the group was left untouched because the LLM synthesis
+    /// call failed; the sources stay as they were for a later run.
+    pub skipped_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -79,6 +82,9 @@ pub struct ConsolidateReport {
     pub groups: Vec<ConsolidationGroupReport>,
     pub groups_processed: usize,
     pub memories_replaced: usize,
+    /// Groups left untouched because the LLM synthesis call failed. They
+    /// are not counted in `groups_processed` or `memories_replaced`.
+    pub groups_skipped_llm_error: usize,
     pub dry_run: bool,
 }
 
@@ -344,50 +350,84 @@ fn build_consolidated_from_extracted(
 }
 
 /// Build a consolidated memory, preferring LLM synthesis when no explicit summary was provided.
+///
+/// Returns `Err(reason)` when the LLM call itself failed. Committing a
+/// replacement deletes the source rows, so a transient provider error must
+/// not be turned into a rule-based digest: the caller leaves the group
+/// untouched and a later run consolidates it properly.
 pub async fn build_consolidated_from_memories_async(
     config: &ReinConfig,
     canonical_topic: String,
     source_topics: &[String],
     memories: &[Memory],
     summary_template: Option<&str>,
-) -> Memory {
+) -> Result<Memory, String> {
     if summary_template.is_some() {
-        return build_consolidated_from_memories(
+        return Ok(build_consolidated_from_memories(
             config,
             canonical_topic,
             source_topics,
             memories,
             summary_template,
-        );
+        ));
     }
 
-    match crate::extract::llm::summarize_topic_group(
+    let outcome = crate::extract::llm::summarize_topic_group(
         config,
         &canonical_topic,
         source_topics,
         memories,
     )
-    .await
-    {
-        Ok(Some(extracted)) => build_consolidated_from_extracted(
+    .await;
+    consolidated_from_summary_outcome(config, canonical_topic, source_topics, memories, outcome)
+}
+
+/// Map the LLM synthesis result onto a replacement memory. `Ok(Some)` uses
+/// the synthesis; `Ok(None)` (no LLM configured, group over the input
+/// budget, or no usable summary) uses the rule-based digest; `Err` yields no
+/// replacement at all.
+fn consolidated_from_summary_outcome(
+    config: &ReinConfig,
+    canonical_topic: String,
+    source_topics: &[String],
+    memories: &[Memory],
+    outcome: ReinResult<Option<ExtractedMemory>>,
+) -> Result<Memory, String> {
+    match outcome {
+        Ok(Some(extracted)) => Ok(build_consolidated_from_extracted(
             config,
             canonical_topic,
             source_topics,
             memories,
             extracted,
-        ),
-        Ok(None) => {
-            build_consolidated_from_memories(config, canonical_topic, source_topics, memories, None)
-        }
+        )),
+        Ok(None) => Ok(build_consolidated_from_memories(
+            config,
+            canonical_topic,
+            source_topics,
+            memories,
+            None,
+        )),
         Err(error) => {
             tracing::warn!(
-                "llm consolidation failed for topic '{}': {}",
+                "llm consolidation failed for topic '{}'; leaving the group untouched: {}",
                 canonical_topic,
                 error
             );
-            build_consolidated_from_memories(config, canonical_topic, source_topics, memories, None)
+            Err(format!("llm synthesis failed: {error}"))
         }
     }
+}
+
+/// What the preparation step decided for one group.
+enum PreparedReplacement {
+    /// Dry run: nothing is built or written.
+    DryRun,
+    /// A replacement is ready to commit; the flag records whether the LLM
+    /// was called for it.
+    Ready(Box<Memory>, bool),
+    /// The LLM call failed; the group is left untouched.
+    LlmFailed(String),
 }
 
 /// Execute one or more consolidations selected by topic/pattern, optionally grouping
@@ -414,6 +454,7 @@ pub fn run_consolidation(
                 source_topics: group.topics.clone(),
                 memory_count: 0,
                 created_id: None,
+                skipped_reason: None,
             });
             continue;
         }
@@ -429,6 +470,7 @@ pub fn run_consolidation(
                 source_topics: group.topics.clone(),
                 memory_count: 1,
                 created_id: None,
+                skipped_reason: None,
             });
             continue;
         }
@@ -472,6 +514,7 @@ pub fn run_consolidation(
             source_topics: group.topics.clone(),
             memory_count: memories.len(),
             created_id,
+            skipped_reason: None,
         });
     }
 
@@ -506,6 +549,7 @@ pub async fn run_consolidation_async(
                 source_topics: group.topics.clone(),
                 memory_count: 0,
                 created_id: None,
+                skipped_reason: None,
             });
             continue;
         }
@@ -522,6 +566,7 @@ pub async fn run_consolidation_async(
                 source_topics: group.topics.clone(),
                 memory_count: 1,
                 created_id: None,
+                skipped_reason: None,
             });
             continue;
         }
@@ -558,7 +603,7 @@ pub async fn run_consolidation_async(
                 let summary_template = summary_template_owned.clone();
                 async move {
                     let replacement = if dry_run {
-                        None
+                        PreparedReplacement::DryRun
                     } else {
                         // Skip LLM for short-content groups: total chars below threshold
                         // get rule-based merge only (no LLM summarization).
@@ -569,25 +614,26 @@ pub async fn run_consolidation_async(
                                 "consolidation: short content ({total_chars} chars) for '{}', skipping LLM",
                                 group.canonical_topic
                             );
-                            Some((build_consolidated_from_memories(
+                            PreparedReplacement::Ready(Box::new(build_consolidated_from_memories(
                                 &config,
                                 group.canonical_topic.clone(),
                                 &group.topics,
                                 &memories,
                                 summary_template.as_deref(),
-                            ), false))
+                            )), false)
                         } else {
-                            Some((
-                                build_consolidated_from_memories_async(
-                                    &config,
-                                    group.canonical_topic.clone(),
-                                    &group.topics,
-                                    &memories,
-                                    summary_template.as_deref(),
-                                )
-                                .await,
-                                true,
-                            ))
+                            match build_consolidated_from_memories_async(
+                                &config,
+                                group.canonical_topic.clone(),
+                                &group.topics,
+                                &memories,
+                                summary_template.as_deref(),
+                            )
+                            .await
+                            {
+                                Ok(memory) => PreparedReplacement::Ready(Box::new(memory), true),
+                                Err(reason) => PreparedReplacement::LlmFailed(reason),
+                            }
                         }
                     };
                     (group, memories, replacement)
@@ -595,12 +641,14 @@ pub async fn run_consolidation_async(
             }))
             .await;
 
-        // Track whether any item in this batch used LLM
+        // Track whether any item in this batch called the LLM. A failed call
+        // still reached the provider, so it counts for pacing.
         for (_, _, replacement) in &prepared {
-            if let Some((_, did_llm)) = replacement {
-                if *did_llm {
+            match replacement {
+                PreparedReplacement::Ready(_, true) | PreparedReplacement::LlmFailed(_) => {
                     used_llm = true;
                 }
+                PreparedReplacement::Ready(_, false) | PreparedReplacement::DryRun => {}
             }
         }
 
@@ -614,10 +662,27 @@ pub async fn run_consolidation_async(
         }
 
         for (group, memories, replacement) in prepared {
+            let replacement = match replacement {
+                PreparedReplacement::LlmFailed(reason) => {
+                    // The sources stay exactly as they are; the group is
+                    // reported as skipped and picked up again by a later run.
+                    report.groups_skipped_llm_error += 1;
+                    report.groups.push(ConsolidationGroupReport {
+                        canonical_topic: group.canonical_topic.clone(),
+                        source_topics: group.topics.clone(),
+                        memory_count: memories.len(),
+                        created_id: None,
+                        skipped_reason: Some(reason),
+                    });
+                    continue;
+                }
+                PreparedReplacement::DryRun => None,
+                PreparedReplacement::Ready(memory, _) => Some(*memory),
+            };
             report.memories_replaced += memories.len();
             report.groups_processed += 1;
 
-            let created_id = if let Some((replacement, _)) = replacement {
+            let created_id = if let Some(replacement) = replacement {
                 let new_id = replacement.id.clone();
                 // Snapshot-checked, ID-based replacement (see the single-group
                 // path above): an edited source skips the group rather than
@@ -646,6 +711,7 @@ pub async fn run_consolidation_async(
                 source_topics: group.topics.clone(),
                 memory_count: memories.len(),
                 created_id,
+                skipped_reason: None,
             });
         }
     }
@@ -706,8 +772,18 @@ pub async fn run_cleanup_async(
 ) -> ReinResult<CleanupReport> {
     let consolidation = run_consolidation_async(store, config, groups, None, dry_run).await?;
     let threshold = config.search.dedup_similarity as f32;
-    let (duplicates_found, duplicates_merged) =
-        run_dedup_scoped(store, config, groups, threshold, dry_run, merge_variants)?;
+    // A group skipped because its synthesis failed is left exactly as it
+    // was for the retry: deduplicating inside it now would merge and
+    // supersede the very sources the later synthesis has to read.
+    let dedup_groups = groups_outside_skipped(groups, &consolidation);
+    let (duplicates_found, duplicates_merged) = run_dedup_scoped(
+        store,
+        config,
+        &dedup_groups,
+        threshold,
+        dry_run,
+        merge_variants,
+    )?;
 
     Ok(CleanupReport {
         consolidation,
@@ -715,6 +791,24 @@ pub async fn run_cleanup_async(
         duplicates_merged,
         dry_run,
     })
+}
+
+/// `groups` without those the consolidation pass reported as skipped.
+fn groups_outside_skipped(
+    groups: &[TopicGroup],
+    consolidation: &ConsolidateReport,
+) -> Vec<TopicGroup> {
+    let skipped: std::collections::HashSet<&str> = consolidation
+        .groups
+        .iter()
+        .filter(|group| group.skipped_reason.is_some())
+        .map(|group| group.canonical_topic.as_str())
+        .collect();
+    groups
+        .iter()
+        .filter(|group| !skipped.contains(group.canonical_topic.as_str()))
+        .cloned()
+        .collect()
 }
 
 pub fn run_cleanup_sync(
@@ -1418,5 +1512,128 @@ mod tests {
             after_count > before_count,
             "consolidation should emit feedback events: before={before_count}, after={after_count}"
         );
+    }
+
+    #[test]
+    fn llm_error_yields_no_replacement_but_empty_result_keeps_rule_based_digest() {
+        let config = ReinConfig::default();
+        let topics = vec!["rust-testing".to_string()];
+        let memories = vec![
+            test_memory("rust-testing", "unit", "Write unit tests", vec!["rust"]),
+            test_memory(
+                "rust-testing",
+                "integration",
+                "Write integration tests",
+                vec!["rust"],
+            ),
+        ];
+
+        let failed = consolidated_from_summary_outcome(
+            &config,
+            "rust-testing".to_string(),
+            &topics,
+            &memories,
+            Err(ReinError::Extract("provider returned 503".to_string())),
+        );
+        let reason = failed.expect_err("an LLM error must not produce a replacement");
+        assert!(reason.contains("provider returned 503"), "{reason}");
+
+        let digest = consolidated_from_summary_outcome(
+            &config,
+            "rust-testing".to_string(),
+            &topics,
+            &memories,
+            Ok(None),
+        )
+        .expect("no usable LLM summary still yields the rule-based digest");
+        assert_eq!(digest.topic, "rust-testing");
+        assert_eq!(digest.support_count, 2);
+    }
+
+    #[test]
+    fn skipped_groups_are_left_out_of_the_cleanup_dedup_scope() {
+        let group = |topic: &str| TopicGroup {
+            canonical_topic: topic.to_string(),
+            topics: vec![topic.to_string()],
+        };
+        let groups = vec![group("kept"), group("skipped"), group("also-kept")];
+        let report_for = |topic: &str, skipped: bool| ConsolidationGroupReport {
+            canonical_topic: topic.to_string(),
+            skipped_reason: skipped.then(|| "llm call failed".to_string()),
+            ..ConsolidationGroupReport::default()
+        };
+        let consolidation = ConsolidateReport {
+            groups: vec![
+                report_for("kept", false),
+                report_for("skipped", true),
+                report_for("also-kept", false),
+            ],
+            groups_skipped_llm_error: 1,
+            ..ConsolidateReport::default()
+        };
+
+        let scope = groups_outside_skipped(&groups, &consolidation);
+
+        assert_eq!(scope, vec![group("kept"), group("also-kept")]);
+    }
+
+    #[tokio::test]
+    async fn test_run_consolidation_async_leaves_group_untouched_on_llm_error() {
+        let store = SqliteStore::in_memory().unwrap();
+        // An OpenAI-compatible provider on a closed local port: every
+        // synthesis call fails at the transport level.
+        let mut config = ReinConfig::default();
+        config.extract.provider = "omlx".to_string();
+        config.extract.omlx.endpoint = "http://127.0.0.1:1/v1".to_string();
+        assert!(
+            crate::extract::llm::create_extractor(&config).is_some(),
+            "test precondition: an LLM must be configured so the error path is reached"
+        );
+
+        // Long enough to pass `skip_short_content_chars`, so the LLM path runs.
+        let long_a = "Unit tests live next to the code they cover. ".repeat(10);
+        let long_b = "Integration tests live in the tests directory. ".repeat(10);
+        assert!(
+            long_a.chars().count() + long_b.chars().count()
+                >= config.cleanup.skip_short_content_chars
+        );
+        let id_a = store
+            .store(test_memory(
+                "rust-testing",
+                "unit tests",
+                &long_a,
+                vec!["rust"],
+            ))
+            .unwrap();
+        let id_b = store
+            .store(test_memory(
+                "rust-testing",
+                "integration tests",
+                &long_b,
+                vec!["rust"],
+            ))
+            .unwrap();
+
+        let groups =
+            crate::ops::resolve_topic_groups(&store, None, &[], None, true, false).unwrap();
+        assert_eq!(groups.len(), 1);
+        let report = run_consolidation_async(&store, &config, &groups, None, false)
+            .await
+            .unwrap();
+
+        assert_eq!(report.groups_skipped_llm_error, 1);
+        assert_eq!(report.groups_processed, 0);
+        assert_eq!(report.memories_replaced, 0);
+        assert_eq!(report.groups.len(), 1);
+        assert!(report.groups[0].created_id.is_none());
+        assert!(report.groups[0].skipped_reason.is_some());
+
+        // Both sources are still current, unmerged memories.
+        let remaining = load_group_memories(&store, &groups[0]).unwrap();
+        let mut remaining_ids: Vec<String> = remaining.into_iter().map(|m| m.id).collect();
+        remaining_ids.sort();
+        let mut expected = vec![id_a, id_b];
+        expected.sort();
+        assert_eq!(remaining_ids, expected);
     }
 }

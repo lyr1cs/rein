@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 const MAX_CLIENT_NAME_BYTES: usize = 128;
 const MAX_REDIRECT_URIS: usize = 10;
 const MAX_REDIRECT_URI_BYTES: usize = 2048;
-const MAX_OAUTH_CLIENTS: i64 = 256;
+pub(crate) const MAX_OAUTH_CLIENTS: i64 = 256;
 
 #[derive(Debug, Clone)]
 pub struct RegisterClientInput {
@@ -286,12 +286,42 @@ fn prune_oauth_clients_to_cap(conn: &Connection, keep: i64) -> anyhow::Result<us
     Ok(deleted)
 }
 
+/// Registration failure caused by the metadata the client sent. Carries the
+/// reason; every other registration failure is a server-side condition.
+#[derive(Debug)]
+pub struct InvalidClientMetadata(String);
+
+impl std::fmt::Display for InvalidClientMetadata {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for InvalidClientMetadata {}
+
+fn invalid_client_metadata(err: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(InvalidClientMetadata(err.to_string()))
+}
+
+/// Registration failure because the client table is at its cap and nothing
+/// in it can be pruned. The message tells the operator how to free a slot.
+#[derive(Debug)]
+pub struct ClientLimitReached;
+
+impl std::fmt::Display for ClientLimitReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("oauth client registration limit reached; revoke unused clients in Connectors")
+    }
+}
+
+impl std::error::Error for ClientLimitReached {}
+
 pub fn register_client(
     conn: &Connection,
     input: RegisterClientInput,
 ) -> anyhow::Result<RegisteredClient> {
-    validate_register_input(&input)?;
-    let grant_types = normalize_grant_types(&input.grant_types)?;
+    validate_register_input(&input).map_err(invalid_client_metadata)?;
+    let grant_types = normalize_grant_types(&input.grant_types).map_err(invalid_client_metadata)?;
     let client_id = random_token(32)?;
     let client_secret = (input.token_endpoint_auth_method != "none")
         .then(|| random_token(32))
@@ -304,9 +334,7 @@ pub fn register_client(
     let registered = (|| -> anyhow::Result<RegisteredClient> {
         prune_oauth_clients_to_cap(conn, MAX_OAUTH_CLIENTS - 1)?;
         if oauth_client_count(conn)? >= MAX_OAUTH_CLIENTS {
-            anyhow::bail!(
-                "oauth client registration limit reached; revoke unused clients in Connectors"
-            );
+            return Err(ClientLimitReached.into());
         }
         conn.execute(
             "INSERT INTO oauth_clients (

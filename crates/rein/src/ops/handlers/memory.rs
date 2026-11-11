@@ -13,6 +13,21 @@ use serde_json::json;
 use crate::ops::{IntoCliText, IntoJson, IntoMarkdown, OpsRuntime};
 use crate::types::{MemoryStore, ReinResult};
 
+/// Largest memory content, in bytes, that any write path may create.
+/// `rein_store` and `rein_update` reject larger content, and the extraction
+/// admission gate (`extract::hooks::persist`) drops larger items, so hooks,
+/// the proxy and the async worker cannot store what a direct call could not.
+pub const MAX_MEMORY_CONTENT_BYTES: usize = 100_000;
+
+/// Number of results `rein_recall` returns when the caller gives no `limit`.
+pub const RECALL_DEFAULT_LIMIT: usize = 10;
+
+/// The bad-request error for content over [`MAX_MEMORY_CONTENT_BYTES`].
+fn content_too_large() -> crate::types::ReinError {
+    crate::types::ReinError::Config("content too large (max 100KB)".to_string())
+        .with_kind(crate::types::OpsErrorKind::BadRequest)
+}
+
 // ── forget ───────────────────────────────────────────────────────────────────
 
 /// Parameters for the forget op (`DELETE /api/memories/{id}`).
@@ -658,7 +673,7 @@ impl OpsRuntime {
         mcp(name = "rein_recall")
     )]
     pub fn recall(&self, params: RecallMemoryParams) -> ReinResult<RecallMemoryOutput> {
-        let limit = params.limit.unwrap_or(10).min(200);
+        let limit = params.limit.unwrap_or(RECALL_DEFAULT_LIMIT).min(200);
         let time_from = params.from.as_deref().and_then(parse_dt_start);
         let time_to = params.to.as_deref().and_then(parse_dt_end);
         let request_id = ulid::Ulid::new().to_string();
@@ -783,11 +798,8 @@ impl OpsRuntime {
         mcp(name = "rein_store")
     )]
     pub fn store_memory(&self, params: StoreMemoryParams) -> ReinResult<StoreMemoryOutput> {
-        if params.content.len() > 100_000 {
-            return Err(crate::types::ReinError::Config(
-                "content too large (max 100KB)".to_string(),
-            )
-            .with_kind(crate::types::OpsErrorKind::BadRequest));
+        if params.content.len() > MAX_MEMORY_CONTENT_BYTES {
+            return Err(content_too_large());
         }
         let importance: crate::types::Importance =
             match params.importance.as_deref().unwrap_or("medium").parse() {
@@ -848,6 +860,15 @@ impl OpsRuntime {
             conn.execute_batch("BEGIN IMMEDIATE")?;
             let result = (|| -> ReinResult<UpdateOutput> {
                 let mut memory = store.get(&id)?;
+                // Same size bound as `rein_store`, applied to growth only:
+                // `content` is a required field, so a row that is already
+                // over the bound must stay updatable (importance change,
+                // unchanged or shorter content) — it just cannot grow.
+                if params.content.len() > MAX_MEMORY_CONTENT_BYTES
+                    && params.content.len() > memory.content.len()
+                {
+                    return Err(content_too_large());
+                }
                 memory.content = params.content.clone();
                 memory.summary = params
                     .content
@@ -1180,5 +1201,104 @@ impl OpsRuntime {
                 deleted: true,
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    fn runtime_with_empty_db() -> (Arc<OpsRuntime>, TempDir) {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut config = crate::config::ReinConfig::default();
+        config.database.path = tmp
+            .path()
+            .join("memories.db")
+            .to_string_lossy()
+            .into_owned();
+        let config = Arc::new(config);
+        let _ = config.open_store().expect("open store applies migrations");
+        (Arc::new(OpsRuntime::for_rest(config)), tmp)
+    }
+
+    #[test]
+    fn update_rejects_content_over_the_store_limit() {
+        let (runtime, _tmp) = runtime_with_empty_db();
+        let original = "The deploy pipeline uses blue-green releases";
+        let id = {
+            let store = runtime.config().open_store().expect("open store");
+            let memory = crate::ops::build_memory(
+                runtime.config(),
+                "deploy".to_string(),
+                original.to_string(),
+                crate::types::Importance::Medium,
+                vec![],
+                crate::types::Source::Manual,
+            );
+            store.store(memory).expect("seed memory")
+        };
+
+        // Just over the bound, in multi-byte characters.
+        let oversized = "记".repeat(MAX_MEMORY_CONTENT_BYTES / 3 + 1);
+        assert!(oversized.len() > MAX_MEMORY_CONTENT_BYTES);
+        let err = runtime
+            .update(UpdateParams {
+                id: id.clone(),
+                content: oversized.clone(),
+                importance: None,
+            })
+            .expect_err("oversized update must be rejected");
+        assert_eq!(err.kind(), crate::types::OpsErrorKind::BadRequest);
+
+        // `rein_store` rejects the same content with the same error kind.
+        let store_err = runtime
+            .store_memory(StoreMemoryParams {
+                content: oversized,
+                ..Default::default()
+            })
+            .expect_err("oversized store must be rejected");
+        assert_eq!(store_err.kind(), err.kind());
+
+        // The stored memory is untouched.
+        let store = runtime.config().open_store().expect("open store");
+        assert_eq!(store.get(&id).expect("memory exists").content, original);
+
+        // A row already over the bound can still be updated with the same
+        // or shorter content (here: an importance change), but cannot grow.
+        let legacy_content = "legacy note ".repeat(MAX_MEMORY_CONTENT_BYTES / 12 + 100);
+        assert!(legacy_content.len() > MAX_MEMORY_CONTENT_BYTES);
+        let legacy = crate::ops::build_memory(
+            runtime.config(),
+            "legacy".to_string(),
+            legacy_content.clone(),
+            crate::types::Importance::Low,
+            vec![],
+            crate::types::Source::Manual,
+        );
+        let legacy_id = store.store(legacy).expect("seed legacy memory");
+        drop(store);
+
+        runtime
+            .update(UpdateParams {
+                id: legacy_id.clone(),
+                content: legacy_content.clone(),
+                importance: Some("high".to_string()),
+            })
+            .expect("unchanged oversized content must still be updatable");
+        let grow_err = runtime
+            .update(UpdateParams {
+                id: legacy_id.clone(),
+                content: format!("{legacy_content}more"),
+                importance: None,
+            })
+            .expect_err("an oversized row must not grow");
+        assert_eq!(grow_err.kind(), crate::types::OpsErrorKind::BadRequest);
+
+        let store = runtime.config().open_store().expect("open store");
+        let after = store.get(&legacy_id).expect("legacy memory exists");
+        assert_eq!(after.importance, crate::types::Importance::High);
+        assert_eq!(after.content, legacy_content);
     }
 }

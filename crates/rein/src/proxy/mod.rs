@@ -134,6 +134,36 @@ fn resolve_proxy_startup_auth(
     Ok(env_token)
 }
 
+/// Longest wait for the TCP/TLS connection to an upstream to be established.
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Longest silence tolerated from an upstream: the wait for the response
+/// headers, and each gap between two reads of the response body.
+const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Build the client used for every upstream request.
+///
+/// The client has no total deadline. reqwest's `ClientBuilder::timeout` also
+/// covers reading the response body, so it ends a healthy SSE completion that
+/// streams for longer than the deadline. A hung upstream is detected by two
+/// narrower limits instead:
+///
+/// - `connect_timeout` bounds connection establishment.
+/// - `read_timeout` bounds the wait for the response headers (one timer that
+///   starts when the request is sent) and then every individual read of the
+///   body (the timer restarts after each chunk). A non-streaming call
+///   therefore still fails when the upstream produces nothing for
+///   `idle_timeout`, while a stream lives for as long as chunks keep
+///   arriving.
+fn build_upstream_client(
+    connect_timeout: Duration,
+    idle_timeout: Duration,
+) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .read_timeout(idle_timeout)
+        .build()
+}
+
 /// Start the transparent proxy server.
 pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
     // REIN_PROXY_ACTIVE is set by the caller (main.rs) before entering async
@@ -162,9 +192,7 @@ pub async fn run_proxy(config: ReinConfig) -> anyhow::Result<()> {
     let _ = crate::service::write_pid("proxy");
 
     // Shared reqwest client for all upstream requests (connection pooling).
-    let upstream_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .build()?;
+    let upstream_client = build_upstream_client(UPSTREAM_CONNECT_TIMEOUT, UPSTREAM_IDLE_TIMEOUT)?;
 
     let state = Arc::new(ProxyState {
         metrics: ProxyMetrics::new(),
@@ -765,9 +793,21 @@ fn format_artifact_body(bytes: &[u8], truncated: bool, mode: RecordingMode) -> S
         // and user/assistant content (end) are preserved.
         let head_n = cap / 4;
         let tail_n = cap - head_n - 40;
-        let chars: Vec<char> = text.chars().collect();
-        let head: String = chars[..head_n].iter().collect();
-        let tail: String = chars[chars.len() - tail_n..].iter().collect();
+        // Cut at the byte offsets of the head_n-th character from the start
+        // and the tail_n-th from the end, so only the kept parts are copied.
+        let head_end = text
+            .char_indices()
+            .nth(head_n)
+            .map(|(offset, _)| offset)
+            .unwrap_or(text.len());
+        let tail_start = text
+            .char_indices()
+            .rev()
+            .nth(tail_n - 1)
+            .map(|(offset, _)| offset)
+            .unwrap_or(0);
+        let head = &text[..head_end];
+        let tail = &text[tail_start..];
         let omitted = char_count - head_n - tail_n;
         format!("{head}\n\n…[middle {omitted} chars omitted]…\n\n{tail}")
     } else {
@@ -782,6 +822,14 @@ fn format_artifact_body(bytes: &[u8], truncated: bool, mode: RecordingMode) -> S
     }
 }
 
+/// Whether HTTP traffic for `provider` is recorded as a session artifact.
+fn stores_first_party_artifact(provider: ProviderKind) -> bool {
+    matches!(
+        provider,
+        ProviderKind::CodexFirstParty | ProviderKind::ChatGptBackend
+    )
+}
+
 fn maybe_store_first_party_artifact(
     config: &ReinConfig,
     artifact: ProxyArtifactInput,
@@ -791,10 +839,7 @@ fn maybe_store_first_party_artifact(
     response_truncated: bool,
     streaming: bool,
 ) {
-    if !matches!(
-        artifact.route.provider,
-        ProviderKind::CodexFirstParty | ProviderKind::ChatGptBackend
-    ) {
+    if !stores_first_party_artifact(artifact.route.provider) {
         return;
     }
 
@@ -991,7 +1036,9 @@ async fn send_with_retry(
         let mut req = client.request(method.clone(), url);
         req = req.headers(headers.clone());
         if !body.is_empty() {
-            req = req.body(body.to_vec());
+            // `Bytes` is reference-counted: every attempt shares the one
+            // buffer read from the client instead of copying it.
+            req = req.body(body.clone());
         }
 
         match req.send().await {
@@ -1188,11 +1235,11 @@ async fn handle_request(
         }
     }
 
-    if let Some(content_length) = headers
+    let declared_length = headers
         .get("content-length")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<usize>().ok())
-    {
+        .and_then(|s| s.parse::<usize>().ok());
+    if let Some(content_length) = declared_length {
         if content_length > config.proxy.max_request_body {
             state.metrics.error_count.fetch_add(1, Ordering::Relaxed);
             return Ok(error_response(413, "request body too large"));
@@ -1200,8 +1247,13 @@ async fn handle_request(
     }
 
     // Read request body incrementally with size cap (handles chunked TE too).
+    // The declared length is the client's claim, not memory it has earned:
+    // at most REQUEST_BUFFER_PREALLOC is reserved up front and the buffer
+    // then grows with the bytes actually received.
+    const REQUEST_BUFFER_PREALLOC: usize = 64 * 1024;
     let max_body = config.proxy.max_request_body;
-    let mut body_buf = Vec::new();
+    let mut body_buf =
+        Vec::with_capacity(declared_length.unwrap_or(0).min(REQUEST_BUFFER_PREALLOC));
     let mut body_stream = req.into_body();
     loop {
         let frame = match body_stream.frame().await {
@@ -1259,7 +1311,14 @@ async fn handle_request(
         path: path_and_query.clone(),
         session_id: extract_session_id(&headers),
         request_headers: capture_request_headers(&headers),
-        request_body: body_bytes.clone(),
+        // Only first-party routes store an artifact. Other routes carry an
+        // empty body here so the request buffer is released as soon as it
+        // has been sent upstream, not when the response stream ends.
+        request_body: if stores_first_party_artifact(provider) {
+            body_bytes.clone()
+        } else {
+            Bytes::new()
+        },
     };
 
     // Build upstream URL (rewrite path if needed, e.g. /responses → /v1/responses).
@@ -1645,6 +1704,10 @@ where
 }
 
 /// Forward a request unmodified (for non-LLM endpoints like /v1/models).
+///
+/// Nothing is extracted on this path, so the upstream response is relayed to
+/// the client as it arrives and is never buffered: its size is not limited,
+/// and a streaming response reaches the client chunk by chunk.
 async fn forward_raw(
     client: &reqwest::Client,
     config: &ReinConfig,
@@ -1674,53 +1737,57 @@ async fn forward_raw(
         }
     }
     if !body.is_empty() {
-        req = req.body(body.to_vec());
+        req = req.body(body);
     }
 
     match req.send().await {
-        Ok(resp) => {
-            let status = resp.status();
-            let resp_headers = resp.headers().clone();
-            // Cap response body to prevent unbounded memory allocation.
-            let max_raw = config.proxy.max_response_buffer;
-            let mut resp_bytes = Vec::new();
-            let mut stream = resp.bytes_stream();
-            use futures_util::StreamExt;
-            let mut exceeded = false;
-            while let Some(chunk) = stream.next().await {
-                match chunk {
-                    Ok(c) => {
-                        resp_bytes.extend_from_slice(&c);
-                        if resp_bytes.len() > max_raw {
-                            exceeded = true;
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("forward_raw upstream read error: {e}");
-                        return Ok(error_response(502, "upstream read failed"));
-                    }
-                }
-            }
-            if exceeded {
-                tracing::warn!("forward_raw: response exceeded {max_raw} bytes, returning 502");
-                return Ok(error_response(502, "upstream response too large"));
-            }
-            let resp_body = Bytes::from(resp_bytes);
-
-            let mut builder = hyper::Response::builder().status(status.as_u16());
-            for (name, value) in resp_headers.iter() {
-                if name.as_str() != "transfer-encoding" {
-                    builder = builder.header(name.as_str(), value);
-                }
-            }
-            Ok(build_response(builder, full_body(resp_body)))
-        }
+        Ok(resp) => Ok(relay_upstream_response(resp)),
         Err(e) => {
             tracing::warn!("forward_raw upstream error: {e}");
             Ok(error_response(502, "upstream request failed"))
         }
     }
+}
+
+/// Relay an upstream response to the client without buffering it.
+///
+/// Status and headers are passed through (`transfer-encoding` is dropped
+/// because hyper frames the outgoing body itself). Body chunks are forwarded
+/// unmodified through a bounded channel, so a slow client applies
+/// backpressure to the upstream read. An upstream failure in the middle of
+/// the body is sent as an error frame, which makes hyper abort the client
+/// connection instead of ending the body as if it were complete.
+fn relay_upstream_response(resp: reqwest::Response) -> hyper::Response<BoxBody> {
+    let mut builder = hyper::Response::builder().status(resp.status().as_u16());
+    for (name, value) in resp.headers().iter() {
+        if name.as_str() != "transfer-encoding" {
+            builder = builder.header(name.as_str(), value);
+        }
+    }
+
+    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, BodyError>>(64);
+    tokio::spawn(async move {
+        let mut upstream_stream = Box::pin(resp.bytes_stream());
+        while let Some(chunk_result) = upstream_stream.next().await {
+            match chunk_result {
+                Ok(chunk) => {
+                    if tx.send(Ok(Frame::data(chunk))).await.is_err() {
+                        break; // Client disconnected.
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("forward_raw upstream read error: {e}");
+                    let _ = tx
+                        .send(Err(format!("rein proxy: upstream stream error: {e}").into()))
+                        .await;
+                    break;
+                }
+            }
+        }
+    });
+
+    let body_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    build_response(builder, box_body(StreamBody::new(body_stream)))
 }
 
 fn extract_query_for_recording(provider: &ProviderKind, body_bytes: &[u8]) -> Option<String> {
@@ -1771,6 +1838,14 @@ fn prefers_chatgpt_backend(path: &str, _headers: &hyper::HeaderMap) -> bool {
     true
 }
 
+/// Request headers that are not copied to the upstream request.
+///
+/// `accept-encoding` is dropped because the upstream client is built without
+/// decompression support: a compressed response could be relayed but not read
+/// for memory extraction. Without the header the upstream answers
+/// uncompressed, which every HTTP client accepts. Response bodies are never
+/// re-encoded by the proxy, so a `content-encoding` response header always
+/// describes the bytes it travels with.
 fn should_strip_request_header(name: &str) -> bool {
     matches!(
         name,
@@ -1780,6 +1855,7 @@ fn should_strip_request_header(name: &str) -> bool {
             | "connection"
             | "proxy-authenticate"
             | "proxy-authorization"
+            | "accept-encoding"
             | "x-rein-token"
     )
 }
@@ -4843,6 +4919,7 @@ x-openai-subagent: worker_abc\r\n\
         assert!(should_strip_request_header("host"));
         assert!(should_strip_request_header("x-rein-token"));
         assert!(should_strip_request_header("content-length"));
+        assert!(should_strip_request_header("accept-encoding"));
     }
 
     // --- v0.18.1 WS boundary-case hardening tests ---
@@ -5151,6 +5228,271 @@ Connection: close\r\n\r\n\
             response.status().is_server_error(),
             "upstream drop must surface as a 5xx, got {}",
             response.status()
+        );
+        proxy_task.abort();
+    }
+
+    // --- upstream timeout, raw relay, body cap and encoding tests ---
+
+    /// Read one HTTP request head from `stream` (the stubs below serve
+    /// requests without a body).
+    fn read_request_head_for_test(stream: &mut std::net::TcpStream) {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        while find_header_end_for_test(&buf).is_none() {
+            let n = stream.read(&mut tmp).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+
+    fn write_http_chunk_for_test(stream: &mut std::net::TcpStream, data: &str) {
+        let _ = stream.write_all(format!("{:x}\r\n{data}\r\n", data.len()).as_bytes());
+        let _ = stream.flush();
+    }
+
+    const CHUNKED_SSE_HEAD_FOR_TEST: &[u8] = b"HTTP/1.1 200 OK\r\n\
+Content-Type: text/event-stream\r\n\
+X-Upstream-Marker: kept\r\n\
+Transfer-Encoding: chunked\r\n\
+Connection: close\r\n\r\n";
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn upstream_client_does_not_cut_a_stream_longer_than_the_idle_timeout() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        // 25 chunks, 100 ms apart: the body takes about 2.5 s in total, past
+        // the 2 s idle timeout, while each gap is a twentieth of it.
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request_head_for_test(&mut stream);
+            let _ = stream.write_all(CHUNKED_SSE_HEAD_FOR_TEST);
+            for i in 0..25 {
+                thread::sleep(Duration::from_millis(100));
+                write_http_chunk_for_test(&mut stream, &format!("data: {i}\n\n"));
+            }
+            let _ = stream.write_all(b"0\r\n\r\n");
+        });
+
+        let client = build_upstream_client(Duration::from_secs(5), Duration::from_secs(2)).unwrap();
+        let response = client
+            .get(format!("http://{addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let body = response
+            .text()
+            .await
+            .expect("a stream that keeps producing chunks must not time out");
+        let expected: String = (0..25).map(|i| format!("data: {i}\n\n")).collect();
+        assert_eq!(body, expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn upstream_client_times_out_a_stalled_stream() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        // One chunk, then silence with the connection held open.
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request_head_for_test(&mut stream);
+            let _ = stream.write_all(CHUNKED_SSE_HEAD_FOR_TEST);
+            write_http_chunk_for_test(&mut stream, "data: first\n\n");
+            let _ = done_rx.recv_timeout(Duration::from_secs(20));
+        });
+
+        let client =
+            build_upstream_client(Duration::from_secs(5), Duration::from_millis(500)).unwrap();
+        let response = client
+            .get(format!("http://{addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(10), response.text())
+            .await
+            .expect("the idle timeout must end a stalled body read");
+        assert!(
+            result.is_err(),
+            "a stalled upstream body must surface as an error, got {result:?}"
+        );
+        let _ = done_tx.send(());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn forward_raw_streams_response_larger_than_buffer_cap() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        // The upstream sends the first chunk, then holds the response open
+        // until the test has read that chunk through the proxy.
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request_head_for_test(&mut stream);
+            let _ = stream.write_all(CHUNKED_SSE_HEAD_FOR_TEST);
+            write_http_chunk_for_test(&mut stream, "first-chunk;");
+            let _ = release_rx.recv_timeout(Duration::from_secs(20));
+            write_http_chunk_for_test(&mut stream, "second-chunk");
+            let _ = stream.write_all(b"0\r\n\r\n");
+        });
+
+        let mut config = test_config();
+        config.proxy.openai_upstream = format!("http://{addr}");
+        // Far smaller than the response body.
+        config.proxy.max_response_buffer = 4;
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let mut response = tokio::time::timeout(
+            Duration::from_secs(4),
+            reqwest::Client::new()
+                .get(format!("{proxy_base}/v1/models"))
+                .header("x-rein-token", "secret")
+                .send(),
+        )
+        .await
+        .expect("response head must arrive while the upstream body is still open")
+        .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-upstream-marker")
+                .and_then(|v| v.to_str().ok()),
+            Some("kept")
+        );
+
+        let first = tokio::time::timeout(Duration::from_secs(4), response.chunk())
+            .await
+            .expect("first chunk must be relayed before the upstream finishes")
+            .unwrap()
+            .expect("first chunk");
+        assert_eq!(&first[..], b"first-chunk;");
+
+        release_tx.send(()).unwrap();
+        let mut rest = Vec::new();
+        while let Some(chunk) = tokio::time::timeout(Duration::from_secs(4), response.chunk())
+            .await
+            .expect("remaining body must arrive")
+            .unwrap()
+        {
+            rest.extend_from_slice(&chunk);
+        }
+        assert_eq!(rest, b"second-chunk");
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn forward_raw_aborts_client_response_when_upstream_dies_mid_body() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        // The upstream announces a chunked body, sends one chunk and closes
+        // the connection without the terminating zero-length chunk.
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_request_head_for_test(&mut stream);
+            let _ = stream.write_all(CHUNKED_SSE_HEAD_FOR_TEST);
+            write_http_chunk_for_test(&mut stream, "partial;");
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        });
+
+        let mut config = test_config();
+        config.proxy.openai_upstream = format!("http://{addr}");
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let response = tokio::time::timeout(
+            Duration::from_secs(4),
+            reqwest::Client::new()
+                .get(format!("{proxy_base}/v1/models"))
+                .header("x-rein-token", "secret")
+                .send(),
+        )
+        .await
+        .expect("response head must arrive")
+        .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+
+        let body = tokio::time::timeout(Duration::from_secs(4), response.bytes())
+            .await
+            .expect("the body read must end when the upstream dies");
+        assert!(
+            body.is_err(),
+            "a truncated upstream body must reach the client as an aborted response, got {body:?}"
+        );
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_accepts_request_body_above_one_mebibyte_by_default() {
+        let (anthropic_upstream, anthropic_rx) =
+            spawn_capture_http_server("200 OK", r#"{"content":[{"type":"text","text":"ok"}]}"#);
+
+        let mut config = test_config();
+        config.proxy.extract_enabled = false;
+        config.proxy.anthropic_upstream = anthropic_upstream;
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        // 2 MiB of payload inside a well-formed messages request.
+        let filler = "a".repeat(2 * 1024 * 1024);
+        let body = format!(
+            r#"{{"model":"claude-sonnet","messages":[{{"role":"user","content":"{filler}"}}]}}"#
+        );
+        let response = reqwest::Client::new()
+            .post(format!("{proxy_base}/v1/messages"))
+            .header("x-rein-token", "secret")
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+
+        let captured = anthropic_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(captured.body.len(), body.len());
+        proxy_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_does_not_forward_accept_encoding_upstream() {
+        let (anthropic_upstream, anthropic_rx) =
+            spawn_capture_http_server("200 OK", r#"{"content":[{"type":"text","text":"ok"}]}"#);
+
+        let mut config = test_config();
+        config.proxy.extract_enabled = false;
+        config.proxy.anthropic_upstream = anthropic_upstream;
+
+        let (proxy_base, proxy_task) =
+            spawn_one_shot_proxy(config, Some("secret".to_string())).await;
+        let response = reqwest::Client::new()
+            .post(format!("{proxy_base}/v1/messages"))
+            .header("x-rein-token", "secret")
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .header("accept-encoding", "gzip, br, zstd")
+            .body(r#"{"model":"claude-sonnet","messages":[{"role":"user","content":"hello"}]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        assert!(response.headers().get("content-encoding").is_none());
+
+        let captured = anthropic_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            !captured.headers.contains_key("accept-encoding"),
+            "accept-encoding must not reach the upstream, got {:?}",
+            captured.headers.get("accept-encoding")
+        );
+        assert_eq!(
+            captured
+                .headers
+                .get("anthropic-version")
+                .map(String::as_str),
+            Some("2023-06-01")
         );
         proxy_task.abort();
     }

@@ -1083,6 +1083,31 @@ pub struct ConsolidateOutput {
     pub pattern: Option<String>,
     /// Per-group detail, mirroring the pre-A1 MCP response structure.
     pub details: Vec<ConsolidateGroupDetail>,
+    /// Canonical topics of groups that were left untouched because the LLM
+    /// synthesis call failed. They are not part of the consolidated counts or
+    /// of the per-group detail; a later run retries them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_llm_error: Vec<String>,
+}
+
+/// One line telling the operator which groups were skipped because the LLM
+/// call failed, or an empty string when none were.
+fn llm_skip_note(skipped: &[String]) -> String {
+    if skipped.is_empty() {
+        return String::new();
+    }
+    let shown: Vec<&str> = skipped.iter().take(8).map(String::as_str).collect();
+    let more = if skipped.len() > shown.len() {
+        format!(" (+{} more)", skipped.len() - shown.len())
+    } else {
+        String::new()
+    };
+    format!(
+        "\nSkipped {} groups because the LLM call failed; their memories were left untouched and a later run retries them: {}{}",
+        skipped.len(),
+        shown.join(", "),
+        more
+    )
 }
 
 impl IntoJson for ConsolidateOutput {
@@ -1147,6 +1172,7 @@ impl IntoMarkdown for ConsolidateOutput {
                 total_non_empty - visible.len()
             ));
         }
+        text.push_str(&llm_skip_note(&self.skipped_llm_error));
         text
     }
 }
@@ -1197,6 +1223,7 @@ impl IntoCliText for ConsolidateOutput {
                 ));
             }
         }
+        text.push_str(&llm_skip_note(&self.skipped_llm_error));
         text
     }
 }
@@ -1244,6 +1271,7 @@ impl OpsRuntime {
                     topic: topic.clone(),
                     pattern: pattern.clone(),
                     details: vec![],
+                    skipped_llm_error: vec![],
                 });
             }
             let topic_count = groups.len();
@@ -1254,8 +1282,15 @@ impl OpsRuntime {
                 params.summary.as_deref(),
                 dry_run,
             )?;
-            let details = report
+            // Groups skipped on an LLM error were not consolidated: they are
+            // listed on their own instead of among the per-group detail.
+            let (skipped, consolidated): (Vec<_>, Vec<_>) = report
                 .groups
+                .into_iter()
+                .partition(|g| g.skipped_reason.is_some());
+            let skipped_llm_error: Vec<String> =
+                skipped.into_iter().map(|g| g.canonical_topic).collect();
+            let details = consolidated
                 .into_iter()
                 .map(|g| ConsolidateGroupDetail {
                     canonical_topic: g.canonical_topic,
@@ -1272,6 +1307,7 @@ impl OpsRuntime {
                 topic: topic.clone(),
                 pattern: pattern.clone(),
                 details,
+                skipped_llm_error,
             })
         })
     }
@@ -1383,6 +1419,11 @@ pub struct CleanupOutput {
     pub pattern: Option<String>,
     /// Per-group detail (up to all groups; output formatting truncates at 8).
     pub groups: Vec<CleanupGroupDetail>,
+    /// Canonical topics of groups that were left untouched because the LLM
+    /// synthesis call failed. They are not part of the consolidated counts or
+    /// of the per-group detail; a later run retries them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_llm_error: Vec<String>,
 }
 
 impl IntoJson for CleanupOutput {
@@ -1454,6 +1495,7 @@ impl IntoMarkdown for CleanupOutput {
                     total_non_empty - visible.len()
                 ));
             }
+            text.push_str(&llm_skip_note(&self.skipped_llm_error));
             text
         }
     }
@@ -1487,13 +1529,15 @@ impl IntoCliText for CleanupOutput {
                 self.groups_consolidated, self.memories_consolidated, self.duplicates_found
             )
         } else {
-            format!(
+            let mut text = format!(
                 "Cleanup finished: {} groups consolidated ({} memories), removed {} of {} duplicates",
                 self.groups_consolidated,
                 self.memories_consolidated,
                 self.duplicates_merged,
                 self.duplicates_found
-            )
+            );
+            text.push_str(&llm_skip_note(&self.skipped_llm_error));
+            text
         }
     }
 }
@@ -1544,6 +1588,7 @@ impl OpsRuntime {
                 topic: params.topic.clone(),
                 pattern: params.pattern.clone(),
                 groups: vec![],
+                skipped_llm_error: vec![],
             });
         }
 
@@ -1584,6 +1629,7 @@ impl OpsRuntime {
                     topic: topic.clone(),
                     pattern: pattern.clone(),
                     groups: vec![],
+                    skipped_llm_error: vec![],
                 });
             }
             // Compose at the business-function layer: call run_cleanup_sync
@@ -1592,9 +1638,14 @@ impl OpsRuntime {
             // re-invoke set_dry_run and could override state.
             let report =
                 crate::ops::run_cleanup_sync(store, &config, &groups, merge_variants, dry_run)?;
-            let details = report
+            let (skipped, consolidated): (Vec<_>, Vec<_>) = report
                 .consolidation
                 .groups
+                .into_iter()
+                .partition(|g| g.skipped_reason.is_some());
+            let skipped_llm_error: Vec<String> =
+                skipped.into_iter().map(|g| g.canonical_topic).collect();
+            let details = consolidated
                 .into_iter()
                 .map(|g| CleanupGroupDetail {
                     canonical_topic: g.canonical_topic,
@@ -1613,6 +1664,7 @@ impl OpsRuntime {
                 topic: topic.clone(),
                 pattern: pattern.clone(),
                 groups: details,
+                skipped_llm_error,
             })
         })
     }
@@ -1760,6 +1812,77 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         (OpsRuntime::for_cli(Arc::new(config)), tmp)
+    }
+
+    #[test]
+    fn llm_skipped_groups_are_reported_and_not_shown_as_consolidated() {
+        let consolidate = ConsolidateOutput {
+            matched: true,
+            consolidated_count: 1,
+            topic_count: 2,
+            dry_run: false,
+            topic: None,
+            pattern: None,
+            details: vec![ConsolidateGroupDetail {
+                canonical_topic: "done-topic".to_string(),
+                source_topics: vec!["done-topic".to_string()],
+                memory_count: 3,
+                created_id: Some("NEWID".to_string()),
+            }],
+            skipped_llm_error: vec!["failed-topic".to_string()],
+        };
+        for text in [consolidate.to_markdown(), consolidate.to_cli_text()] {
+            assert!(
+                text.starts_with("Consolidated 1 groups (3 memories)"),
+                "{text}"
+            );
+            assert!(
+                text.contains("Skipped 1 groups because the LLM call failed"),
+                "{text}"
+            );
+            assert!(
+                text.contains("a later run retries them: failed-topic"),
+                "{text}"
+            );
+            assert!(!text.contains("- failed-topic"), "{text}");
+        }
+        assert_eq!(
+            consolidate.to_json()["skipped_llm_error"],
+            serde_json::json!(["failed-topic"])
+        );
+
+        let cleanup = CleanupOutput {
+            matched: true,
+            groups_consolidated: 0,
+            memories_consolidated: 0,
+            duplicates_found: 0,
+            duplicates_merged: 0,
+            dry_run: false,
+            queued: false,
+            topic: None,
+            pattern: None,
+            groups: vec![],
+            skipped_llm_error: vec!["failed-topic".to_string()],
+        };
+        for text in [cleanup.to_markdown(), cleanup.to_cli_text()] {
+            assert!(
+                text.contains("0 groups consolidated (0 memories)"),
+                "{text}"
+            );
+            assert!(
+                text.contains("Skipped 1 groups because the LLM call failed"),
+                "{text}"
+            );
+        }
+
+        // Without skipped groups the rendered text and the JSON shape are
+        // what they were before the field existed.
+        let clean = CleanupOutput {
+            skipped_llm_error: vec![],
+            ..cleanup
+        };
+        assert!(!clean.to_cli_text().contains("Skipped"));
+        assert!(clean.to_json().get("skipped_llm_error").is_none());
     }
 
     #[test]

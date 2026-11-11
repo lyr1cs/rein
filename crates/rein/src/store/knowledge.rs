@@ -6,6 +6,36 @@ use crate::types::*;
 
 use super::SqliteStore;
 
+/// Append `addition` to `existing` without growing it past
+/// [`MERGE_CONTENT_CAP`] bytes, and return whether the addition was cut or
+/// skipped.
+///
+/// `existing` is never shortened. The addition gets the room left under the
+/// cap and keeps its beginning, cut on a char boundary; when `existing` is
+/// already at or over the cap nothing is appended. A caller that gets `true`
+/// must set `needs_resummerize = 1` on the canonical so the slow channel
+/// recompresses the row and makes room again.
+///
+/// [`MERGE_CONTENT_CAP`]: crate::store::sqlite::MERGE_CONTENT_CAP
+pub(crate) fn append_within_merge_cap(existing: &mut String, addition: &str) -> bool {
+    append_within_cap(existing, addition, crate::store::sqlite::MERGE_CONTENT_CAP)
+}
+
+/// [`append_within_merge_cap`] with an explicit bound in bytes.
+pub(crate) fn append_within_cap(existing: &mut String, addition: &str, cap: usize) -> bool {
+    let room = cap.saturating_sub(existing.len());
+    if addition.len() <= room {
+        existing.push_str(addition);
+        return false;
+    }
+    let mut end = room;
+    while end > 0 && !addition.is_char_boundary(end) {
+        end -= 1;
+    }
+    existing.push_str(&addition[..end]);
+    true
+}
+
 impl SqliteStore {
     /// Store knowledge units (concepts + links) into the Memoir system.
     /// Auto-creates memoirs as needed. Refines existing concepts, adds new ones.
@@ -489,7 +519,34 @@ impl SqliteStore {
                     // would leave Tantivy/HNSW serving the refined text
                     // for DB content that was reverted. Mirrors the
                     // deprecation path's split.
-                    let refined_content = format!("{}\n\n[refined] {}", old.content, new_content);
+                    // The row's existing content is kept byte for byte; only
+                    // the appended refinement is bounded by what is left of
+                    // the merge cap. When it is cut or does not fit at all,
+                    // the canonical is flagged for resummerize so a later
+                    // pass recompresses the row and makes room again.
+                    let mut refined_content = old.content.clone();
+                    let addition_cut = append_within_merge_cap(
+                        &mut refined_content,
+                        &format!("\n\n[refined] {new_content}"),
+                    );
+                    if addition_cut {
+                        let canonical_id = self.canonical_id_for(&old.id)?;
+                        tracing::warn!(
+                            canonical_id = %canonical_id,
+                            existing_bytes = old.content.len(),
+                            appended_bytes = refined_content.len() - old.content.len(),
+                            "refinement did not fit under the content cap (resummerize pending)"
+                        );
+                        let _ = self.conn.execute(
+                            "UPDATE memories SET needs_resummerize = 1 WHERE id = ?1",
+                            rusqlite::params![&canonical_id],
+                        );
+                    }
+                    if refined_content.len() == old.content.len() {
+                        // Nothing fit: the row keeps its content, embedding
+                        // and status.
+                        continue;
+                    }
                     let refined_summary: String = refined_content
                         .chars()
                         .take(crate::types::SUMMARY_MAX_CHARS)
@@ -1519,6 +1576,80 @@ mod tests {
             "original content must be preserved (got: {:?})",
             refined.content
         );
+    }
+
+    /// The refine branch never drops existing content: the appended
+    /// refinement only gets the room left under `MERGE_CONTENT_CAP`, and a
+    /// cut or skipped refinement flags the row for resummerize.
+    #[test]
+    fn apply_evolution_refine_keeps_existing_content_and_bounds_the_addition() {
+        use crate::store::sqlite::MERGE_CONTENT_CAP;
+
+        let store = SqliteStore::in_memory().unwrap();
+
+        // Same refine-band setup as the test above (summary carries every
+        // query token, body shares 2 of 3), with a body 10 bytes under the cap.
+        let filler = (0..1500)
+            .map(|i| format!("filler{i:04}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut old_content = format!("shared content alpha beta gamma {filler}");
+        old_content.truncate(MERGE_CONTENT_CAP - 10);
+        let old_id = store
+            .store(test_memory(
+                "old-id",
+                "topic-a",
+                "very long summary mentioning shared evolution content here for fts",
+                &old_content,
+            ))
+            .unwrap();
+
+        let new_id = "new-evolution-id";
+        let new_content = "shared evolution content";
+        store
+            .store(test_memory(new_id, "topic-a", "new summary", new_content))
+            .unwrap();
+
+        let evolved = store.apply_evolution(new_id, new_content, None).unwrap();
+        assert!(evolved >= 1, "refine branch must fire (got {evolved})");
+
+        let refined = store.get(&old_id).unwrap();
+        assert!(
+            refined.content.starts_with(&old_content),
+            "existing content must survive byte for byte"
+        );
+        assert_eq!(refined.content.len(), MERGE_CONTENT_CAP);
+        assert!(
+            "\n\n[refined] shared evolution content"
+                .starts_with(&refined.content[old_content.len()..]),
+            "the appended part is the beginning of the refinement"
+        );
+        let flagged: i64 = store
+            .conn()
+            .query_row(
+                "SELECT needs_resummerize FROM memories WHERE id = ?1",
+                rusqlite::params![&old_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flagged, 1, "a cut refinement must request resummerize");
+
+        // Content already over the cap is left unchanged.
+        let large = "x".repeat(MERGE_CONTENT_CAP * 5);
+        let mut existing = large.clone();
+        assert!(append_within_merge_cap(&mut existing, "\n\n[refined] more"));
+        assert_eq!(existing, large);
+
+        // The cut never lands inside a multi-byte character.
+        let mut existing = "a".repeat(MERGE_CONTENT_CAP - 4);
+        assert!(append_within_merge_cap(&mut existing, "记忆"));
+        assert!(existing.ends_with("a记"));
+        assert_eq!(existing.len(), MERGE_CONTENT_CAP - 1);
+
+        // An addition that fits is appended whole.
+        let mut small = "short canonical".to_string();
+        assert!(!append_within_merge_cap(&mut small, " plus more"));
+        assert_eq!(small, "short canonical plus more");
     }
 
     /// F6 D-M3: streaming warmup callback fires once per stored row,

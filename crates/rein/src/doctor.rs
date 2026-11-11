@@ -164,7 +164,7 @@ pub async fn run(config: &ReinConfig, options: DoctorOptions) -> DoctorReport {
                             checks.push(check_vector_provenance(config, &snapshot));
                             checks.push(check_tantivy(&store, snapshot.active_memories));
                             checks.push(hnsw_check);
-                            checks.push(check_resummerize(&store));
+                            checks.push(check_resummerize(&store, config));
                             checks.push(check_pool_saturation(config));
                             checks.push(check_ars_parameter_policy(&store, config));
                             checks.push(check_dedup_threshold_observability(&store, config));
@@ -2660,7 +2660,7 @@ fn check_pool_saturation(config: &ReinConfig) -> DoctorCheck {
     }
 }
 
-fn check_resummerize(store: &SqliteStore) -> DoctorCheck {
+fn check_resummerize(store: &SqliteStore, config: &ReinConfig) -> DoctorCheck {
     // v0.23: surface resummerize backlog + recent failure rate. Backlog
     // alone is not an error — it just means the LLM hasn't yet processed
     // rows flagged by MergeInto cap hits. A high failure rate indicates
@@ -2742,18 +2742,36 @@ fn check_resummerize(store: &SqliteStore) -> DoctorCheck {
              Reduce worker batch size overlap or serialize resummerize \
              further (lower concurrency).",
         )
+    } else if backlog > 0 && config.resummerize.enabled {
+        // Nothing schedules the resummerize op: flagged rows wait until an
+        // operator (or an external scheduler) runs it. The row stays OK
+        // because a backlog is not a fault, but it names the way to drain it.
+        let mut check = ok_in(DoctorCategory::Queue, "resummerize", message);
+        check.repair_hint = Some(
+            "the backlog is drained only by running `rein resummerize` (MCP `rein_resummerize`, \
+             REST `POST /api/resummerize`); nothing runs it on a schedule. Each run handles up to \
+             [resummerize].batch_size rows; its dry-run mode previews without calling the LLM."
+                .to_string(),
+        );
+        check
     } else {
         ok_in(DoctorCategory::Queue, "resummerize", message)
     }
 }
 
 fn check_queues(diag: &QueueGroupDiagnostics) -> DoctorCheck {
-    let pending = diag.memory.pending + diag.cleanup.pending + diag.dedup.pending;
-    let inflight = diag.memory.inflight + diag.cleanup.inflight + diag.dedup.inflight;
-    let dead = diag.memory.dead_letters + diag.cleanup.dead_letters + diag.dedup.dead_letters;
-    let issues = diag.memory.issues.len() + diag.cleanup.issues.len() + diag.dedup.issues.len();
+    let groups = [
+        &diag.memory,
+        &diag.cleanup,
+        &diag.dedup,
+        &diag.merge_refinement,
+    ];
+    let pending: usize = groups.iter().map(|queue| queue.pending).sum();
+    let inflight: usize = groups.iter().map(|queue| queue.inflight).sum();
+    let dead: usize = groups.iter().map(|queue| queue.dead_letters).sum();
+    let issues: usize = groups.iter().map(|queue| queue.issues.len()).sum();
     let message = format!(
-        "memory p{} i{} d{} | cleanup p{} i{} d{} | dedup p{} i{} d{}",
+        "memory p{} i{} d{} | cleanup p{} i{} d{} | dedup p{} i{} d{} | merge_refinement p{} i{} d{}",
         diag.memory.pending,
         diag.memory.inflight,
         diag.memory.dead_letters,
@@ -2762,7 +2780,10 @@ fn check_queues(diag: &QueueGroupDiagnostics) -> DoctorCheck {
         diag.cleanup.dead_letters,
         diag.dedup.pending,
         diag.dedup.inflight,
-        diag.dedup.dead_letters
+        diag.dedup.dead_letters,
+        diag.merge_refinement.pending,
+        diag.merge_refinement.inflight,
+        diag.merge_refinement.dead_letters
     );
 
     if issues > 0 {
@@ -2772,6 +2793,7 @@ fn check_queues(diag: &QueueGroupDiagnostics) -> DoctorCheck {
             .iter()
             .chain(diag.cleanup.issues.iter())
             .chain(diag.dedup.issues.iter())
+            .chain(diag.merge_refinement.issues.iter())
             .next()
             .cloned()
             .unwrap_or_else(|| "queue diagnostics failed".to_string());
@@ -3051,10 +3073,10 @@ fn apply_local_fixes(config: &ReinConfig, store: &SqliteStore) -> Vec<String> {
 
     // v0.28.7 H2 — drift-triggered rollback. If the parameter policy is in
     // Canary mode while `judge_calibration_state.judge_drift_alert*` is
-    // positive, force a refresh which (per the demote-on-drift logic in
-    // `ops/adaptive::refresh_ars_parameter_policy`) flips the policy back
-    // to Shadow and zeroes runtime_adoption_weight on the next pipeline
-    // tick. The refresh itself is idempotent and cheap.
+    // positive, force a refresh; the demote-on-drift logic in
+    // `ops/adaptive::refresh_ars_parameter_policy` decides whether the
+    // policy goes back to Shadow. The refresh itself is idempotent and
+    // cheap, and the fix line states the mode found afterwards.
     if let Some(state) = crate::store::adaptive::AdaptiveState::restore_snapshot(store.conn()) {
         let drift_active = state
             .judge_calibration_state
@@ -3079,10 +3101,28 @@ fn apply_local_fixes(config: &ReinConfig, store: &SqliteStore) -> Vec<String> {
                     config,
                     &state,
                 );
-                fixes.push(
-                    "demoted ARS parameter policy from Canary to Shadow due to active judge drift alert"
-                        .to_string(),
+                // The refresh decides on its own whether the alert that is
+                // active applies to the policy, and it can lose a write race
+                // or fail to persist. Report the mode that is on disk now.
+                let after = crate::store::ars_parameter_policy::load_parameter_policy(store.conn());
+                let still_canary = matches!(
+                    after.status,
+                    crate::store::ars_parameter_policy::ArsParameterPolicyLoadStatus::Loaded
+                ) && matches!(
+                    after.policy.mode,
+                    crate::store::ars_parameter_policy::ArsParameterPolicyMode::Canary
                 );
+                if still_canary {
+                    fixes.push(
+                        "refreshed ARS parameter policy for the active judge drift alert; it is still in Canary (the refresh did not demote it)"
+                            .to_string(),
+                    );
+                } else {
+                    fixes.push(format!(
+                        "refreshed ARS parameter policy for the active judge drift alert; it left Canary (now {:?})",
+                        after.policy.mode
+                    ));
+                }
             }
         }
     }
@@ -3445,8 +3485,10 @@ fn check_recall_fusion_calibration(
 /// counter.
 /// Surface the last `run_adaptive_pipeline` pass recorded by
 /// [`crate::ops::pipeline_run`]: outcome, age, total time and the slowest
-/// stages. Warns when the pipeline never ran, failed, or has reported
-/// `running` for longer than six hours (a killed pass).
+/// stages. Warns when the pipeline never ran, failed, has reported
+/// `running` for longer than six hours (a killed pass), or last finished
+/// longer ago than the configured GC cadence allows (the scheduled pass
+/// stopped running).
 fn check_adaptive_pipeline_last_run(
     store: &crate::store::SqliteStore,
     config: &ReinConfig,
@@ -3455,13 +3497,25 @@ fn check_adaptive_pipeline_last_run(
         store,
         config.adaptive.enabled,
         chrono::Utc::now().timestamp_millis(),
+        adaptive_pipeline_finished_stale_after_ms(config),
     )
+}
+
+/// Age past which a finished pass means the scheduled pass is no longer
+/// running: one nominal GC interval (`[decay].interval_hours`) plus the
+/// longest a single pass is allowed to stay `running`.
+fn adaptive_pipeline_finished_stale_after_ms(config: &ReinConfig) -> i64 {
+    let interval_ms = i64::try_from(config.decay.interval_hours)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(60 * 60 * 1000);
+    interval_ms.saturating_add(crate::ops::pipeline_run::PIPELINE_RUN_STALE_RUNNING_MS)
 }
 
 fn check_adaptive_pipeline_last_run_at(
     store: &crate::store::SqliteStore,
     adaptive_enabled: bool,
     now_unix_ms: i64,
+    finished_stale_after_ms: i64,
 ) -> DoctorCheck {
     use crate::ops::pipeline_run::{
         load_last_run, PipelineRunOutcome, PIPELINE_RUN_STALE_RUNNING_MS,
@@ -3496,11 +3550,28 @@ fn check_adaptive_pipeline_last_run_at(
         age_secs
     );
     match record.outcome {
-        PipelineRunOutcome::Completed | PipelineRunOutcome::SkippedDisabled => ok_in(
-            DoctorCategory::Storage,
-            "adaptive_pipeline_last_run",
-            summary,
-        ),
+        PipelineRunOutcome::Completed | PipelineRunOutcome::SkippedDisabled => {
+            if now_unix_ms.saturating_sub(record.started_at_unix_ms) > finished_stale_after_ms {
+                let mut check = warn_in(
+                    DoctorCategory::Storage,
+                    "adaptive_pipeline_last_run",
+                    format!(
+                        "{summary}; no pass since then, which is longer than the GC cadence ([decay].interval_hours) allows"
+                    ),
+                );
+                check.repair_hint = Some(
+                    "The scheduled pass has stopped. Check the scheduler that runs `rein gc` (launchd, cron or similar), or run `rein gc --threshold 0` to run the adaptive pipeline once without pruning memories."
+                        .to_string(),
+                );
+                check
+            } else {
+                ok_in(
+                    DoctorCategory::Storage,
+                    "adaptive_pipeline_last_run",
+                    summary,
+                )
+            }
+        }
         PipelineRunOutcome::Failed => {
             let mut check = warn_in(
                 DoctorCategory::Storage,
@@ -3658,6 +3729,9 @@ fn check_judge_calibration(store: &crate::store::SqliteStore, config: &ReinConfi
             .surface_scope_promotion
             .release_blocked
         || !repair_advice.is_empty();
+    if total_drift_alerts > 0 {
+        repair_advice.insert(judge_drift_repair_hint());
+    }
     if attention {
         let mut check = warn_in(DoctorCategory::Configuration, "judge_calibration", summary);
         if !repair_advice.is_empty() {
@@ -3667,6 +3741,25 @@ fn check_judge_calibration(store: &crate::store::SqliteStore, config: &ReinConfi
     } else {
         ok_in(DoctorCategory::Configuration, "judge_calibration", summary)
     }
+}
+
+/// What ends a standing drift alert. The consumer zeroes a surface's
+/// counter when a later runtime-vs-nightly window of that surface has enough
+/// pairs and its κ is back at or above the alert threshold; nothing else
+/// (including `rein doctor --fix`) clears it.
+fn judge_drift_repair_hint() -> String {
+    format!(
+        "A drift alert (drift_alerts / global_drift_alerts > 0) keeps the ARS parameter policy \
+         out of Canary. It clears by itself on an adaptive pipeline pass once the \
+         runtime-vs-nightly window of that surface (rolling, last {} pairs) is back at kappa \
+         >= {2} and at least {} pairs gathered after the alert also reach it; `rein doctor \
+         --fix` does not clear it. Keep `rein \
+         judge-calibrate-cron` running so new pairs arrive, and if kappa stays low compare the \
+         runtime and nightly judge models and prompts.",
+        crate::store::adaptive::JUDGE_RUNTIME_VS_OFFLINE_PAIRS_CAP,
+        crate::store::adaptive::JUDGE_DRIFT_MIN_PAIRS,
+        crate::store::adaptive::JUDGE_DRIFT_THRESHOLD,
+    )
 }
 
 fn format_judge_calibration_surface(
@@ -5656,7 +5749,7 @@ provider = "inherit"
         let recorder = PipelineRunRecorder::start(&store, "gc");
         recorder.stage("m4_cluster", || ());
         let started = recorder.record().started_at_unix_ms;
-        let fresh = check_adaptive_pipeline_last_run_at(&store, true, started + 1_000);
+        let fresh = check_adaptive_pipeline_last_run_at(&store, true, started + 1_000, i64::MAX);
         assert_eq!(
             fresh.status,
             CheckStatus::Ok,
@@ -5666,9 +5759,130 @@ provider = "inherit"
             &store,
             true,
             started + PIPELINE_RUN_STALE_RUNNING_MS + 1,
+            i64::MAX,
         );
         assert_eq!(stale.status, CheckStatus::Warn);
         assert!(stale.message.contains("probably killed"));
+    }
+
+    #[test]
+    fn adaptive_pipeline_last_run_old_completed_pass_warns() {
+        use crate::ops::pipeline_run::{PipelineRunOutcome, PipelineRunRecorder};
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+        let recorder = PipelineRunRecorder::start(&store, "gc");
+        recorder.finish(PipelineRunOutcome::Completed, None);
+        let started = recorder.record().started_at_unix_ms;
+        let stale_after = adaptive_pipeline_finished_stale_after_ms(&ReinConfig::default());
+
+        let within =
+            check_adaptive_pipeline_last_run_at(&store, true, started + stale_after, stale_after);
+        assert_eq!(within.status, CheckStatus::Ok);
+
+        let overdue = check_adaptive_pipeline_last_run_at(
+            &store,
+            true,
+            started + stale_after + 1,
+            stale_after,
+        );
+        assert_eq!(overdue.status, CheckStatus::Warn);
+        assert!(overdue.message.contains("no pass since then"));
+        assert!(overdue
+            .repair_hint
+            .as_deref()
+            .unwrap_or_default()
+            .contains("rein gc"));
+    }
+
+    #[test]
+    fn queues_check_counts_the_merge_refinement_queue() {
+        let mut diag = QueueGroupDiagnostics::default();
+        diag.merge_refinement.pending = 3;
+        let pending = check_queues(&diag);
+        assert_eq!(pending.status, CheckStatus::Warn);
+        assert!(pending.message.contains("merge_refinement p3 i0 d0"));
+        assert!(pending.message.contains("pending jobs"));
+
+        let mut diag = QueueGroupDiagnostics::default();
+        diag.merge_refinement.dead_letters = 1;
+        let dead = check_queues(&diag);
+        assert_eq!(dead.status, CheckStatus::Warn);
+        assert!(dead.message.contains("dead letters present"));
+
+        let mut diag = QueueGroupDiagnostics::default();
+        diag.merge_refinement
+            .issues
+            .push("merge refinement queue unreadable".to_string());
+        let issue = check_queues(&diag);
+        assert_eq!(issue.status, CheckStatus::Warn);
+        assert!(issue.message.contains("merge refinement queue unreadable"));
+
+        assert_eq!(
+            check_queues(&QueueGroupDiagnostics::default()).status,
+            CheckStatus::Ok
+        );
+    }
+
+    #[test]
+    fn judge_calibration_drift_warning_says_what_clears_it() {
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+        let mut config = ReinConfig::default();
+        config.ars.llm_judge.enabled = true;
+        crate::store::adaptive::AdaptiveState {
+            judge_calibration_state: Some(crate::store::adaptive::JudgeCalibrationState {
+                judge_drift_alert_synthesis: 1,
+                ..Default::default()
+            }),
+            version: 1,
+            ..Default::default()
+        }
+        .save_snapshot(store.conn())
+        .unwrap();
+
+        let check = check_judge_calibration(&store, &config);
+        assert_eq!(check.status, CheckStatus::Warn);
+        let hint = check.repair_hint.unwrap_or_default();
+        assert!(hint.contains("clears by itself"), "hint={hint}");
+        assert!(hint.contains("judge-calibrate-cron"), "hint={hint}");
+        assert!(
+            hint.contains(&crate::store::adaptive::JUDGE_DRIFT_MIN_PAIRS.to_string()),
+            "hint={hint}"
+        );
+    }
+
+    #[test]
+    fn resummerize_backlog_names_the_command_that_drains_it() {
+        let store = crate::store::SqliteStore::in_memory().unwrap();
+        let mut config = ReinConfig::default();
+
+        let empty = check_resummerize(&store, &config);
+        assert_eq!(empty.status, CheckStatus::Ok);
+        assert!(empty.repair_hint.is_none());
+
+        let memory = crate::ops::build_consolidated(&config, "topic".into(), "body".into(), vec![]);
+        let id = store.store(memory).unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE memories SET needs_resummerize = 1 WHERE id = ?1",
+                rusqlite::params![&id],
+            )
+            .unwrap();
+
+        // Feature off: the backlog cannot be drained, so no command is named.
+        config.resummerize.enabled = false;
+        let disabled = check_resummerize(&store, &config);
+        assert!(disabled.message.contains("backlog=1"));
+        assert!(disabled.repair_hint.is_none());
+
+        config.resummerize.enabled = true;
+        let enabled = check_resummerize(&store, &config);
+        assert_eq!(enabled.status, CheckStatus::Ok);
+        assert!(enabled.message.contains("backlog=1"));
+        assert!(enabled
+            .repair_hint
+            .as_deref()
+            .unwrap_or_default()
+            .contains("rein resummerize"));
     }
 
     #[test]

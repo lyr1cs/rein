@@ -1768,7 +1768,7 @@ pub struct ProxyConfig {
     pub max_retries: u32,
     /// Base backoff in milliseconds; exponential per retry attempt. Default: 500.
     pub retry_base_ms: u64,
-    /// Max buffered request body in bytes. Default: 1_048_576 (1 MiB).
+    /// Max buffered request body in bytes. Default: 67_108_864 (64 MiB).
     pub max_request_body: usize,
     /// Max buffered non-streaming response in bytes. Default: 1_048_576 (1 MiB).
     pub max_response_buffer: usize,
@@ -1815,7 +1815,11 @@ impl Default for ProxyConfig {
             store_min_score: 3,
             max_retries: 2,
             retry_base_ms: 500,
-            max_request_body: 1_048_576,
+            // The proxy must not reject a request the upstream would accept.
+            // 64 MiB is twice the 32 MB request size limit of the Anthropic
+            // Messages API as understood when this default was chosen; the
+            // figure was not checked against provider documentation.
+            max_request_body: 67_108_864,
             max_response_buffer: 1_048_576,
             max_sse_buffer: 1_048_576,
             max_concurrent_extractions: 4,

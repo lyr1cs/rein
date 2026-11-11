@@ -92,6 +92,17 @@ pub async fn migrate_from_qmd<E: crate::types::Embedder>(
             let mut all_embeddings: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
             for batch in chunk_refs.chunks(100) {
                 match emb.embed_batch(batch).await {
+                    // A response with the wrong number of vectors would
+                    // shift every later chunk onto another chunk's vector.
+                    Ok(batch_embs) if batch_embs.len() != batch.len() => {
+                        tracing::warn!(
+                            "Embedding batch returned {} vectors for {} chunks",
+                            batch_embs.len(),
+                            batch.len()
+                        );
+                        report.errors += 1;
+                        all_embeddings.extend(std::iter::repeat_with(Vec::new).take(batch.len()));
+                    }
                     Ok(batch_embs) => {
                         report.embeddings_generated += batch_embs.len();
                         all_embeddings.extend(batch_embs);
@@ -179,6 +190,10 @@ pub struct ReindexReport {
     /// reindex was staging, or skipped above) and flagged
     /// `needs_vec_dedup = 1` so the next vec_dedup pass re-embeds them.
     pub flagged_for_retry: usize,
+    /// Memories the embedding provider refuses on their own (see
+    /// [`crate::embed::unembeddable`]). They have no vector in the new
+    /// index and are not counted in `errors`.
+    pub unembeddable: usize,
 }
 
 impl std::fmt::Display for ReindexReport {
@@ -187,7 +202,15 @@ impl std::fmt::Display for ReindexReport {
             f,
             "Reindex complete: {}/{} memories embedded, {} errors, {} skipped (changed during reindex), {} flagged for re-embedding",
             self.embedded, self.total, self.errors, self.skipped_changed, self.flagged_for_retry
-        )
+        )?;
+        if self.unembeddable > 0 {
+            write!(
+                f,
+                ", {} refused by the embedding provider (full-text only)",
+                self.unembeddable
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -297,6 +320,13 @@ pub async fn reindex_with_embedder(
     // No early return on `total == 0`: the swap below still has to run so
     // the vector table, its old-model rows and the provenance stamp move
     // to the configured model (codex round-11 P2).
+    // `errors` counts failures that may be transient (outage, rate limit,
+    // storage): publishing a partial index over them would silently drop
+    // vectors, so those still abort. A memory the provider refuses on its
+    // own is not in that count — it is recorded as unembeddable during
+    // staging and the swap goes ahead without it; otherwise one such memory
+    // would discard the whole re-embedding on every attempt and leave the
+    // store on the old model for good.
     if errors > 0 {
         let _ = store
             .conn()
@@ -309,6 +339,14 @@ pub async fn reindex_with_embedder(
         config.embedding_model(),
         config.embedding.dimensions
     );
+    let unembeddable = crate::embed::unembeddable::count(store.conn(), &provenance);
+    if unembeddable > 0 {
+        tracing::warn!(
+            unembeddable,
+            "reindex: the embedding provider refuses these memories; they are left without a \
+             vector (full-text only) until their text or the embedding model changes"
+        );
+    }
     let swap = schema::replace_vector_index_from_staging_validated(
         store.conn(),
         config.embedding.dimensions,
@@ -437,6 +475,7 @@ pub async fn reindex_with_embedder(
         errors,
         skipped_changed,
         flagged_for_retry,
+        unembeddable,
     })
 }
 
@@ -451,7 +490,6 @@ pub(crate) async fn stage_reindex_embeddings(
     heartbeat: Option<&crate::ops::adaptive::SingleFlightLock>,
 ) -> anyhow::Result<(usize, usize, usize)> {
     use crate::store::schema;
-    use crate::types::Embedder as _;
 
     let total: usize = store
         .conn()
@@ -488,6 +526,17 @@ pub(crate) async fn stage_reindex_embeddings(
         scope.page_filter()
     );
     let mut cursor = String::new();
+    let mut session = crate::embed::BulkEmbedSession::new(embedder);
+    let staging_provenance = format!(
+        "{}:{}",
+        config.embedding_model(),
+        config.embedding.dimensions
+    );
+    // A full re-embedding judges every memory again, so earlier refusal
+    // records are dropped and rewritten from what this run observes.
+    crate::embed::unembeddable::clear_all(store.conn())?;
+    // Lone texts the provider refused, as (memory id, refusal fingerprint).
+    let mut refused: Vec<(String, String)> = Vec::new();
     loop {
         let chunk: Vec<(String, String, String, String)> = {
             let mut stmt = store.conn().prepare(&page_sql)?;
@@ -513,57 +562,89 @@ pub(crate) async fn stage_reindex_embeddings(
             .collect();
         let text_refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
 
-        match embedder.embed_batch(&text_refs).await {
-            Ok(embs) => {
-                if embs.len() != chunk.len() {
-                    tracing::warn!(
-                        "batch returned {} embeddings for {} inputs, skipping batch",
-                        embs.len(),
-                        chunk.len()
-                    );
-                    errors += chunk.len();
-                    continue;
-                }
-                // Persist this batch into the staging table inside its own short
-                // transaction — fast sequential appends, no buffered state across batches.
-                let tx_result: ReinResult<()> = (|| {
-                    store.conn().execute_batch("BEGIN")?;
-                    {
-                        let mut stmt = store.conn().prepare(
-                            "INSERT OR REPLACE INTO embed_staging(id, embedding, text_hash) \
-                             VALUES (?1, ?2, ?3)",
-                        )?;
-                        for (i, emb) in embs.iter().enumerate() {
-                            let id = &chunk[i].0;
-                            if emb.len() != config.embedding.dimensions {
-                                tracing::warn!(
-                                    "embedding for {id} has {} dims, expected {}",
-                                    emb.len(),
-                                    config.embedding.dimensions
-                                );
-                                errors += 1;
-                                continue;
-                            }
-                            let bytes: Vec<u8> = emb.iter().flat_map(|f| f.to_le_bytes()).collect();
-                            stmt.execute(rusqlite::params![
+        // Requests are packed by size and a failed request is split, so one
+        // very large memory fails alone instead of with its whole page.
+        let results = session.embed(&text_refs).await;
+        let per_memory_log = session.degraded().is_none();
+        if let Some(reason) = session.degraded() {
+            let failed = results.iter().filter(|r| r.is_err()).count();
+            if failed > 0 {
+                tracing::warn!(failed, reason, "reindex: page not embedded");
+            }
+        }
+        // Persist this page into the staging table inside its own short
+        // transaction — fast sequential appends, no buffered state across pages.
+        let mut page_embedded = 0usize;
+        let mut page_errors = 0usize;
+        let mut page_refused: Vec<(String, String)> = Vec::new();
+        let tx_result: ReinResult<()> = (|| {
+            store.conn().execute_batch("BEGIN")?;
+            {
+                let mut stmt = store.conn().prepare(
+                    "INSERT OR REPLACE INTO embed_staging(id, embedding, text_hash) \
+                     VALUES (?1, ?2, ?3)",
+                )?;
+                for (i, result) in results.iter().enumerate() {
+                    let id = &chunk[i].0;
+                    let emb = match result {
+                        Ok(emb) => emb,
+                        Err(failure) if failure.rejected_alone => {
+                            // Refused on its own: record it and leave it out
+                            // of the new index instead of failing the run.
+                            tracing::warn!(
                                 id,
-                                bytes,
-                                enriched_text_hash(&texts[i])
-                            ])?;
-                            embedded += 1;
+                                chars = texts[i].chars().count(),
+                                "reindex: the embedding provider refuses this memory: {}",
+                                failure.error
+                            );
+                            page_refused.push((
+                                id.clone(),
+                                crate::embed::unembeddable::fingerprint(
+                                    &staging_provenance,
+                                    &texts[i],
+                                ),
+                            ));
+                            continue;
                         }
+                        Err(failure) => {
+                            if per_memory_log {
+                                tracing::warn!(
+                                    id,
+                                    chars = texts[i].chars().count(),
+                                    "reindex: memory could not be embedded: {}",
+                                    failure.error
+                                );
+                            }
+                            page_errors += 1;
+                            continue;
+                        }
+                    };
+                    if emb.len() != config.embedding.dimensions {
+                        tracing::warn!(
+                            "embedding for {id} has {} dims, expected {}",
+                            emb.len(),
+                            config.embedding.dimensions
+                        );
+                        page_errors += 1;
+                        continue;
                     }
-                    store.conn().execute_batch("COMMIT")?;
-                    Ok(())
-                })();
-                if let Err(e) = tx_result {
-                    let _ = store.conn().execute_batch("ROLLBACK");
-                    tracing::warn!("staging batch failed: {e}");
-                    errors += chunk.len();
+                    let bytes: Vec<u8> = emb.iter().flat_map(|f| f.to_le_bytes()).collect();
+                    stmt.execute(rusqlite::params![id, bytes, enriched_text_hash(&texts[i])])?;
+                    page_embedded += 1;
                 }
             }
+            store.conn().execute_batch("COMMIT")?;
+            Ok(())
+        })();
+        match tx_result {
+            Ok(()) => {
+                embedded += page_embedded;
+                errors += page_errors;
+                refused.append(&mut page_refused);
+            }
             Err(e) => {
-                tracing::warn!("batch embed failed: {e}");
+                let _ = store.conn().execute_batch("ROLLBACK");
+                tracing::warn!("staging batch failed: {e}");
                 errors += chunk.len();
             }
         }
@@ -575,6 +656,21 @@ pub(crate) async fn stage_reindex_embeddings(
         if chunk.len() < PAGE {
             break;
         }
+    }
+
+    // A refusal is a verdict on the text only if the provider embedded
+    // something through the same batch path in this run and still does at
+    // the end of it; otherwise (a key revoked before or during the run, an
+    // endpoint without the batch call) the refusals are failures and the
+    // reindex must not publish an index without them.
+    if refused.is_empty() {
+        // Nothing to settle.
+    } else if session.any_success() && session.provider_still_embeds().await {
+        for (id, fingerprint) in &refused {
+            crate::embed::unembeddable::record_fingerprint(store.conn(), id, fingerprint)?;
+        }
+    } else {
+        errors += refused.len();
     }
 
     Ok((total, embedded, errors))
@@ -1121,6 +1217,159 @@ mod tests {
             &new_provenance,
         )
         .expect("current-model writer is accepted after the swap");
+    }
+
+    // One memory the provider refuses must not discard the whole
+    // re-embedding: the rest is published and the store moves to the
+    // configured model.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn reindex_publishes_around_a_refused_memory() {
+        use crate::store::schema::VEC_ROWS_PROVENANCE_KEY;
+        use crate::types::{
+            Importance, Memory, MemoryLayer, MemoryStatus, MemoryStore, MemoryTier, Source,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::ReinConfig::default();
+        let dims = config.embedding.dimensions;
+        let store = crate::store::SqliteStore::new(
+            &dir.path().join("memories.db"),
+            &config.embedding_model(),
+            dims,
+        )
+        .unwrap();
+        let now = chrono::Utc::now();
+        let make = |content: &str| Memory {
+            id: ulid::Ulid::new().to_string(),
+            layer: MemoryLayer::LTM,
+            topic: "t".to_string(),
+            summary: content.to_string(),
+            content: content.to_string(),
+            keywords: vec![],
+            importance: Importance::Medium,
+            source: Source::Manual,
+            strength: 1.0,
+            decay_lambda: 0.06,
+            access_count: 0,
+            superseded_by: None,
+            canonical_id: None,
+            support_count: 1,
+            merge_count: 0,
+            dedup_confidence: 1.0,
+            source_diversity: 1.0,
+            contradiction_score: 0.0,
+            related_ids: vec![],
+            concept_ids: vec![],
+            status: MemoryStatus::Active,
+            embedding: None,
+            tier: MemoryTier::Warm,
+            cluster_id: None,
+            archival_summary: None,
+            archival_summary_at: None,
+            archival_summary_version: None,
+            created_at: now,
+            updated_at: now,
+            last_accessed: now,
+        };
+        let good_a = store.store(make("first ordinary memory")).unwrap();
+        let refused = store.store(make("refuse-me payload")).unwrap();
+        let good_b = store.store(make("second ordinary memory")).unwrap();
+        let embedder = crate::embed::EmbedderKind::Mock(
+            crate::embed::MockEmbedder::always(dims, vec![0.25; dims])
+                .rejecting_texts_containing("refuse-me")
+                .rejecting_with_status(reqwest::StatusCode::BAD_REQUEST),
+        );
+
+        let report =
+            super::reindex_with_embedder(&store, &config, &embedder, super::ReindexScope::Live)
+                .await
+                .expect("a refused memory does not fail the reindex");
+
+        assert_eq!(report.errors, 0);
+        assert_eq!(report.unembeddable, 1);
+        assert_eq!(report.embedded, 2);
+        for id in [&good_a, &good_b] {
+            assert!(crate::store::vec::get_embedding(store.conn(), id)
+                .unwrap()
+                .is_some());
+        }
+        assert!(crate::store::vec::get_embedding(store.conn(), &refused)
+            .unwrap()
+            .is_none());
+        let stamped: String = store
+            .conn()
+            .query_row(
+                "SELECT value FROM metadata WHERE key = ?1",
+                rusqlite::params![VEC_ROWS_PROVENANCE_KEY],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamped, format!("{}:{dims}", config.embedding_model()));
+
+        // A provider whose batch call refuses everything (a revoked key, an
+        // endpoint without the batch call) has refused nothing in
+        // particular: the reindex aborts instead of publishing an empty
+        // index, and no refusal is recorded.
+        let refuses_all = crate::embed::EmbedderKind::Mock(
+            crate::embed::MockEmbedder::always(dims, vec![0.25; dims])
+                .rejecting_texts_containing("")
+                .rejecting_with_status(reqwest::StatusCode::BAD_REQUEST),
+        );
+        let err =
+            super::reindex_with_embedder(&store, &config, &refuses_all, super::ReindexScope::Live)
+                .await
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("vector index NOT modified"), "{err}");
+        let records: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM metadata WHERE key LIKE 'unembeddable:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(records, 0);
+        assert!(crate::store::vec::get_embedding(store.conn(), &good_a)
+            .unwrap()
+            .is_some());
+
+        // The same when the provider works for part of the run and then
+        // refuses everything (a key revoked mid-run): no partial index.
+        let more: Vec<String> = (0..60)
+            .map(|i| store.store(make(&format!("later memory {i}"))).unwrap())
+            .collect();
+        let revoked = crate::embed::MockEmbedder::always(dims, vec![0.25; dims])
+            .rejecting_with_status(reqwest::StatusCode::BAD_REQUEST)
+            .rejecting_after_batches(1);
+        let revoked = crate::embed::EmbedderKind::Mock(revoked);
+        let err =
+            super::reindex_with_embedder(&store, &config, &revoked, super::ReindexScope::Live)
+                .await
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("vector index NOT modified"), "{err}");
+        let records: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM metadata WHERE key LIKE 'unembeddable:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(records, 0);
+        assert_eq!(more.len(), 60);
+
+        // A failure that is not a verdict on one text still aborts.
+        let outage = crate::embed::EmbedderKind::Mock(
+            crate::embed::MockEmbedder::always(dims, vec![0.25; dims])
+                .rejecting_texts_containing("ordinary"),
+        );
+        let err = super::reindex_with_embedder(&store, &config, &outage, super::ReindexScope::Live)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("vector index NOT modified"), "{err}");
     }
 
     #[cfg(feature = "test-support")]

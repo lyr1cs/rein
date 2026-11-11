@@ -966,6 +966,126 @@ async fn vec_dedup_preserves_flag_on_embed_failure() {
 /// Uses a tempfile store because `:memory:` skips HNSW entirely, and
 /// `#[tokio::test(flavor = "multi_thread")]` because the embed path
 /// requires an active runtime (see H-2 test above).
+/// A memory the provider refuses on its own must not hold the sweep: its
+/// neighbours are embedded in the same pass, it is recorded, and it leaves
+/// the pending set instead of coming back first on every pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn vec_dedup_isolates_and_records_a_refused_memory() {
+    use rein::embed::{EmbedderKind, MockEmbedder};
+    use rein::ops::dedup::run_vec_dedup_with_embedder;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("vec_dedup_refused.db");
+    let dims = 8usize;
+    let store = SqliteStore::new(&db_path, "mock-embedder", dims).unwrap();
+    let mut config = rein::config::ReinConfig::default();
+    config.embedding.dimensions = dims;
+
+    let refused = store
+        .store(make_memory("refused-topic", "refuse-me payload"))
+        .unwrap();
+    let good = store
+        .store(make_memory("alpha-topic", "kubernetes ingress notes"))
+        .unwrap();
+    store
+        .conn()
+        .execute("UPDATE memories SET needs_vec_dedup = 1", [])
+        .unwrap();
+
+    let fixed: Vec<f32> = (0..dims).map(|i| i as f32 / dims as f32).collect();
+    let mock = EmbedderKind::Mock(
+        MockEmbedder::always(dims, fixed)
+            .rejecting_texts_containing("refuse-me")
+            .rejecting_with_status(reqwest::StatusCode::BAD_REQUEST),
+    );
+    run_vec_dedup_with_embedder(&store, &config, mock);
+
+    // Both texts travel in one request; the refusal must not cost the other
+    // one its vector.
+    assert!(
+        rein::store::vec::get_embedding(store.conn(), &good)
+            .unwrap()
+            .is_some(),
+        "the neighbour of the refused memory must still be embedded"
+    );
+    let good_flag: i64 = store
+        .conn()
+        .query_row(
+            "SELECT needs_vec_dedup FROM memories WHERE id = ?1",
+            rusqlite::params![&good],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(good_flag, 0);
+    assert!(rein::store::vec::get_embedding(store.conn(), &refused)
+        .unwrap()
+        .is_none());
+    let flag: i64 = store
+        .conn()
+        .query_row(
+            "SELECT needs_vec_dedup FROM memories WHERE id = ?1",
+            rusqlite::params![&refused],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(flag, 0, "a refused memory leaves the pending set");
+    let recorded: i64 = store
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM metadata WHERE key = ?1",
+            rusqlite::params![format!("unembeddable:{refused}")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1);
+}
+
+/// A provider that answers every request with a client error (a revoked key)
+/// refuses nothing in particular: no memory is recorded as unembeddable and
+/// every row stays pending for the next pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn vec_dedup_records_nothing_when_the_provider_embeds_nothing() {
+    use rein::embed::{EmbedderKind, MockEmbedder};
+    use rein::ops::dedup::run_vec_dedup_with_embedder;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("vec_dedup_broken_key.db");
+    let dims = 8usize;
+    let store = SqliteStore::new(&db_path, "mock-embedder", dims).unwrap();
+    let mut config = rein::config::ReinConfig::default();
+    config.embedding.dimensions = dims;
+
+    store
+        .store(make_memory("alpha-topic", "kubernetes ingress notes"))
+        .unwrap();
+    store
+        .store(make_memory("beta-topic", "sourdough hydration ratios"))
+        .unwrap();
+    store
+        .conn()
+        .execute("UPDATE memories SET needs_vec_dedup = 1", [])
+        .unwrap();
+
+    let mock = EmbedderKind::Mock(
+        MockEmbedder::always(dims, vec![0.5; dims])
+            .rejecting_texts_containing("")
+            .rejecting_with_status(reqwest::StatusCode::BAD_REQUEST),
+    );
+    run_vec_dedup_with_embedder(&store, &config, mock);
+
+    let (pending, records): (i64, i64) = store
+        .conn()
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM memories WHERE needs_vec_dedup = 1),
+                    (SELECT COUNT(*) FROM metadata WHERE key LIKE 'unembeddable:%')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(pending, 2, "every row stays pending");
+    assert_eq!(records, 0, "nothing is recorded as refused");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn vec_dedup_reinserts_into_hnsw_after_successful_embed() {
     use rein::embed::{EmbedderKind, MockEmbedder};

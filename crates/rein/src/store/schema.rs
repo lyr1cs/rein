@@ -16,7 +16,7 @@ use std::sync::Once;
 /// Bump when adding a new ALTER / column / index for the OAuth tables.
 /// Stored in `schema_migrations(name='oauth', version=N)` so we don't collide
 /// with SQLite's single global `PRAGMA user_version` slot.
-const OAUTH_SCHEMA_VERSION: i64 = 1;
+const OAUTH_SCHEMA_VERSION: i64 = 2;
 
 static SQLITE_VEC_INIT: Once = Once::new();
 
@@ -582,7 +582,170 @@ fn init_schema_with_migrations(
 
     apply_migrations(conn, migrations)?;
     heal_a12_input_epoch_row(conn)?;
+    heal_oauth_client_name_unique(conn);
     Ok(())
+}
+
+/// Every-open step that takes the OAuth tables from schema version 1 to 2:
+/// drop a legacy `UNIQUE` on `oauth_clients.client_name`.
+///
+/// Client names are labels, not identifiers (RFC 7591), and several
+/// connectors register under the same name. A database created by a build
+/// whose `CREATE TABLE` carried that constraint keeps it forever otherwise:
+/// `migrate_oauth_tables` only runs during baseline bring-up and its
+/// `CREATE TABLE IF NOT EXISTS` never alters an existing table. On such a
+/// database the second registration under a name fails.
+///
+/// Steady state is one `schema_migrations` lookup. The rebuild is the
+/// SQLite table-rebuild procedure (new table, copy, drop, rename) in one
+/// `BEGIN IMMEDIATE` with an in-transaction recheck, so concurrent openers
+/// converge. It never fails the open: on any error the table is left as it
+/// was, the version stays at 1, and the next open tries again.
+fn heal_oauth_client_name_unique(conn: &Connection) {
+    let version: i64 = conn
+        .query_row(
+            "SELECT version FROM schema_migrations WHERE name = 'oauth'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    // 0: no OAuth bring-up recorded on this database; nothing to heal here.
+    if version == 0 || version >= OAUTH_SCHEMA_VERSION {
+        return;
+    }
+    // `PRAGMA foreign_keys` is a no-op inside a transaction, and the rebuild
+    // must not run its DROP with enforcement on (child rows reference the
+    // table). Leave it for an autocommit open.
+    if !conn.is_autocommit() {
+        return;
+    }
+    let fk_was_on = conn
+        .query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0))
+        .map(|v| v != 0)
+        .unwrap_or(false);
+    if fk_was_on && conn.execute_batch("PRAGMA foreign_keys = OFF").is_err() {
+        return;
+    }
+    let result = rebuild_oauth_clients_without_unique_name(conn);
+    if fk_was_on {
+        if let Err(e) = conn.execute_batch("PRAGMA foreign_keys = ON") {
+            tracing::warn!("failed to re-enable foreign keys after the OAuth table check: {e}");
+        }
+    }
+    if let Err(e) = result {
+        tracing::warn!(
+            "could not remove the legacy UNIQUE constraint on oauth_clients.client_name \
+             (retried on the next open): {e}"
+        );
+    }
+}
+
+/// True when a unique index covers exactly the `client_name` column.
+fn oauth_client_name_is_unique(conn: &Connection) -> ReinResult<bool> {
+    let unique_indexes: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_index_list('oauth_clients') WHERE \"unique\" = 1")?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        names
+    };
+    for index in unique_indexes {
+        let columns: Vec<Option<String>> = {
+            let mut stmt = conn.prepare("SELECT name FROM pragma_index_info(?1)")?;
+            let cols = stmt
+                .query_map([&index], |row| row.get::<_, Option<String>>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            cols
+        };
+        if columns.len() == 1 && columns[0].as_deref() == Some("client_name") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn rebuild_oauth_clients_without_unique_name(conn: &Connection) -> ReinResult<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let body = (|| -> ReinResult<bool> {
+        // Recheck under the write lock: a peer may have finished first.
+        let version: i64 = conn
+            .query_row(
+                "SELECT version FROM schema_migrations WHERE name = 'oauth'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if version == 0 || version >= OAUTH_SCHEMA_VERSION {
+            return Ok(false);
+        }
+        let rebuilt = oauth_client_name_is_unique(conn)?;
+        if rebuilt {
+            let before: i64 =
+                conn.query_row("SELECT COUNT(*) FROM oauth_clients", [], |r| r.get(0))?;
+            // New table first, old one dropped, new one renamed into place:
+            // renaming the OLD table would rewrite the `REFERENCES
+            // oauth_clients` clauses of `oauth_auth_codes` / `oauth_grants`.
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS oauth_clients_new;
+                 CREATE TABLE oauth_clients_new (
+                    client_id TEXT PRIMARY KEY,
+                    client_secret_hash TEXT,
+                    client_name TEXT NOT NULL,
+                    redirect_uris TEXT NOT NULL,
+                    grant_types TEXT NOT NULL,
+                    token_endpoint_auth_method TEXT NOT NULL CHECK(token_endpoint_auth_method IN ('none', 'client_secret_basic')),
+                    registered_at INTEGER NOT NULL,
+                    last_used_at INTEGER,
+                    revoked_at INTEGER
+                 );
+                 INSERT INTO oauth_clients_new (
+                    client_id, client_secret_hash, client_name, redirect_uris, grant_types,
+                    token_endpoint_auth_method, registered_at, last_used_at, revoked_at
+                 )
+                 SELECT client_id, client_secret_hash, client_name, redirect_uris, grant_types,
+                        token_endpoint_auth_method, registered_at, last_used_at, revoked_at
+                 FROM oauth_clients;
+                 DROP TABLE oauth_clients;
+                 ALTER TABLE oauth_clients_new RENAME TO oauth_clients;",
+            )?;
+            // Every row carried over under its own primary key, so the child
+            // tables reference exactly what they referenced before.
+            let after: i64 =
+                conn.query_row("SELECT COUNT(*) FROM oauth_clients", [], |r| r.get(0))?;
+            if after != before {
+                return Err(ReinError::Config(format!(
+                    "oauth_clients rebuild copied {after} of {before} rows"
+                )));
+            }
+        }
+        conn.execute(
+            "UPDATE schema_migrations SET version = ?1, applied_at = ?2 WHERE name = 'oauth'",
+            rusqlite::params![OAUTH_SCHEMA_VERSION, chrono::Utc::now().timestamp()],
+        )?;
+        Ok(rebuilt)
+    })();
+    match body {
+        Ok(rebuilt) => {
+            // A failed COMMIT leaves the transaction open; close it so the
+            // caller's `PRAGMA foreign_keys = ON` takes effect and the
+            // connection does not keep the write lock.
+            if let Err(e) = conn.execute_batch("COMMIT") {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e.into());
+            }
+            if rebuilt {
+                tracing::info!(
+                    "rebuilt oauth_clients without the legacy UNIQUE constraint on client_name"
+                );
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
 }
 
 /// Every-open self-heal for the v4 `a12_input_epoch` row. The v4 triggers
@@ -598,6 +761,18 @@ fn init_schema_with_migrations(
 /// an explicit repair path that also invalidates the active calibration.
 fn heal_a12_input_epoch_row(conn: &Connection) -> ReinResult<()> {
     if schema_user_version(conn)? < A12_INPUT_EPOCH_SCHEMA_VERSION {
+        return Ok(());
+    }
+    // Read first: an `INSERT OR IGNORE` takes the write lock even when it
+    // changes nothing, so every open (including pure readers such as bearer
+    // verification) would queue behind any long write transaction and fail
+    // with "database is locked" once the busy timeout ran out.
+    let present: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM metadata WHERE key = 'a12_input_epoch')",
+        [],
+        |row| row.get(0),
+    )?;
+    if present {
         return Ok(());
     }
     conn.execute(
@@ -1411,10 +1586,20 @@ pub fn migrate_oauth_tables(conn: &Connection) -> ReinResult<()> {
     // 4. Record completion at the new schema version.  Use INSERT OR REPLACE
     //    so re-running a partial migration (e.g. process crashed before this
     //    line) bumps the version correctly.
+    //
+    //    A pre-existing `oauth_clients` that still carries the legacy UNIQUE
+    //    on `client_name` was not changed by the `CREATE TABLE IF NOT
+    //    EXISTS` above. Record version 1 for it so the every-open
+    //    `heal_oauth_client_name_unique` step still rebuilds the table.
+    let recorded_version = if oauth_client_name_is_unique(conn)? {
+        1
+    } else {
+        OAUTH_SCHEMA_VERSION
+    };
     conn.execute(
         "INSERT OR REPLACE INTO schema_migrations (name, version, applied_at)
          VALUES ('oauth', ?1, ?2)",
-        rusqlite::params![OAUTH_SCHEMA_VERSION, chrono::Utc::now().timestamp()],
+        rusqlite::params![recorded_version, chrono::Utc::now().timestamp()],
     )?;
 
     Ok(())
@@ -2485,6 +2670,29 @@ mod migration_tests {
         assert_eq!(trigger_count, 21, "v4 installs one trigger per write path");
     }
 
+    // Opening an up-to-date database is read-only: it must succeed while
+    // another connection holds the write lock (a long staged swap), or every
+    // reader — bearer verification included — fails for that long.
+    #[test]
+    fn opening_a_current_database_does_not_need_the_write_lock() {
+        init_sqlite_vec();
+        let file = NamedTempFile::new().expect("tempfile");
+        let writer = Connection::open(file.path()).expect("open writer");
+        init_schema(&writer, 4).expect("first schema init");
+        writer
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold the write lock");
+
+        let reader = Connection::open(file.path()).expect("open reader");
+        reader
+            .busy_timeout(std::time::Duration::ZERO)
+            .expect("no waiting");
+        init_schema(&reader, 4).expect("open while a peer holds the write lock");
+        assert_eq!(a12_input_epoch(&reader), Some(0));
+
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+
     #[test]
     fn a12_input_epoch_row_self_heals_on_reopen_without_resetting_live_counter() {
         init_sqlite_vec();
@@ -3005,6 +3213,229 @@ mod migration_tests {
             )
             .expect("query signing key secret");
         assert_eq!(secret_hex.len(), 64, "secret should be 32 random bytes hex");
+    }
+
+    /// Replace the freshly created `oauth_clients` with the legacy shape
+    /// that carried `UNIQUE` on `client_name`, at oauth schema version 1,
+    /// with one client that has a grant and an auth code.
+    fn seed_legacy_unique_oauth_clients(conn: &Connection) {
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TABLE oauth_clients;
+             CREATE TABLE oauth_clients (
+                client_id TEXT PRIMARY KEY,
+                client_secret_hash TEXT,
+                client_name TEXT NOT NULL UNIQUE,
+                redirect_uris TEXT NOT NULL,
+                grant_types TEXT NOT NULL,
+                token_endpoint_auth_method TEXT NOT NULL CHECK(token_endpoint_auth_method IN ('none', 'client_secret_basic')),
+                registered_at INTEGER NOT NULL,
+                last_used_at INTEGER,
+                revoked_at INTEGER
+             );
+             INSERT INTO oauth_clients (
+                client_id, client_secret_hash, client_name, redirect_uris, grant_types,
+                token_endpoint_auth_method, registered_at, last_used_at, revoked_at
+             ) VALUES ('old-client', 'hash', 'Claude', '[\"https://a.example/cb\"]',
+                       '[\"authorization_code\"]', 'client_secret_basic', 7, 8, NULL);
+             INSERT INTO oauth_grants (
+                grant_id, client_id, access_token_jti, access_expires_at,
+                refresh_token_hash, refresh_token_fingerprint,
+                refresh_expires_at, issued_at, revoked_at
+             ) VALUES ('g1', 'old-client', 'jti1', 999999, 'rh', 'fp', 999999, 1, NULL);
+             INSERT INTO oauth_auth_codes (
+                code, client_id, redirect_uri, code_challenge, code_challenge_method,
+                issued_at, expires_at, consumed_at
+             ) VALUES ('code1', 'old-client', 'https://a.example/cb', 'ch', 'S256', 1, 2, NULL);
+             UPDATE schema_migrations SET version = 1 WHERE name = 'oauth';
+             PRAGMA foreign_keys = ON;",
+        )
+        .expect("seed legacy oauth_clients");
+    }
+
+    fn insert_oauth_client_named(
+        conn: &Connection,
+        id: &str,
+        name: &str,
+    ) -> rusqlite::Result<usize> {
+        conn.execute(
+            "INSERT INTO oauth_clients (
+                client_id, client_secret_hash, client_name, redirect_uris, grant_types,
+                token_endpoint_auth_method, registered_at, last_used_at, revoked_at
+             ) VALUES (?1, NULL, ?2, '[]', '[]', 'none', 1, NULL, NULL)",
+            [id, name],
+        )
+    }
+
+    // A database whose `oauth_clients` carries UNIQUE on `client_name`
+    // rejects every second registration under the same name (claude.ai
+    // registers every connector as "Claude"); opening it rebuilds the table
+    // (GitHub #6).
+    #[test]
+    fn legacy_unique_client_name_is_rebuilt_on_open() {
+        init_sqlite_vec();
+        let conn = Connection::open_in_memory().expect("open memory db");
+        init_schema(&conn, 4).expect("init schema");
+        seed_legacy_unique_oauth_clients(&conn);
+        assert!(
+            insert_oauth_client_named(&conn, "dup", "Claude").is_err(),
+            "the seeded legacy table must reproduce the UNIQUE failure"
+        );
+
+        init_schema(&conn, 4).expect("reopen heals the legacy table");
+
+        insert_oauth_client_named(&conn, "new-1", "Claude").expect("same name registers");
+        insert_oauth_client_named(&conn, "new-2", "Claude").expect("same name registers again");
+
+        // The existing client and its children survive, column for column.
+        let kept: (String, String, String, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT client_secret_hash, redirect_uris, token_endpoint_auth_method,
+                        registered_at, last_used_at
+                 FROM oauth_clients WHERE client_id = 'old-client'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .expect("old client kept");
+        assert_eq!(
+            kept,
+            (
+                "hash".to_string(),
+                "[\"https://a.example/cb\"]".to_string(),
+                "client_secret_basic".to_string(),
+                7,
+                Some(8)
+            )
+        );
+        let children: (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM oauth_grants WHERE client_id = 'old-client'),
+                        (SELECT COUNT(*) FROM oauth_auth_codes WHERE client_id = 'old-client')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(children, (1, 1));
+
+        // Foreign keys are back on, intact, and still enforced.
+        let fk_on: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk_on, 1);
+        let violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0);
+        assert!(
+            conn.execute(
+                "INSERT INTO oauth_grants (
+                    grant_id, client_id, access_token_jti, access_expires_at,
+                    refresh_token_hash, refresh_token_fingerprint,
+                    refresh_expires_at, issued_at, revoked_at
+                 ) VALUES ('g2', 'no-such-client', 'jti2', 1, 'rh', 'fp', 1, 1, NULL)",
+                [],
+            )
+            .is_err(),
+            "grants must still reference a real client"
+        );
+        let leftovers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'oauth_clients_%'
+                    OR sql LIKE '%oauth_clients_new%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftovers, 0);
+
+        let version: i64 = conn
+            .query_row(
+                "SELECT version FROM schema_migrations WHERE name = 'oauth'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, OAUTH_SCHEMA_VERSION);
+
+        // A further open is a no-op.
+        init_schema(&conn, 4).expect("third open");
+        let clients: i64 = conn
+            .query_row("SELECT COUNT(*) FROM oauth_clients", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(clients, 3);
+    }
+
+    // A database that has never been through baseline bring-up and already
+    // holds the legacy table: bring-up must not record the OAuth tables as
+    // current and so hide the constraint from the heal.
+    #[test]
+    fn legacy_unique_client_name_is_rebuilt_on_first_open_of_a_pre_baseline_db() {
+        init_sqlite_vec();
+        let conn = Connection::open_in_memory().expect("open memory db");
+        conn.execute_batch(
+            "CREATE TABLE oauth_clients (
+                client_id TEXT PRIMARY KEY,
+                client_secret_hash TEXT,
+                client_name TEXT NOT NULL UNIQUE,
+                redirect_uris TEXT NOT NULL,
+                grant_types TEXT NOT NULL,
+                token_endpoint_auth_method TEXT NOT NULL CHECK(token_endpoint_auth_method IN ('none', 'client_secret_basic')),
+                registered_at INTEGER NOT NULL,
+                last_used_at INTEGER,
+                revoked_at INTEGER
+             );",
+        )
+        .expect("legacy table before any bring-up");
+        insert_oauth_client_named(&conn, "old", "Claude").unwrap();
+
+        init_schema(&conn, 4).expect("first open");
+
+        insert_oauth_client_named(&conn, "new", "Claude").expect("same name registers");
+        let version: i64 = conn
+            .query_row(
+                "SELECT version FROM schema_migrations WHERE name = 'oauth'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, OAUTH_SCHEMA_VERSION);
+    }
+
+    // A version-1 database without the legacy constraint is only stamped.
+    #[test]
+    fn oauth_v1_without_unique_client_name_is_stamped_untouched() {
+        init_sqlite_vec();
+        let conn = Connection::open_in_memory().expect("open memory db");
+        init_schema(&conn, 4).expect("init schema");
+        insert_oauth_client_named(&conn, "a", "Claude").unwrap();
+        let sql_before: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'oauth_clients'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE schema_migrations SET version = 1 WHERE name = 'oauth'",
+            [],
+        )
+        .unwrap();
+
+        init_schema(&conn, 4).expect("reopen");
+
+        let (sql_after, version): (String, i64) = conn
+            .query_row(
+                "SELECT (SELECT sql FROM sqlite_master WHERE name = 'oauth_clients'),
+                        (SELECT version FROM schema_migrations WHERE name = 'oauth')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(sql_after, sql_before);
+        assert_eq!(version, OAUTH_SCHEMA_VERSION);
+        insert_oauth_client_named(&conn, "b", "Claude").unwrap();
     }
 
     #[test]

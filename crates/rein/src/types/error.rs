@@ -117,6 +117,39 @@ pub fn provider_status_error(op: &str, status: reqwest::StatusCode, body: &str) 
     format!("{op} returned {status} (body {body_chars} chars; preview at debug level)")
 }
 
+/// Whether `err` is a provider rate-limit (HTTP 429) response as rendered by
+/// [`provider_status_error`]. Bulk embedding uses it to wait for the quota
+/// window instead of retrying straight away.
+pub fn is_rate_limit_error(err: &ReinError) -> bool {
+    provider_status_of(err) == Some(429)
+}
+
+/// Whether `err` is the provider refusing the content of a request: 400
+/// (malformed or unacceptable input), 413 (too large) or 422 (cannot be
+/// processed), as rendered by [`provider_status_error`]. Statuses about the
+/// caller rather than the content (401, 403, 404, 408 …) are not refusals.
+///
+/// Some providers also answer 400 for a bad API key, so a refusal is only a
+/// verdict on the text when the same key has embedded something else; the
+/// bulk callers check that before they record one.
+pub fn is_provider_rejection_error(err: &ReinError) -> bool {
+    matches!(provider_status_of(err), Some(400 | 413 | 422))
+}
+
+/// HTTP status carried by an error built with [`provider_status_error`].
+fn provider_status_of(err: &ReinError) -> Option<u16> {
+    let ReinError::Embedding(message) = err else {
+        return None;
+    };
+    // "<op> returned <status> <reason> (body N chars; …)"
+    let (_, rest) = message.split_once(" API returned ")?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.len() != 3 {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 /// Content-free summary of LLM output that failed to parse. Same contract as
 /// [`provider_status_error`]: generated text can quote the prompt (and thus
 /// memory content) verbatim, so it is emitted at DEBUG only.

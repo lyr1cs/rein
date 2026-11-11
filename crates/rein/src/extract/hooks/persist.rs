@@ -16,6 +16,9 @@ pub struct StoreExtractedStats {
     pub stored_ids: Vec<String>,
     pub filtered_count: u32,
     pub secret_filtered_count: u32,
+    /// Items dropped because their content exceeds
+    /// `MAX_MEMORY_CONTENT_BYTES`, the bound `rein_store` enforces.
+    pub oversized_filtered_count: u32,
     pub created_count: u32,
     pub merged_count: u32,
     pub superseded_count: u32,
@@ -326,6 +329,22 @@ pub fn store_extracted_report(
     let mut ctx_cache: std::collections::HashMap<String, AdmissionContext> =
         std::collections::HashMap::new();
     for item in items {
+        // Size gate, shared with `rein_store` / `rein_update`: an extracted
+        // item becomes a new row as-is (`DedupAction::CreateNew` applies no
+        // merge cap), so this is the only bound on what hooks, the proxy and
+        // the async worker can create. Logged by size only — the content is
+        // memory text and WARN is the default stderr level.
+        let content_bytes = item.content.len();
+        if content_bytes > crate::ops::handlers::memory::MAX_MEMORY_CONTENT_BYTES {
+            stats.oversized_filtered_count += 1;
+            tracing::warn!(
+                content_bytes,
+                max_bytes = crate::ops::handlers::memory::MAX_MEMORY_CONTENT_BYTES,
+                "dropping oversized extraction item"
+            );
+            continue;
+        }
+
         if looks_like_secret(&item.content) {
             stats.secret_filtered_count += 1;
             continue;
@@ -807,6 +826,43 @@ mod tests {
         assert!(
             working[0].detail.contains("docker compose"),
             "surface item should be built from stored canonical content"
+        );
+    }
+
+    #[test]
+    fn oversized_extraction_item_is_dropped_at_admission() {
+        let config = test_config("oversized");
+        let store = config.open_store().unwrap();
+        let max = crate::ops::handlers::memory::MAX_MEMORY_CONTENT_BYTES;
+
+        // Multi-byte content just over the bound, next to a normal item.
+        let oversized = "我们决定采用蓝绿部署。".repeat(max / 33 + 1);
+        assert!(oversized.len() > max);
+        let items = vec![
+            extracted_memory("deploy", "oversized dump", &oversized),
+            extracted_memory(
+                "docker",
+                "compose setup",
+                "Use docker compose for local development and testing",
+            ),
+        ];
+
+        let stats = store_extracted_report(&store, &config, items, "tester", false);
+        assert_eq!(stats.oversized_filtered_count, 1);
+        assert_eq!(stats.stored_count, 1, "the normal item is still admitted");
+        assert_eq!(stats.store_failed_count, 0, "a size drop is not a retry");
+
+        let largest: i64 = store
+            .conn()
+            .query_row(
+                "SELECT MAX(LENGTH(CAST(content AS BLOB))) FROM memories",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            (largest as usize) <= max,
+            "a stored memory exceeds the bound: {largest} bytes"
         );
     }
 

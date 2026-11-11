@@ -151,8 +151,10 @@ pub struct ColdArchiveSummaryReport {
     /// fuse. NOT the cumulative strike count across passes; this is the
     /// per-pass count.
     pub strikes: u64,
-    /// LLM call errors (network / parse / etc.) + 5-way CAS losses + DB
-    /// errors. Non-counting toward the strike fuse per spec §2.5.
+    /// LLM call errors (network / parse / etc.) + 5-way CAS
+    /// losses + DB errors. Non-counting toward the strike fuse per spec
+    /// §2.5. A row that fails this way keeps its flag and moves to the
+    /// back of the claim order.
     pub errors: u64,
     /// Subset of `errors` attributable to claim-loss between LLM call and
     /// commit (spec §2.5 mirrors resummerize ClaimLost). Surfaced
@@ -217,8 +219,12 @@ impl ColdArchiveSummaryGenerator {
     }
 
     /// Generate a summary for a single cold memory. Returns `Ok(None)`
-    /// when the LLM declines to summarize (e.g. content already shorter
-    /// than `target_chars`, or empty after stripping). Errors from the
+    /// when the content is already at or below `target_chars` (no LLM
+    /// call), or when the model output is empty after stripping. Callers
+    /// tell the two apart by the content length: the worker and the manual
+    /// refresh treat the first as "nothing to do"; the worker counts the
+    /// second as a strike and the manual refresh returns it as an error.
+    /// Errors from the
     /// LLM provider propagate as [`ReinError`]; callers MUST classify
     /// failures into countable / non-countable per the strike fuse
     /// policy (see [`run_cold_archive_summary`]'s match arms).
@@ -742,10 +748,19 @@ fn process_one_with_strike_fuse(
                 // LLM-side errors are non-counting per spec §2.5.
                 tracing::warn!(
                     memory_id = %claim.memory_id,
-                    "Cap C: LLM error (non-counting); leaving flag for next pass"
+                    "Cap C: LLM error (non-counting); flag kept, row moved to the back of the queue"
                 );
-                // Release the claim so the next pass can re-acquire.
-                let _ = release_claim(store, &claim.memory_id, &claim.token);
+                // Release the claim and stamp the backoff column so the row
+                // sorts behind every row that has not failed yet. Without
+                // the stamp the row would be first in line again on the next
+                // pass, and a few rows that always fail or time out would
+                // use up the pass budget ahead of everything else.
+                let _ = release_claim_with_backoff(
+                    store,
+                    &claim.memory_id,
+                    &claim.token,
+                    Utc::now().timestamp(),
+                );
                 return (ProcessVerdict::LlmError, strike_count);
             }
             Err(e) => {
@@ -758,7 +773,14 @@ fn process_one_with_strike_fuse(
                     error = %e,
                     "Cap C: DB or unexpected error processing row"
                 );
-                let _ = release_claim(store, &claim.memory_id, &claim.token);
+                // Same deprioritisation as an LLM error: the flag stays set
+                // and the row is retried after the rows that have not failed.
+                let _ = release_claim_with_backoff(
+                    store,
+                    &claim.memory_id,
+                    &claim.token,
+                    Utc::now().timestamp(),
+                );
                 return (ProcessVerdict::DbError, strike_count);
             }
         }
@@ -867,11 +889,23 @@ fn attempt_one(
 
     let outcome = match generator.generate(&memory) {
         Ok(Some(o)) => o,
-        Ok(None) => {
+        Ok(None) if content_fits_target(&memory, generator.config.target_chars) => {
             // Content fits under target_chars — clear the flag so the
             // row doesn't loop. This is a degenerate-success.
             clear_flag_only(store, &claim.memory_id, &claim.token)?;
             return Ok(AttemptOutcome::SkippedShort);
+        }
+        Ok(None) => {
+            // The content is over the target, so `None` means the model
+            // answered with blank text. The row is not done, and the model
+            // failed at the task the same way an unfaithful summary does:
+            // it counts as a strike, so a row the model always answers
+            // blank on is retired by the fuse instead of being retried on
+            // every pass. Transport and provider errors stay non-counting.
+            return Ok(AttemptOutcome::ContractViolation(format!(
+                "Cap C: model returned empty output for memory {}",
+                claim.memory_id
+            )));
         }
         Err(e) => {
             // Distinguish lossless-contract violations (countable) from
@@ -894,7 +928,7 @@ fn attempt_one(
                 // oldest queue first). Without this, oversized rows were
                 // reclaimed every pass and starved newer cold rows.
                 if msg.starts_with("Cap C too large") {
-                    let _ = release_claim_too_large(
+                    let _ = release_claim_with_backoff(
                         store,
                         &claim.memory_id,
                         &claim.token,
@@ -1015,13 +1049,14 @@ fn claim_batch(store: &SqliteStore, batch_size: usize) -> ReinResult<Vec<Claim>>
 
     // Step 1: pick eligible ids (read-only scan).
     //
-    // v0.27.5 R1 — too-large backoff: rows whose previous attempt returned
-    // `AttemptOutcome::TooLarge` get `last_too_large_at` stamped to now()
-    // and are sorted to the back of the queue so they don't reclaim every
-    // batch and starve newer eligible rows. Among too-large rows we still
-    // pick the one with the oldest stamp first (longest backoff elapsed),
-    // so an operator who later raises the input cap or chunks the row
-    // will see it retried before fresher too-large rows.
+    // Failure backoff: rows whose previous attempt failed with the flag
+    // still set (content over the input cap, LLM error, unexpected
+    // error) get `last_too_large_at` stamped to now() and are
+    // sorted to the back of the queue so they don't reclaim every batch
+    // and starve newer eligible rows. Among stamped rows the one with the
+    // oldest stamp goes first (longest backoff elapsed), so the failed
+    // rows take turns and an operator who later raises the input cap or
+    // fixes the provider sees the longest-waiting row retried first.
     let eligible_ids: Vec<String> = {
         let mut stmt = store.conn().prepare(
             "SELECT m.id FROM memories m \
@@ -1074,26 +1109,15 @@ fn claim_batch(store: &SqliteStore, batch_size: usize) -> ReinResult<Vec<Claim>>
     Ok(claims)
 }
 
-/// Release a claim **only if we still own it**. If a stale timeout
-/// elapsed and another worker reclaimed in the meantime, this becomes a
-/// no-op rather than clobbering the new owner's marker. Mirrors
-/// `ops/resummerize.rs::release_claim`.
-fn release_claim(store: &SqliteStore, memory_id: &str, token: &str) -> ReinResult<()> {
-    store.conn().execute(
-        "UPDATE memories \
-         SET in_progress_archival_summary_at = NULL, \
-             archival_claim_token = NULL \
-         WHERE id = ?1 AND archival_claim_token = ?2",
-        rusqlite::params![memory_id, token],
-    )?;
-    Ok(())
-}
-
-/// v0.27.5 R1 — release the claim AND stamp `last_too_large_at = now_unix`
-/// so `claim_batch` deprioritizes this row on subsequent passes. Both
+/// Release the claim AND stamp `last_too_large_at = now_unix` so
+/// `claim_batch` deprioritizes this row on subsequent passes. Used for every
+/// attempt that fails while the flag stays set: content over the input cap,
+/// an LLM error, and unexpected errors. The column
+/// is read only by the `claim_batch` ordering, where it means "last failed
+/// attempt"; a successful summary or a content change clears it. Both
 /// updates are predicated on the claim token so a stale worker can't
 /// stamp a row that a fresh owner is still processing.
-fn release_claim_too_large(
+fn release_claim_with_backoff(
     store: &SqliteStore,
     memory_id: &str,
     token: &str,
@@ -1108,6 +1132,12 @@ fn release_claim_too_large(
         rusqlite::params![memory_id, token, now_unix],
     )?;
     Ok(())
+}
+
+/// True when the content is already at or below the summary target, the
+/// only case in which `generate` returns `Ok(None)` without calling the LLM.
+fn content_fits_target(memory: &Memory, target_chars: usize) -> bool {
+    memory.content.chars().count() <= target_chars
 }
 
 /// Clear the flag (set to 0 = not needed) AND release the claim, **only
@@ -1294,6 +1324,13 @@ fn refresh_one_for_handler_inner(
     // schema columns so concurrent worker passes see consistent state.
     let outcome = match generator.generate(&memory)? {
         Some(o) => o,
+        None if !content_fits_target(&memory, cold_config.target_chars) => {
+            // Over the target and still no summary: the model answered
+            // with blank text. Report it as the failure it is.
+            return Err(ReinError::Extract(format!(
+                "Cap C: model returned empty output for memory {memory_id}"
+            )));
+        }
         None => {
             return Ok(ManualRefreshOutcome {
                 generated: false,
@@ -2096,6 +2133,120 @@ mod tests {
             );
         }
 
+        fn read_backoff_stamp(store: &SqliteStore, id: &str) -> Option<i64> {
+            store
+                .conn()
+                .query_row(
+                    "SELECT last_too_large_at FROM memories WHERE id = ?1",
+                    rusqlite::params![id],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .expect("read backoff stamp")
+        }
+
+        /// A row whose LLM call fails keeps its flag but goes to the back
+        /// of the claim order, so the next pass serves a row that has not
+        /// failed instead of retrying the same one first.
+        #[test]
+        fn worker_llm_failure_moves_row_behind_untried_rows() {
+            let (config, _tmp) = fresh_store();
+            let store = config.open_store().expect("open store");
+
+            let source = "Anthropic released Claude 4.6 in 2026 with 200K context window. \
+                The model targets long-document synthesis and tool use across multi-turn dialogs. \
+                Released alongside an upgrade to the Sonnet tier and improved citation grounding.";
+            let summary = "Anthropic released Claude 4.6 in 2026 with 200K context. \
+                Targets long-document synthesis. Released with Sonnet upgrade.";
+            // `failing` is older, so it is first in line on the first pass.
+            seed_cold_flagged(&store, "failing", source, "2026-04-01T00:00:00Z");
+            seed_cold_flagged(&store, "waiting", source, "2026-04-02T00:00:00Z");
+
+            let mut cold_config = ColdArchiveConfig::from_ars(&config.ars);
+            cold_config.batch_size = 1;
+
+            // Pass 1: the provider call for `failing` errors out.
+            let extractor = ExtractorKind::Mock(MockExtractor::with_responses(vec![Err(
+                "simulated 503".to_string(),
+            )]));
+            let report =
+                run_cold_archive_summary_with_extractor(&store, &config, &cold_config, extractor)
+                    .expect("pass 1");
+            assert_eq!(report.considered, 1);
+            assert_eq!(report.errors, 1);
+            assert_eq!(report.generated, 0);
+            let (_, _, _, flag) = read_archival_state(&store, "failing");
+            assert_eq!(flag, 1, "a failed row stays flagged for a later retry");
+            assert!(
+                read_backoff_stamp(&store, "failing").is_some(),
+                "a failed row carries the backoff stamp"
+            );
+
+            // Pass 2: the one slot goes to `waiting`, not to `failing` again.
+            let extractor =
+                ExtractorKind::Mock(MockExtractor::with_responses(vec![Ok(summary.to_string())]));
+            let report =
+                run_cold_archive_summary_with_extractor(&store, &config, &cold_config, extractor)
+                    .expect("pass 2");
+            assert_eq!(report.generated, 1);
+            let (saved, _, _, flag) = read_archival_state(&store, "waiting");
+            assert!(saved.is_some(), "the untried row is served on pass 2");
+            assert_eq!(flag, 0);
+
+            // Pass 3: `failing` is retried, and its success clears the stamp.
+            let extractor =
+                ExtractorKind::Mock(MockExtractor::with_responses(vec![Ok(summary.to_string())]));
+            let report =
+                run_cold_archive_summary_with_extractor(&store, &config, &cold_config, extractor)
+                    .expect("pass 3");
+            assert_eq!(report.generated, 1);
+            let (saved, _, _, flag) = read_archival_state(&store, "failing");
+            assert!(saved.is_some());
+            assert_eq!(flag, 0);
+            assert!(read_backoff_stamp(&store, "failing").is_none());
+        }
+
+        /// Blank model output for content that is over the target is the
+        /// model failing at the task: the row is not counted as "short", each
+        /// blank answer is a strike, and the fuse retires the row.
+        #[test]
+        fn worker_blank_llm_output_keeps_flag_set() {
+            let (config, _tmp) = fresh_store();
+            let store = config.open_store().expect("open store");
+
+            let source = "A".repeat(500);
+            seed_cold_flagged(&store, "blank1", &source, "2026-04-01T00:00:00Z");
+
+            let cold_config = ColdArchiveConfig::from_ars(&config.ars);
+            let blank = || -> Result<String, String> { Ok("   \n  ".to_string()) };
+            let extractor = ExtractorKind::Mock(MockExtractor::with_responses(vec![
+                blank(),
+                blank(),
+                blank(),
+            ]));
+            let report =
+                run_cold_archive_summary_with_extractor(&store, &config, &cold_config, extractor)
+                    .expect("worker pass");
+            assert_eq!(report.considered, 1);
+            assert_eq!(report.skipped_short, 0, "blank output is not a short row");
+            assert_eq!(report.generated, 0);
+            assert_eq!(report.strikes, 3, "each blank answer is a strike");
+            assert_eq!(report.exhausted, 1, "the fuse retires the row");
+
+            let (saved, _, _, flag) = read_archival_state(&store, "blank1");
+            assert!(saved.is_none(), "no summary is stored for a blank answer");
+            assert_eq!(
+                flag, NEEDS_ARCHIVAL_SUMMARY_EXHAUSTED,
+                "the row is retired, not marked done and not retried forever"
+            );
+
+            // A later pass does not spend another LLM call on it.
+            let extractor = ExtractorKind::Mock(MockExtractor::with_responses(vec![blank()]));
+            let report =
+                run_cold_archive_summary_with_extractor(&store, &config, &cold_config, extractor)
+                    .expect("second pass");
+            assert_eq!(report.considered, 0);
+        }
+
         #[test]
         fn worker_skipped_short_clears_flag_without_llm_call() {
             let (config, _tmp) = fresh_store();
@@ -2309,12 +2460,12 @@ mod tests {
             );
         }
 
-        /// v0.27.5 R1 — `release_claim_too_large` stamps
+        /// v0.27.5 R1 — `release_claim_with_backoff` stamps
         /// `last_too_large_at = now()` AND clears the claim, both
         /// predicated on token match so a stale worker can't clobber
         /// a fresh owner.
         #[test]
-        fn release_claim_too_large_stamps_and_clears_only_on_token_match() {
+        fn release_claim_with_backoff_stamps_and_clears_only_on_token_match() {
             let (config, _tmp) = fresh_store();
             let store = config.open_store().expect("open store");
 
@@ -2331,7 +2482,7 @@ mod tests {
                 .expect("stamp claim");
 
             // Wrong-token release is a no-op.
-            release_claim_too_large(&store, "row1", "TOKEN_STALE", 1900000000)
+            release_claim_with_backoff(&store, "row1", "TOKEN_STALE", 1900000000)
                 .expect("release with wrong token must be Ok no-op");
             let still_owned: String = store
                 .conn()
@@ -2356,7 +2507,7 @@ mod tests {
             assert!(stamp.is_none(), "wrong-token release must not stamp");
 
             // Right-token release clears claim and stamps.
-            release_claim_too_large(&store, "row1", "TOKEN_OWNED", 1900000000)
+            release_claim_with_backoff(&store, "row1", "TOKEN_OWNED", 1900000000)
                 .expect("release with correct token");
             let (claim_token, stamp): (Option<String>, Option<i64>) = store
                 .conn()

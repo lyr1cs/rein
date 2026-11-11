@@ -134,6 +134,20 @@ fn release_code_exchange(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Answer for a failure inside the server (store open, SQLite, signing).
+/// The token endpoint is reachable before the client authenticates, so the
+/// error text, which can name paths, tables and constraints, goes to the
+/// server log and the caller gets a fixed description. `step` names the
+/// failing operation; nothing from the request is logged.
+fn internal_error(err: &dyn std::fmt::Display, step: &'static str) -> OAuthResponse {
+    tracing::warn!(error = %err, step, "oauth token request failed inside the server");
+    oauth_error(
+        hyper::StatusCode::INTERNAL_SERVER_ERROR,
+        "server_error",
+        "the token request could not be processed",
+    )
+}
+
 pub fn handle_token(headers: &hyper::HeaderMap, body: &[u8], config: &ReinConfig) -> OAuthResponse {
     let req = match serde_urlencoded::from_bytes::<TokenRequest>(body) {
         Ok(req) => req,
@@ -147,13 +161,7 @@ pub fn handle_token(headers: &hyper::HeaderMap, body: &[u8], config: &ReinConfig
     };
     let store = match config.open_store() {
         Ok(store) => store,
-        Err(err) => {
-            return oauth_error(
-                hyper::StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                &err.to_string(),
-            )
-        }
+        Err(err) => return internal_error(&err, "open store"),
     };
     match req.grant_type.as_str() {
         "authorization_code" => handle_authorization_code(headers, req, store.conn()),
@@ -208,13 +216,7 @@ fn handle_authorization_code(
                 "unknown client",
             )
         }
-        Err(err) => {
-            return oauth_error(
-                hyper::StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                &err.to_string(),
-            )
-        }
+        Err(err) => return internal_error(&err, "load client"),
     };
     if let Err(err) = authenticate_client(&client, headers, req.client_secret.as_deref()) {
         return oauth_error(
@@ -225,11 +227,7 @@ fn handle_authorization_code(
     }
     let issue_refresh = client_allows_grant(&client, "refresh_token");
     if let Err(err) = conn.execute_batch("SAVEPOINT oauth_code_exchange") {
-        return oauth_error(
-            hyper::StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            &err.to_string(),
-        );
+        return internal_error(&err, "open code exchange savepoint");
     }
     let consumed = match store::consume_auth_code(
         conn,
@@ -241,6 +239,12 @@ fn handle_authorization_code(
         Ok(code) => code,
         Err(err) => {
             rollback_code_exchange(conn);
+            // A SQLite failure is not a verdict on the code: only the
+            // rejection reasons (unknown, consumed, expired, mismatched)
+            // are reported to the client as `invalid_grant`.
+            if err.downcast_ref::<rusqlite::Error>().is_some() {
+                return internal_error(&err, "consume authorization code");
+            }
             return oauth_error(
                 hyper::StatusCode::BAD_REQUEST,
                 "invalid_grant",
@@ -250,11 +254,7 @@ fn handle_authorization_code(
     };
     if !pkce::verify_s256(verifier, &consumed.code_challenge) {
         if let Err(err) = release_code_exchange(conn) {
-            return oauth_error(
-                hyper::StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                &err.to_string(),
-            );
+            return internal_error(&err, "release code exchange savepoint");
         }
         return oauth_error(
             hyper::StatusCode::BAD_REQUEST,
@@ -267,19 +267,11 @@ fn handle_authorization_code(
             Ok(pair) => pair,
             Err(err) => {
                 rollback_code_exchange(conn);
-                return oauth_error(
-                    hyper::StatusCode::INTERNAL_SERVER_ERROR,
-                    "server_error",
-                    &err.to_string(),
-                );
+                return internal_error(&err, "issue token pair");
             }
         };
     if let Err(err) = release_code_exchange(conn) {
-        return oauth_error(
-            hyper::StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            &err.to_string(),
-        );
+        return internal_error(&err, "release code exchange savepoint");
     }
     token_response(access_token, refresh_token)
 }
@@ -312,13 +304,7 @@ fn handle_refresh(
                 "unknown client",
             )
         }
-        Err(err) => {
-            return oauth_error(
-                hyper::StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                &err.to_string(),
-            )
-        }
+        Err(err) => return internal_error(&err, "load client"),
     };
     if let Err(err) = authenticate_client(&client, headers, req.client_secret.as_deref()) {
         return oauth_error(
@@ -337,13 +323,7 @@ fn handle_refresh(
     let (access_token, new_refresh_token, new_grant) =
         match prepare_token_material(conn, &client_id, true) {
             Ok(material) => material,
-            Err(err) => {
-                return oauth_error(
-                    hyper::StatusCode::INTERNAL_SERVER_ERROR,
-                    "server_error",
-                    &err.to_string(),
-                )
-            }
+            Err(err) => return internal_error(&err, "prepare token material"),
         };
     match store::rotate_refresh_grant(
         conn,
@@ -385,13 +365,7 @@ fn handle_refresh(
                 "invalid refresh_token",
             );
         }
-        Err(err) => {
-            return oauth_error(
-                hyper::StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                &err.to_string(),
-            )
-        }
+        Err(err) => return internal_error(&err, "rotate refresh grant"),
     };
     token_response(access_token, Some(new_refresh_token))
 }
@@ -525,6 +499,55 @@ mod tests {
         )
         .expect("code should remain usable after issuance failure");
         assert_eq!(consumed.code, code);
+    }
+
+    #[test]
+    fn storage_failures_answer_with_a_generic_server_error() {
+        let (_dir, config) = temp_config();
+        let client = register_client_with_grants(&config, vec!["authorization_code".to_string()]);
+        let verifier = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~";
+        let challenge = pkce::s256_challenge(verifier).expect("challenge");
+        let code = insert_code(&config, &client.client_id, &challenge);
+        {
+            let store = config.open_store().expect("open store");
+            store
+                .conn()
+                .execute_batch(
+                    "CREATE TRIGGER oauth_auth_codes_reject BEFORE UPDATE ON oauth_auth_codes
+                     BEGIN SELECT RAISE(ABORT, 'sqlite detail oauth_auth_codes.consumed_at'); END;",
+                )
+                .expect("install failing trigger");
+        }
+        let body = serde_urlencoded::to_string([
+            ("grant_type", "authorization_code"),
+            ("client_id", client.client_id.as_str()),
+            ("redirect_uri", "https://claude.ai/callback"),
+            ("code", code.as_str()),
+            ("code_verifier", verifier),
+        ])
+        .expect("form");
+
+        let response = handle_token(&hyper::HeaderMap::new(), body.as_bytes(), &config);
+
+        assert_eq!(response.status, hyper::StatusCode::INTERNAL_SERVER_ERROR);
+        let text = String::from_utf8(response.body).expect("utf8 body");
+        assert!(text.contains("server_error"), "{text}");
+        assert!(!text.contains("sqlite detail"), "{text}");
+        assert!(!text.contains("oauth_auth_codes"), "{text}");
+
+        // A rejected code is still explained to the client.
+        let body = serde_urlencoded::to_string([
+            ("grant_type", "authorization_code"),
+            ("client_id", client.client_id.as_str()),
+            ("redirect_uri", "https://claude.ai/callback"),
+            ("code", "not-a-real-code"),
+            ("code_verifier", verifier),
+        ])
+        .expect("form");
+        let response = handle_token(&hyper::HeaderMap::new(), body.as_bytes(), &config);
+        assert_eq!(response.status, hyper::StatusCode::BAD_REQUEST);
+        let text = String::from_utf8(response.body).expect("utf8 body");
+        assert!(text.contains("invalid authorization code"), "{text}");
     }
 
     #[test]

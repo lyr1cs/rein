@@ -285,6 +285,12 @@ pub async fn handle_warmup(
             report.revalidation_skipped
         ));
     }
+    if report.unembeddable > 0 {
+        line.push_str(&format!(
+            ", {} refused by the embedding provider (full-text only until their text or the model changes)",
+            report.unembeddable
+        ));
+    }
     println!("{line}");
     if report.provenance_unknown {
         println!(
@@ -377,6 +383,12 @@ pub async fn handle_worker_cleanup(
             report.duplicates_merged,
             report.duplicates_found
         );
+        if report.consolidation.groups_skipped_llm_error > 0 {
+            eprintln!(
+                "rein worker: {} groups skipped because the LLM call failed; their memories were left untouched and a later run retries them",
+                report.consolidation.groups_skipped_llm_error
+            );
+        }
     }
     Ok(())
 }

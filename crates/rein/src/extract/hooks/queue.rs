@@ -2053,9 +2053,10 @@ async fn process_cleanup_job(config: &ReinConfig, job: CleanupJob) -> anyhow::Re
     let report =
         crate::ops::run_cleanup_async(&store, config, &groups, merge_variants, job.dry_run).await?;
     tracing::info!(
-        "cleanup worker: job {} finished; groups={}, memories={}, dedup_removed={}/{}",
+        "cleanup worker: job {} finished; groups={}, skipped_llm_error={}, memories={}, dedup_removed={}/{}",
         job.id,
         report.consolidation.groups_processed,
+        report.consolidation.groups_skipped_llm_error,
         report.consolidation.memories_replaced,
         report.duplicates_merged,
         report.duplicates_found

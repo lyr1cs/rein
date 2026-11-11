@@ -50,6 +50,32 @@ pub struct OpenAiCompatibleEmbedder {
     options: OpenAiCompatibleOptions,
 }
 
+/// Timeout and retry allowance of one embeddings request.
+#[derive(Clone, Copy)]
+struct RequestLimits {
+    timeout: Duration,
+    max_retries: u32,
+}
+
+/// Client-wide timeout; also the per-request limit for single texts and
+/// query batches, which sit on the interactive recall path.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upper bound for document batches (backfill, reindex, dedup), which carry
+/// far more text and get a far larger response; the actual allowance is
+/// [`crate::embed::batch_request_timeout`].
+const BATCH_TIMEOUT: Duration = Duration::from_secs(60);
+const RETRY_BACKOFF_BASE_MS: u64 = 400;
+
+/// Interactive calls: one retry, so a slow provider costs recall one extra
+/// attempt before it falls back to full-text search.
+const INTERACTIVE: RequestLimits = RequestLimits {
+    timeout: QUERY_TIMEOUT,
+    max_retries: 1,
+};
+/// Retries for bulk document batches: a transient 429 / 5xx must not fail a
+/// whole request that a short wait would let through.
+const BULK_MAX_RETRIES: u32 = 3;
+
 impl OpenAiCompatibleEmbedder {
     pub fn new(
         endpoint: String,
@@ -59,12 +85,9 @@ impl OpenAiCompatibleEmbedder {
     ) -> Self {
         // Builder failure returning `Client::default()` would silently drop the
         // timeout and let a hung endpoint stall recall; surface it instead.
-        let client = Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .expect(
-                "reqwest client build failed for openai-compatible embedder (likely TLS backend)",
-            );
+        let client = Client::builder().timeout(QUERY_TIMEOUT).build().expect(
+            "reqwest client build failed for openai-compatible embedder (likely TLS backend)",
+        );
         let options = OpenAiCompatibleOptions {
             max_batch: options.max_batch.max(1),
             ..options
@@ -106,23 +129,69 @@ impl OpenAiCompatibleEmbedder {
         body
     }
 
-    /// One HTTP round trip for ≤ `max_batch` texts; output is in input order.
-    async fn request(&self, texts: &[&str], input_type: Option<&str>) -> ReinResult<Vec<Vec<f32>>> {
+    /// Embed ≤ `max_batch` texts; output is in input order. Transport
+    /// errors, 429 and 5xx are retried with backoff; any other status is
+    /// returned as it is.
+    async fn request(
+        &self,
+        texts: &[&str],
+        input_type: Option<&str>,
+        limits: RequestLimits,
+    ) -> ReinResult<Vec<Vec<f32>>> {
         let url = format!("{}/embeddings", self.endpoint);
-        let resp = self
-            .authed(self.client.post(&url))
-            .json(&self.body(texts, input_type))
-            .send()
-            .await?;
-        let status = resp.status();
-        let text_body = resp.text().await?;
-        if !status.is_success() {
-            return Err(ReinError::Embedding(crate::types::provider_status_error(
-                "OpenAI-compatible embed API",
-                status,
-                &text_body,
-            )));
-        }
+        let body = self.body(texts, input_type);
+        let mut attempt: u32 = 0;
+        let text_body = loop {
+            let sent = self
+                .authed(self.client.post(&url))
+                .timeout(limits.timeout)
+                .json(&body)
+                .send()
+                .await;
+            let outcome = match sent {
+                Ok(resp) => {
+                    let status = resp.status();
+                    match resp.text().await {
+                        Ok(text) => Ok((status, text)),
+                        Err(e) => Err(e),
+                    }
+                }
+                Err(e) => Err(e),
+            };
+            match outcome {
+                Ok((status, text)) if status.is_success() => break text,
+                Ok((status, text)) => {
+                    let transient = status.as_u16() == 429 || status.is_server_error();
+                    if !transient || attempt >= limits.max_retries {
+                        return Err(ReinError::Embedding(crate::types::provider_status_error(
+                            "OpenAI-compatible embed API",
+                            status,
+                            &text,
+                        )));
+                    }
+                    tracing::warn!(
+                        attempt,
+                        status = status.as_u16(),
+                        "OpenAI-compatible embed API transient failure, retrying"
+                    );
+                }
+                Err(e) => {
+                    if attempt >= limits.max_retries {
+                        return Err(e.into());
+                    }
+                    tracing::warn!(
+                        attempt,
+                        err = %e,
+                        "OpenAI-compatible embed API transport error, retrying"
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(
+                RETRY_BACKOFF_BASE_MS.saturating_mul(1u64 << attempt.min(6)),
+            ))
+            .await;
+            attempt += 1;
+        };
         let parsed: Value =
             serde_json::from_str(&text_body).map_err(|e| ReinError::Embedding(e.to_string()))?;
         let data = parsed["data"]
@@ -156,10 +225,16 @@ impl OpenAiCompatibleEmbedder {
         &self,
         texts: &[&str],
         input_type: Option<&str>,
+        // `None`: a bulk document batch, timed by what each request carries.
+        limits: Option<RequestLimits>,
     ) -> ReinResult<Vec<Vec<f32>>> {
         let mut out = Vec::with_capacity(texts.len());
         for chunk in texts.chunks(self.options.max_batch) {
-            out.extend(self.request(chunk, input_type).await?);
+            let limits = limits.unwrap_or_else(|| RequestLimits {
+                timeout: crate::embed::batch_request_timeout(chunk, QUERY_TIMEOUT, BATCH_TIMEOUT),
+                max_retries: BULK_MAX_RETRIES,
+            });
+            out.extend(self.request(chunk, input_type, limits).await?);
         }
         Ok(out)
     }
@@ -209,28 +284,40 @@ impl Embedder for OpenAiCompatibleEmbedder {
 
     async fn embed(&self, text: &str) -> ReinResult<Vec<f32>> {
         let mut v = self
-            .embed_many(&[text], self.options.document_input_type.as_deref())
+            .embed_many(
+                &[text],
+                self.options.document_input_type.as_deref(),
+                Some(INTERACTIVE),
+            )
             .await?;
         v.pop()
             .ok_or_else(|| ReinError::Embedding("empty embedding response".into()))
     }
 
     async fn embed_batch(&self, texts: &[&str]) -> ReinResult<Vec<Vec<f32>>> {
-        self.embed_many(texts, self.options.document_input_type.as_deref())
+        self.embed_many(texts, self.options.document_input_type.as_deref(), None)
             .await
     }
 
     async fn embed_query(&self, text: &str) -> ReinResult<Vec<f32>> {
         let mut v = self
-            .embed_many(&[text], self.options.query_input_type.as_deref())
+            .embed_many(
+                &[text],
+                self.options.query_input_type.as_deref(),
+                Some(INTERACTIVE),
+            )
             .await?;
         v.pop()
             .ok_or_else(|| ReinError::Embedding("empty embedding response".into()))
     }
 
     async fn embed_query_batch(&self, texts: &[&str]) -> ReinResult<Vec<Vec<f32>>> {
-        self.embed_many(texts, self.options.query_input_type.as_deref())
-            .await
+        self.embed_many(
+            texts,
+            self.options.query_input_type.as_deref(),
+            Some(INTERACTIVE),
+        )
+        .await
     }
 }
 
@@ -419,6 +506,31 @@ mod tests {
             e.embed_batch(&["a", "b"]).await.unwrap(),
             vec![vec![1.0], vec![2.0]]
         );
+    }
+
+    #[tokio::test]
+    async fn a_transient_status_is_retried_and_a_rejection_is_not() {
+        // 429 then success: the batch goes through on the retry.
+        let stub = StubServer::start(vec![
+            (429, "{}".to_string()),
+            (200, float_resp(&[vec![1.0], vec![2.0]])),
+        ]);
+        let e = OpenAiCompatibleEmbedder::new(stub.url.clone(), "m".into(), 1, opts());
+        assert_eq!(
+            e.embed_batch(&["a", "b"]).await.unwrap(),
+            vec![vec![1.0], vec![2.0]]
+        );
+        assert_eq!(stub.requests().len(), 2);
+
+        // 400 is the provider's answer: one request, no retry.
+        let stub = StubServer::start(vec![
+            (400, "{}".to_string()),
+            (200, float_resp(&[vec![1.0]])),
+        ]);
+        let e = OpenAiCompatibleEmbedder::new(stub.url.clone(), "m".into(), 1, opts());
+        let err = e.embed_batch(&["a"]).await.unwrap_err();
+        assert!(crate::types::error::is_provider_rejection_error(&err));
+        assert_eq!(stub.requests().len(), 1);
     }
 
     #[tokio::test]

@@ -2360,6 +2360,10 @@ fn recall_temporal_with_execution_mode(
     }
     .into_iter()
     .filter(|memory| matches_external_filters(memory, topic, keyword, time_from, time_to))
+    // The scan returns every matching file, best first. The request's limit
+    // applies after the filters, so a time- or topic-restricted recall is
+    // not starved by better-ranked files outside its window.
+    .take(effective_limit)
     .collect::<Vec<_>>();
 
     // Join the Supermemory thread. v0.36 #P1: `sm_handle` is `None` for a

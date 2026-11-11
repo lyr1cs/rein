@@ -1462,6 +1462,41 @@ fn facts_to_memories(text: &str, threshold: u32) -> Vec<ExtractedMemory> {
         .collect()
 }
 
+/// Turn the outcome of a simple LLM extraction into the memories to store.
+///
+/// A non-empty list from the extractor is used as is. Everything else falls
+/// back to patterns over the full text: a failed call, no configured
+/// extractor, and also an empty list — the extractor only sees the text up to
+/// its input cap, so an empty answer says nothing about the remainder.
+fn memories_or_pattern_fallback(
+    llm_outcome: Option<ReinResult<Vec<ExtractedMemory>>>,
+    text: &str,
+    pattern_threshold: u32,
+) -> Vec<ExtractedMemory> {
+    match llm_outcome {
+        Some(Ok(memories)) if !memories.is_empty() => return memories,
+        Some(Ok(_)) | None => {}
+        Some(Err(e)) => tracing::warn!("LLM extraction failed, falling back to patterns: {e}"),
+    }
+    facts_to_memories(text, pattern_threshold)
+}
+
+/// Full-extraction counterpart of [`memories_or_pattern_fallback`]: merge the
+/// per-chunk results when at least one chunk produced one, otherwise fall
+/// back to patterns over the full text.
+fn full_result_or_pattern_fallback(
+    chunk_results: Vec<ExtractionResult>,
+    text: &str,
+) -> ExtractionResult {
+    if !chunk_results.is_empty() {
+        return merge_chunk_results(chunk_results);
+    }
+    ExtractionResult {
+        memories: facts_to_memories(text, 2),
+        ..Default::default()
+    }
+}
+
 /// Infer a topic from extracted keywords by matching against known topic categories.
 /// Falls back to the most specific keyword if no category matches.
 fn infer_topic_from_keywords(keywords: &[String]) -> String {
@@ -1514,15 +1549,12 @@ pub async fn extract_with_fallback(
     text: &str,
     pattern_threshold: u32,
 ) -> Vec<ExtractedMemory> {
+    let mut llm_outcome = None;
     if let Some(extractor) = create_extractor(config) {
         let contextual_input = prepare_with_context(config, text);
-        match extractor.extract(&contextual_input).await {
-            Ok(memories) if !memories.is_empty() => return memories,
-            Ok(_) => {}
-            Err(e) => tracing::warn!("LLM extraction failed, falling back to patterns: {e}"),
-        }
+        llm_outcome = Some(extractor.extract(&contextual_input).await);
     }
-    facts_to_memories(text, pattern_threshold)
+    memories_or_pattern_fallback(llm_outcome, text, pattern_threshold)
 }
 
 /// Extract memories using the async memory worker provider, then pattern fallback.
@@ -1531,16 +1563,13 @@ pub async fn extract_with_worker_preference(
     text: &str,
     pattern_threshold: u32,
 ) -> Vec<ExtractedMemory> {
+    let mut llm_outcome = None;
     if let Some(extractor) = create_memory_worker_extractor(config) {
         let contextual_input =
             prepare_with_context_for_section_kind(config, "extract.async_memory", text, &extractor);
-        match extractor.extract(&contextual_input).await {
-            Ok(memories) if !memories.is_empty() => return memories,
-            Ok(_) => {}
-            Err(e) => tracing::warn!("memory worker extraction failed, falling back: {e}"),
-        }
+        llm_outcome = Some(extractor.extract(&contextual_input).await);
     }
-    facts_to_memories(text, pattern_threshold)
+    memories_or_pattern_fallback(llm_outcome, text, pattern_threshold)
 }
 
 /// LLM semantic dedup: ask the model if two texts are about the same thing.
@@ -1558,6 +1587,7 @@ pub async fn llm_is_duplicate(config: &ReinConfig, text_a: &str, text_b: &str) -
 /// Full extraction (memories + concepts + links + episode) with fallback.
 /// For long sessions, splits into chunks and merges results with cross-chunk dedup.
 pub async fn extract_full_with_fallback(config: &ReinConfig, text: &str) -> ExtractionResult {
+    let mut chunk_results = Vec::new();
     if let Some(extractor) = create_extractor(config) {
         let max_chars = resolve_max_input_chars(config);
         let context_prefix = build_context_prefix_if_enabled(config, text);
@@ -1565,7 +1595,6 @@ pub async fn extract_full_with_fallback(config: &ReinConfig, text: &str) -> Extr
         if chunks.len() > 1 {
             tracing::info!("session chunking: {} chunks for extraction", chunks.len());
         }
-        let mut chunk_results = Vec::new();
         for chunk in &chunks {
             let input = clamp_input(&context_prefix, chunk, max_chars);
             match extractor.extract_full(&input).await {
@@ -1583,16 +1612,12 @@ pub async fn extract_full_with_fallback(config: &ReinConfig, text: &str) -> Extr
                 }
             }
         }
-        if !chunk_results.is_empty() {
-            return merge_chunk_results(chunk_results);
+        if chunk_results.is_empty() {
+            tracing::warn!("all LLM extraction attempts failed, falling back to patterns");
         }
-        tracing::warn!("all LLM extraction attempts failed, falling back to patterns");
     }
 
-    ExtractionResult {
-        memories: facts_to_memories(text, 2),
-        ..Default::default()
-    }
+    full_result_or_pattern_fallback(chunk_results, text)
 }
 
 /// Full extraction using the async memory worker provider.
@@ -1601,6 +1626,7 @@ pub async fn extract_full_with_worker_preference(
     config: &ReinConfig,
     text: &str,
 ) -> ExtractionResult {
+    let mut chunk_results = Vec::new();
     if let Some(extractor) = create_memory_worker_extractor(config) {
         // Use the worker extractor's actual context limit (may differ from main provider)
         let worker_max =
@@ -1613,7 +1639,6 @@ pub async fn extract_full_with_worker_preference(
                 chunks.len()
             );
         }
-        let mut chunk_results = Vec::new();
         for chunk in &chunks {
             let input = clamp_input(&context_prefix, chunk, worker_max);
             match extractor.extract_full(&input).await {
@@ -1633,15 +1658,9 @@ pub async fn extract_full_with_worker_preference(
                 }
             }
         }
-        if !chunk_results.is_empty() {
-            return merge_chunk_results(chunk_results);
-        }
     }
 
-    ExtractionResult {
-        memories: facts_to_memories(text, 2),
-        ..Default::default()
-    }
+    full_result_or_pattern_fallback(chunk_results, text)
 }
 
 // ---------------------------------------------------------------------------
@@ -2126,6 +2145,39 @@ mod tests {
         // Topic is now inferred from keywords (e.g., "architecture" from "microservices")
         assert_ne!(result[0].topic, "", "topic should not be empty");
         assert_eq!(result[0].importance, "medium");
+    }
+
+    #[test]
+    fn empty_llm_answer_falls_back_to_patterns_and_fallback_skips_blobs() {
+        let text = "We decided to use PostgreSQL. The system uses a microservices architecture.";
+
+        // An empty list, a failed call and a missing extractor all fall back
+        // to patterns over the full text.
+        assert!(!memories_or_pattern_fallback(Some(Ok(vec![])), text, 2).is_empty());
+        let failed = Some(Err(ReinError::Extract("simulated outage".into())));
+        assert!(!memories_or_pattern_fallback(failed, text, 2).is_empty());
+        assert!(!memories_or_pattern_fallback(None, text, 2).is_empty());
+        assert!(!full_result_or_pattern_fallback(vec![], text)
+            .memories
+            .is_empty());
+
+        // The fallback never turns an unsplittable blob into a memory, and
+        // Chinese prose is split into sentences instead of stored whole.
+        let blob = format!(
+            "error {}",
+            "QUJD".repeat(crate::store::sqlite::MERGE_CONTENT_CAP)
+        );
+        let cjk = "我们 decided 采用 SQLite。".repeat(3) + "团队 chose 单一二进制部署。";
+        let mixed = format!("{blob}\n\n{cjk}");
+        let memories = memories_or_pattern_fallback(None, &mixed, 2);
+        assert!(!memories.is_empty());
+        for memory in &memories {
+            assert!(
+                memory.content.len() < 200,
+                "fallback stored an oversized item: {} bytes",
+                memory.content.len()
+            );
+        }
     }
 
     #[test]

@@ -148,6 +148,7 @@ fn run_resummerize_inner(
     };
 
     let state = AdaptiveState::restore_snapshot(store.conn()).unwrap_or_default();
+    let input_budget = configured_input_budget(config, &extractor);
 
     // Atomically claim a batch so concurrent workers don't pick the same
     // rows (Codex H6). `claim_batch` returns only rows whose
@@ -158,7 +159,7 @@ fn run_resummerize_inner(
 
     for claim in claims {
         outcome.attempted += 1;
-        match resummerize_one(store, config, &extractor, &state, &claim) {
+        match resummerize_one(store, config, &extractor, &state, &claim, input_budget) {
             Ok(Verdict::Success) => outcome.succeeded += 1,
             Ok(Verdict::ContractViolation) => outcome.contract_failed += 1,
             Ok(Verdict::LlmError) => outcome.llm_failed += 1,
@@ -205,6 +206,40 @@ enum Verdict {
 struct Claim {
     canonical_id: String,
     token: String,
+}
+
+/// Input limit the operator set for the resummerize LLM, in chars; 0 when
+/// none was set.
+///
+/// Only a limit that is known to be real may stop a prompt from being sent.
+/// The generic resolver (`resolve_max_input_for_section_kind`) also returns
+/// provider-agnostic fallbacks (a safe default for OpenAI-compatible
+/// backends, a bandwidth cap for large-context Gemini models); a flagged
+/// canonical plus its evidence is routinely larger than the safe default,
+/// and providers accept such prompts, so those fallbacks are not limits.
+///
+/// - Gemini: the configured value defaults to 0, so any positive value was
+///   set by the operator.
+/// - OpenAI-compatible: the configured value defaults to the compiled
+///   default, which cannot be told apart from an operator writing that same
+///   number; only a value that differs from the default counts as set.
+fn configured_input_budget(config: &ReinConfig, extractor: &ExtractorKind) -> usize {
+    let Ok(resolved) = config.resolve_llm_for("resummerize") else {
+        return 0;
+    };
+    match extractor {
+        ExtractorKind::Gemini(_) => resolved.max_input_chars,
+        ExtractorKind::Omlx(_) => {
+            let compiled_default = crate::config::OmlxExtractConfig::default().max_input_chars;
+            if resolved.max_input_chars == compiled_default {
+                0
+            } else {
+                resolved.max_input_chars
+            }
+        }
+        #[cfg(feature = "test-support")]
+        ExtractorKind::Mock(_) => 0,
+    }
 }
 
 /// Build the LLM extractor honoring `[resummerize].llm_backend`.
@@ -428,8 +463,9 @@ fn resummerize_one(
     extractor: &ExtractorKind,
     state: &AdaptiveState,
     claim: &Claim,
+    input_budget: usize,
 ) -> ReinResult<Verdict> {
-    let result = resummerize_one_inner(store, config, extractor, state, claim);
+    let result = resummerize_one_inner(store, config, extractor, state, claim, input_budget);
     // Release the claim on exit **only if we still own it** (Codex round-2
     // HIGH): if the stale timeout elapsed and another worker reclaimed
     // the row, we must not null their marker. `release_claim` is
@@ -451,6 +487,7 @@ fn resummerize_one_inner(
     extractor: &ExtractorKind,
     state: &AdaptiveState,
     claim: &Claim,
+    input_budget: usize,
 ) -> ReinResult<Verdict> {
     let canonical_id = claim.canonical_id.as_str();
 
@@ -556,6 +593,40 @@ fn resummerize_one_inner(
         ),
     )?;
 
+    // Input budget gate. `input_budget` is the limit the operator set for
+    // this LLM (0 = none set, nothing is gated). The prompt carries the
+    // canonical plus every evidence row, and the contract needs the model
+    // to see all of it, so an over-budget prompt is not truncated and not
+    // sent. It would be over the limit on every run; recording it as `LengthExceeded`
+    // (a deterministic, fuse-counted status) lets the 3-strike fuse retire
+    // the row instead of rebuilding the same prompt forever.
+    let prompt_chars = prompt.chars().count();
+    if input_budget > 0 && prompt_chars > input_budget {
+        tracing::warn!(
+            canonical_id = %canonical_id,
+            prompt_chars,
+            input_budget,
+            evidence_rows = input_evidence_count,
+            "resummerize: prompt exceeds the LLM input budget; LLM not called"
+        );
+        let verdict = finish_with_ownership_check(
+            store,
+            &run_id,
+            &claim.canonical_id,
+            &claim.token,
+            &canonical_updated_at_raw,
+            None,
+            ResummerizeRunStatus::LengthExceeded,
+            &["input_budget".to_string()],
+            Some(format!(
+                "input prompt {prompt_chars} chars exceeds the resummerize input budget \
+                 {input_budget}; LLM not called"
+            )),
+            "input budget check raced with concurrent writer",
+        )?;
+        return Ok(verdict);
+    }
+
     let llm_output = match call_llm_sync(extractor, &prompt) {
         Ok(text) => strip_code_fences(&text),
         Err(e) => {
@@ -599,8 +670,7 @@ fn resummerize_one_inner(
             &claim.canonical_id,
             &claim.token,
             &canonical_updated_at_raw,
-            output_bytes as u32,
-            &sha256_hex(&llm_output),
+            Some((output_bytes as u32, sha256_hex(&llm_output).as_str())),
             ResummerizeRunStatus::LengthExceeded,
             &["length_bounded".to_string()],
             Some(format!(
@@ -747,8 +817,7 @@ fn resummerize_one_inner(
                 &claim.canonical_id,
                 &claim.token,
                 &canonical_updated_at_raw,
-                output_bytes as u32,
-                &sha256_hex(&llm_output),
+                Some((output_bytes as u32, sha256_hex(&llm_output).as_str())),
                 ResummerizeRunStatus::ContractViolation,
                 &violation_names,
                 Some(detail),
@@ -1048,7 +1117,9 @@ pub mod test_hooks {
 /// ownership and write the appropriate terminal audit row. If ownership
 /// is still held, writes the `intended_status` (`LengthExceeded` or
 /// `ContractViolation`); otherwise writes `ClaimLost` with `race_detail`
-/// as the error text. Returns the matching `Verdict`.
+/// as the error text. Returns the matching `Verdict`. `output` is the LLM
+/// output size and hash, or `None` when the run stopped before the LLM was
+/// called (prompt over the input budget).
 ///
 /// Why atomic: before the audit's round-2 MED-1 fix, the call sequence
 /// was `check_claim_still_held()` → `finish_resummerize_run()` as TWO
@@ -1070,14 +1141,16 @@ fn finish_with_ownership_check(
     canonical_id: &str,
     claim_token: &str,
     snapshot_updated_at_raw: &str,
-    output_bytes: u32,
-    output_hash: &str,
+    output: Option<(u32, &str)>,
     intended_status: ResummerizeRunStatus,
     intended_violations: &[String],
     intended_error: Option<String>,
     race_detail: &str,
 ) -> ReinResult<Verdict> {
     let conn = store.conn();
+    // `None` when the run ended before any LLM output existed.
+    let output_bytes = output.map(|(bytes, _)| bytes);
+    let output_hash = output.map(|(_, hash)| hash.to_string());
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let now = Utc::now();
     let result: ReinResult<Verdict> = (|| {
@@ -1087,8 +1160,8 @@ fn finish_with_ownership_check(
             resummerize_audit::finish_resummerize_run(
                 conn,
                 run_id,
-                Some(output_bytes),
-                Some(output_hash.to_string()),
+                output_bytes,
+                output_hash.clone(),
                 intended_status,
                 intended_violations,
                 intended_error,
@@ -1109,8 +1182,8 @@ fn finish_with_ownership_check(
             resummerize_audit::finish_resummerize_run(
                 conn,
                 run_id,
-                Some(output_bytes),
-                Some(output_hash.to_string()),
+                output_bytes,
+                output_hash.clone(),
                 ResummerizeRunStatus::ClaimLost,
                 &[],
                 Some(race_detail.to_string()),
@@ -1157,8 +1230,8 @@ fn finish_with_ownership_check(
             if let Err(finish_err) = resummerize_audit::finish_resummerize_run(
                 conn,
                 run_id,
-                Some(output_bytes),
-                Some(output_hash.to_string()),
+                output_bytes,
+                output_hash.clone(),
                 ResummerizeRunStatus::LlmError,
                 &[],
                 Some(best_effort_err),
@@ -1605,6 +1678,112 @@ mod tests {
             evidence_before,
             "aborted apply must roll back the pre-rewrite evidence snapshot"
         );
+    }
+
+    /// Only a limit the operator set gates a prompt; the resolver's fallback
+    /// values do not, so default configurations keep sending every prompt.
+    #[test]
+    fn configured_input_budget_ignores_provider_agnostic_fallbacks() {
+        // OpenAI-compatible backend with the compiled default: no budget.
+        let mut config = ReinConfig::default();
+        config.extract.provider = "omlx".to_string();
+        let omlx = create_resummerize_extractor(&config).expect("omlx needs no API key");
+        assert!(matches!(omlx, ExtractorKind::Omlx(_)));
+        assert_eq!(configured_input_budget(&config, &omlx), 0);
+
+        // The same backend with a limit the operator chose.
+        config.extract.omlx.max_input_chars = 4_000;
+        assert_eq!(configured_input_budget(&config, &omlx), 4_000);
+
+        // Gemini: unset means no budget, a positive value is the budget.
+        let mut config = ReinConfig::default();
+        config.extract.provider = "google".to_string();
+        let gemini = ExtractorKind::Gemini(crate::extract::llm::GeminiExtractor::new(
+            "test-key".to_string(),
+            config.extract.google.endpoint.clone(),
+            config.extract.google.model.clone(),
+        ));
+        assert_eq!(configured_input_budget(&config, &gemini), 0);
+        config.extract.google.max_input_chars = 50_000;
+        assert_eq!(configured_input_budget(&config, &gemini), 50_000);
+    }
+
+    /// A prompt over the input budget is never sent: the run is recorded as
+    /// `length_exceeded`, which the 3-strike fuse counts, so the row is
+    /// retired after three runs instead of being rebuilt on every run.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn over_budget_prompt_skips_llm_and_trips_the_fuse() {
+        use crate::extract::llm::MockExtractor;
+
+        let store = SqliteStore::in_memory().unwrap();
+        let config = ReinConfig::default();
+        let canonical_id = store
+            .store(test_memory("canonical body that needs recompression"))
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE memories SET needs_resummerize = 1 WHERE id = ?1",
+                rusqlite::params![&canonical_id],
+            )
+            .unwrap();
+        let extractor = ExtractorKind::Mock(MockExtractor::with_fixed_response(
+            "must never be requested",
+        ));
+        let state = AdaptiveState::default();
+        // Any real prompt is longer than this budget.
+        let tiny_budget = 16;
+
+        for run in 1..=MAX_CONSECUTIVE_FAILURES {
+            let claim = claim_batch(&store, Some(&canonical_id), 1)
+                .unwrap()
+                .into_iter()
+                .next()
+                .expect("flagged canonical should be claimable");
+            let verdict =
+                resummerize_one(&store, &config, &extractor, &state, &claim, tiny_budget).unwrap();
+            assert!(
+                matches!(verdict, Verdict::LengthExceeded),
+                "run {run} must be recorded as length_exceeded"
+            );
+        }
+        let (status, error): (String, Option<String>) = store
+            .conn()
+            .query_row(
+                "SELECT status, error FROM resummerize_runs \
+                  WHERE canonical_id = ?1 ORDER BY rowid DESC LIMIT 1",
+                rusqlite::params![&canonical_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "length_exceeded");
+        assert!(error.unwrap_or_default().contains("LLM not called"));
+
+        // The fuse now retires the row without another attempt.
+        let claim = claim_batch(&store, Some(&canonical_id), 1)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("row is still flagged before the fuse run");
+        let verdict =
+            resummerize_one(&store, &config, &extractor, &state, &claim, tiny_budget).unwrap();
+        assert!(matches!(verdict, Verdict::Exhausted));
+        let needs: i64 = store
+            .conn()
+            .query_row(
+                "SELECT needs_resummerize FROM memories WHERE id = ?1",
+                rusqlite::params![&canonical_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(needs, 0, "an exhausted row leaves the queue");
+
+        let calls = match &extractor {
+            ExtractorKind::Mock(mock) => mock.call_count(),
+            _ => unreachable!("test uses the mock extractor"),
+        };
+        assert_eq!(calls, 0, "an over-budget prompt must not reach the LLM");
     }
 
     #[test]

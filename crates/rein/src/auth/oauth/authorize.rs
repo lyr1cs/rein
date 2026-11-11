@@ -110,31 +110,73 @@ fn verify_csrf(
         .unwrap_or(false)
 }
 
+/// Why an authorization request was not accepted.
+enum AuthorizeRejection {
+    /// The request itself is wrong; the text is safe to show the client.
+    Invalid(&'static str),
+    /// The server failed while checking the request; `step` names the
+    /// failing operation and the error text stays in the server log.
+    Internal {
+        step: &'static str,
+        error: anyhow::Error,
+    },
+}
+
 fn validate_authorize_request(
     config: &ReinConfig,
     query: &AuthorizeQuery,
-) -> anyhow::Result<(store::OAuthClient, store::SigningKey)> {
+) -> Result<(store::OAuthClient, store::SigningKey), AuthorizeRejection> {
     if query.response_type != "code" {
-        anyhow::bail!("response_type must be code");
+        return Err(AuthorizeRejection::Invalid("response_type must be code"));
     }
     if query.code_challenge_method != "S256" {
-        anyhow::bail!("code_challenge_method must be S256");
+        return Err(AuthorizeRejection::Invalid(
+            "code_challenge_method must be S256",
+        ));
     }
     if query.state.is_empty() {
-        anyhow::bail!("state is required");
+        return Err(AuthorizeRejection::Invalid("state is required"));
     }
-    let store = config.open_store()?;
-    let client = store::get_client(store.conn(), &query.client_id)?
-        .ok_or_else(|| anyhow::anyhow!("unknown client_id"))?;
+    let store = config
+        .open_store()
+        .map_err(|err| AuthorizeRejection::Internal {
+            step: "open store",
+            error: anyhow::anyhow!("{err}"),
+        })?;
+    let client = store::get_client(store.conn(), &query.client_id)
+        .map_err(|error| AuthorizeRejection::Internal {
+            step: "load client",
+            error,
+        })?
+        .ok_or(AuthorizeRejection::Invalid("unknown client_id"))?;
     if !client
         .redirect_uris
         .iter()
         .any(|uri| uri == &query.redirect_uri)
     {
-        anyhow::bail!("redirect_uri mismatch");
+        return Err(AuthorizeRejection::Invalid("redirect_uri mismatch"));
     }
-    let key = store::current_signing_key(store.conn())?;
+    let key =
+        store::current_signing_key(store.conn()).map_err(|error| AuthorizeRejection::Internal {
+            step: "load signing key",
+            error,
+        })?;
     Ok((client, key))
+}
+
+/// Answer for a failure inside the server (store open, SQLite, signing).
+/// The authorize endpoint is reachable before the owner authenticates, so
+/// the error text, which can name paths, tables and constraints, goes to
+/// the server log and the caller gets a fixed description. The answer is a
+/// direct response, never a redirect to the client's `redirect_uri`.
+/// `step` names the failing operation; nothing from the request is logged.
+fn internal_error(err: &dyn std::fmt::Display, step: &'static str) -> OAuthResponse {
+    tracing::warn!(error = %err, step, "oauth authorize request failed inside the server");
+    oauth_error(
+        hyper::StatusCode::INTERNAL_SERVER_ERROR,
+        "server_error",
+        "the authorization request could not be processed",
+    )
 }
 
 fn registered_redirect_uri(config: &ReinConfig, query: &AuthorizeQuery) -> bool {
@@ -153,7 +195,7 @@ fn registered_redirect_uri(config: &ReinConfig, query: &AuthorizeQuery) -> bool 
 fn redirect_or_bad_request(
     config: &ReinConfig,
     query: &AuthorizeQuery,
-    description: &str,
+    description: &'static str,
 ) -> OAuthResponse {
     if registered_redirect_uri(config, query) {
         OAuthResponse::redirect(redirect_with_params(
@@ -256,7 +298,10 @@ pub fn handle_authorize_get(
     };
     let (client, key) = match validate_authorize_request(config, &parsed) {
         Ok(value) => value,
-        Err(err) => return redirect_or_bad_request(config, &parsed, &err.to_string()),
+        Err(AuthorizeRejection::Invalid(reason)) => {
+            return redirect_or_bad_request(config, &parsed, reason)
+        }
+        Err(AuthorizeRejection::Internal { step, error }) => return internal_error(&error, step),
     };
     if let Some(response) = require_owner_authorization(headers) {
         return response;
@@ -269,13 +314,7 @@ pub fn handle_authorize_get(
         &parsed.code_challenge,
     ) {
         Ok(value) => value,
-        Err(err) => {
-            return oauth_error(
-                hyper::StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                &err.to_string(),
-            );
-        }
+        Err(err) => return internal_error(&err, "build CSRF token"),
     };
     let html = format!(
         r#"<!doctype html><html><head><meta charset="utf-8"><title>Rein OAuth Authorization</title></head>
@@ -333,13 +372,7 @@ pub fn handle_authorize_post(
     };
     let store = match config.open_store() {
         Ok(store) => store,
-        Err(err) => {
-            return oauth_error(
-                hyper::StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                &err.to_string(),
-            )
-        }
+        Err(err) => return internal_error(&err, "open store"),
     };
     let client = match store::get_client(store.conn(), &form.client_id) {
         Ok(Some(client)) => client,
@@ -350,13 +383,7 @@ pub fn handle_authorize_post(
                 "unknown client_id",
             )
         }
-        Err(err) => {
-            return oauth_error(
-                hyper::StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                &err.to_string(),
-            )
-        }
+        Err(err) => return internal_error(&err, "load client"),
     };
     if !client
         .redirect_uris
@@ -374,13 +401,7 @@ pub fn handle_authorize_post(
     }
     let key = match store::current_signing_key(store.conn()) {
         Ok(key) => key,
-        Err(err) => {
-            return oauth_error(
-                hyper::StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                &err.to_string(),
-            )
-        }
+        Err(err) => return internal_error(&err, "load signing key"),
     };
     let Some(nonce) = cookie_value(headers, CSRF_COOKIE) else {
         return oauth_error(
@@ -427,13 +448,7 @@ pub fn handle_authorize_post(
         },
     ) {
         Ok(code) => code,
-        Err(err) => {
-            return oauth_error(
-                hyper::StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                &err.to_string(),
-            )
-        }
+        Err(err) => return internal_error(&err, "store authorization code"),
     };
     OAuthResponse::redirect(redirect_with_params(
         &form.redirect_uri,
@@ -539,6 +554,35 @@ mod tests {
             .headers
             .iter()
             .all(|(name, _)| *name != hyper::header::LOCATION.as_str()));
+    }
+
+    #[test]
+    fn authorize_get_storage_failure_is_a_generic_error_without_redirect() {
+        let (_dir, config) = temp_config();
+        let client = register_client(&config);
+        {
+            // A signing key row that cannot be read back as text makes the
+            // key lookup fail after the client and its redirect_uri have
+            // already been accepted.
+            let store = config.open_store().expect("open store");
+            store
+                .conn()
+                .execute("UPDATE oauth_signing_keys SET secret_hex = x'00ff'", [])
+                .expect("corrupt signing key");
+        }
+        let query = authorize_query(&client.client_id, "https://claude.ai/callback");
+
+        let response = handle_authorize_get(&hyper::HeaderMap::new(), &query, &config);
+
+        assert_eq!(response.status, hyper::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(response
+            .headers
+            .iter()
+            .all(|(name, _)| *name != hyper::header::LOCATION.as_str()));
+        let body = String::from_utf8(response.body).expect("utf8 body");
+        assert!(body.contains("server_error"), "{body}");
+        assert!(!body.contains("secret_hex"), "{body}");
+        assert!(!body.to_ascii_lowercase().contains("column"), "{body}");
     }
 
     #[test]

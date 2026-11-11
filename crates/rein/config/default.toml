@@ -178,7 +178,7 @@ codex_upstream = "https://chatgpt.com/backend-api/codex"
 extract_enabled = true     # extract memories from assistant responses
 store_min_chars = 220      # don't run proxy extraction on short assistant replies
 store_min_score = 3        # pattern score required before proxy extraction runs
-max_request_body = 1048576 # reject oversized client requests before forwarding
+max_request_body = 67108864 # 64 MiB; reject oversized client requests before forwarding
 # v1.2.0: [proxy].allow_unauthenticated_loopback was removed. Default-deny
 # stands: set REIN_PROXY_TOKEN before `rein proxy on`, or opt into
 # unauthenticated loopback explicitly with `auth = "public"` (honored only

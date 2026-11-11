@@ -818,7 +818,10 @@ pub fn run_judge_structural_anchor_consumer(
 /// >= JUDGE_DRIFT_MIN_PAIRS` AND `runtime_vs_offline_kappa <
 /// JUDGE_DRIFT_THRESHOLD`, the consumer bumps `judge_drift_alert` and writes a
 /// one-line warning to `~/.rein/judge_drift.log` (best-effort — logging
-/// failure does NOT abort the consumer). Doctor surfaces the alert.
+/// failure does NOT abort the consumer). Doctor surfaces the alert. The
+/// alert is not a latch: see `drift_alert_recovered` for what resets the
+/// counter of a surface (global, synthesis, concept-summary each on their
+/// own window) to zero.
 pub fn recompute_judge_calibration_state(
     conn: &Connection,
     prior: Option<JudgeCalibrationState>,
@@ -856,6 +859,14 @@ pub fn recompute_judge_calibration_state(
     let mut any_new_pair = false;
     let mut any_new_synthesis_pair = false;
     let mut any_new_concept_pair = false;
+    // Event id up to which this pass applies events; an alert raised in
+    // this pass is "raised at" this id.
+    let applied_event_id = state.last_consumed_event_id_calibration;
+    let mut raised = load_drift_alert_raised(conn);
+    let mut raised_dirty = false;
+    let synthesis_type = [EventType::SynthesisLlmJudgeOfflineCron.as_str()];
+    let concept_type = [EventType::ConceptSummaryLlmJudgeOfflineCron.as_str()];
+    let both_types = [synthesis_type[0], concept_type[0]];
 
     for ev in events {
         if ev.id <= prior_high_water {
@@ -985,6 +996,8 @@ pub fn recompute_judge_calibration_state(
             new_kappa < JUDGE_DRIFT_THRESHOLD && prior_kappa >= JUDGE_DRIFT_THRESHOLD;
         if pair_count >= JUDGE_DRIFT_MIN_PAIRS && (edge_crossing || alert_first_window) {
             state.judge_drift_alert = state.judge_drift_alert.saturating_add(1);
+            raised.global = Some(applied_event_id);
+            raised_dirty = true;
             if let Some(path) = drift_log_path {
                 let _ = append_drift_log(
                     path,
@@ -1002,6 +1015,28 @@ pub fn recompute_judge_calibration_state(
                 threshold = JUDGE_DRIFT_THRESHOLD,
                 "judge_calibration: drift alert — runtime vs offline κ dropped below threshold"
             );
+        } else if state.judge_drift_alert > 0
+            && drift_alert_recovered(
+                conn,
+                &mut raised.global,
+                &mut raised_dirty,
+                &both_types,
+                applied_event_id,
+                &pairs,
+                new_kappa,
+            )
+        {
+            tracing::info!(
+                runtime_vs_offline_kappa = new_kappa,
+                pair_count,
+                cleared_alerts = state.judge_drift_alert,
+                "judge_calibration: runtime vs offline κ recovered; drift alert cleared"
+            );
+            state.judge_drift_alert = 0;
+            // Drop the raise point with the alert, so a later alert can
+            // never be judged from this one's.
+            raised.global = None;
+            raised_dirty = true;
         }
     }
 
@@ -1022,6 +1057,8 @@ pub fn recompute_judge_calibration_state(
             new_kappa < JUDGE_DRIFT_THRESHOLD && prior_kappa >= JUDGE_DRIFT_THRESHOLD;
         if pair_count >= JUDGE_DRIFT_MIN_PAIRS && (edge_crossing || first_below) {
             state.judge_drift_alert_synthesis = state.judge_drift_alert_synthesis.saturating_add(1);
+            raised.synthesis = Some(applied_event_id);
+            raised_dirty = true;
             tracing::warn!(
                 runtime_vs_offline_kappa_synthesis = new_kappa,
                 prior_kappa,
@@ -1030,6 +1067,28 @@ pub fn recompute_judge_calibration_state(
                 threshold = JUDGE_DRIFT_THRESHOLD,
                 "judge_calibration: synthesis runtime vs offline κ dropped below threshold"
             );
+        } else if state.judge_drift_alert_synthesis > 0
+            && drift_alert_recovered(
+                conn,
+                &mut raised.synthesis,
+                &mut raised_dirty,
+                &synthesis_type,
+                applied_event_id,
+                &pairs,
+                new_kappa,
+            )
+        {
+            tracing::info!(
+                runtime_vs_offline_kappa_synthesis = new_kappa,
+                pair_count,
+                cleared_alerts = state.judge_drift_alert_synthesis,
+                "judge_calibration: synthesis runtime vs offline κ recovered; drift alert cleared"
+            );
+            state.judge_drift_alert_synthesis = 0;
+            // Drop the raise point with the alert, so a later alert can
+            // never be judged from this one's.
+            raised.synthesis = None;
+            raised_dirty = true;
         }
     }
 
@@ -1050,6 +1109,8 @@ pub fn recompute_judge_calibration_state(
             new_kappa < JUDGE_DRIFT_THRESHOLD && prior_kappa >= JUDGE_DRIFT_THRESHOLD;
         if pair_count >= JUDGE_DRIFT_MIN_PAIRS && (edge_crossing || first_below) {
             state.judge_drift_alert_concept = state.judge_drift_alert_concept.saturating_add(1);
+            raised.concept = Some(applied_event_id);
+            raised_dirty = true;
             tracing::warn!(
                 runtime_vs_offline_kappa_concept = new_kappa,
                 prior_kappa,
@@ -1058,10 +1119,160 @@ pub fn recompute_judge_calibration_state(
                 threshold = JUDGE_DRIFT_THRESHOLD,
                 "judge_calibration: concept-summary runtime vs offline κ dropped below threshold"
             );
+        } else if state.judge_drift_alert_concept > 0
+            && drift_alert_recovered(
+                conn,
+                &mut raised.concept,
+                &mut raised_dirty,
+                &concept_type,
+                applied_event_id,
+                &pairs,
+                new_kappa,
+            )
+        {
+            tracing::info!(
+                runtime_vs_offline_kappa_concept = new_kappa,
+                pair_count,
+                cleared_alerts = state.judge_drift_alert_concept,
+                "judge_calibration: concept-summary runtime vs offline κ recovered; drift alert cleared"
+            );
+            state.judge_drift_alert_concept = 0;
+            // Drop the raise point with the alert, so a later alert can
+            // never be judged from this one's.
+            raised.concept = None;
+            raised_dirty = true;
         }
     }
 
+    if raised_dirty {
+        save_drift_alert_raised(conn, &raised);
+    }
+
     Ok((state, max_id_this_pass))
+}
+
+/// Metadata key recording, per surface, the calibration event id at which
+/// the standing drift alert was raised.
+const JUDGE_DRIFT_ALERT_RAISED_METADATA_KEY: &str = "judge_drift_alert_raised_event_id";
+
+/// Event id at which each surface's standing drift alert was raised. Only
+/// read while that surface's alert counter is above zero. A raise sets the
+/// entry and a clear removes it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct JudgeDriftAlertRaised {
+    #[serde(default)]
+    global: Option<i64>,
+    #[serde(default)]
+    synthesis: Option<i64>,
+    #[serde(default)]
+    concept: Option<i64>,
+}
+
+fn load_drift_alert_raised(conn: &Connection) -> JudgeDriftAlertRaised {
+    conn.query_row(
+        "SELECT value FROM metadata WHERE key = ?1",
+        rusqlite::params![JUDGE_DRIFT_ALERT_RAISED_METADATA_KEY],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+    .and_then(|raw| serde_json::from_str(&raw).ok())
+    .unwrap_or_default()
+}
+
+/// Best-effort, and separate from the state snapshot write. A failed write
+/// when an alert is raised or cleared leaves no entry (or, after a failed
+/// clear, an older one that the next raise replaces); an alert without a
+/// recorded raise point gets one on the next pass, which delays its clear.
+/// The one case that can shorten the fresh window is two failed writes in a
+/// row: the clear's and then the next raise's.
+fn save_drift_alert_raised(conn: &Connection, raised: &JudgeDriftAlertRaised) {
+    let Ok(raw) = serde_json::to_string(raised) else {
+        return;
+    };
+    if let Err(error) = conn.execute(
+        "INSERT INTO metadata (key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![JUDGE_DRIFT_ALERT_RAISED_METADATA_KEY, raw],
+    ) {
+        tracing::warn!(error = %error, "judge_calibration: failed to record drift alert raise point");
+    }
+}
+
+/// Number of offline-cron events of `event_types` with an id in
+/// `(after_id, up_to_id]` that carry both verdicts, i.e. the events that
+/// add a pair. The filter checks the two verdict fields only, so an event
+/// whose payload is malformed in some other field is still counted. A read
+/// error counts as zero, which only delays a clear.
+fn count_offline_cron_events(
+    conn: &Connection,
+    event_types: &[&str],
+    after_id: i64,
+    up_to_id: i64,
+) -> usize {
+    event_types
+        .iter()
+        .map(|event_type| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM feedback_events \
+                  WHERE event_type = ?1 AND id > ?2 AND id <= ?3 \
+                    AND payload IS NOT NULL AND json_valid(payload) \
+                    AND json_type(payload, '$.runtime_hit') IN ('true', 'false') \
+                    AND json_type(payload, '$.cron_hit') IN ('true', 'false')",
+                rusqlite::params![event_type, after_id, up_to_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            .max(0) as usize
+        })
+        .sum()
+}
+
+/// Whether a standing drift alert has ended. Two conditions, both judged
+/// with the alert rule's own minimum pair count and threshold:
+///
+///   1. the rolling window (`pairs`, κ = `new_kappa`) is large enough and
+///      back at or above the threshold, and
+///   2. the pairs that arrived after the alert was raised form a window of
+///      at least the minimum pair count whose own κ is at or above the
+///      threshold.
+///
+/// The second condition keeps a κ that hovers at the threshold from
+/// clearing and re-raising the alert on alternate pairs: every clear needs
+/// a full window of evidence gathered after the raise. The counter is
+/// zeroed in the same state write that carries the new κ and the consumer
+/// watermark, so the clear is persisted exactly like a bump; a later drop
+/// below the threshold is an edge crossing again and re-raises the alert.
+///
+/// An alert with no recorded raise point (raised before the point was
+/// recorded, or the record write failed) gets this pass as its raise point
+/// and is evaluated from the next pass on. The raise point lives in the
+/// metadata table and is written best-effort, apart from the state
+/// snapshot; see `save_drift_alert_raised` for what a failed write does.
+fn drift_alert_recovered(
+    conn: &Connection,
+    raised_at: &mut Option<i64>,
+    raised_dirty: &mut bool,
+    event_types: &[&str],
+    applied_event_id: i64,
+    pairs: &[(bool, bool)],
+    new_kappa: f64,
+) -> bool {
+    let Some(raised_event_id) = *raised_at else {
+        *raised_at = Some(applied_event_id);
+        *raised_dirty = true;
+        return false;
+    };
+    if pairs.len() < JUDGE_DRIFT_MIN_PAIRS || new_kappa < JUDGE_DRIFT_THRESHOLD {
+        return false;
+    }
+    let fresh = count_offline_cron_events(conn, event_types, raised_event_id, applied_event_id)
+        .min(pairs.len());
+    if fresh < JUDGE_DRIFT_MIN_PAIRS {
+        return false;
+    }
+    let fresh_pairs = &pairs[pairs.len() - fresh..];
+    kappa_runtime_vs_offline(fresh_pairs).unwrap_or(0.0) >= JUDGE_DRIFT_THRESHOLD
 }
 
 /// Best-effort append of a one-line drift alert to `~/.rein/judge_drift.log`.
@@ -3360,6 +3571,74 @@ mod tests {
             "drift log should contain alert line, got: {log_text}"
         );
         let _ = std::fs::remove_file(&drift_log);
+    }
+
+    #[test]
+    fn consumer_drift_alert_clears_when_kappa_recovers() {
+        let conn = setup_db();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .unwrap();
+        // Balanced verdicts keep chance agreement at 0.5, so κ = 2·p_o − 1.
+        let emit = |prefix: &str, count: usize, agree: bool| {
+            for i in 0..count {
+                let hit = i % 2 == 0;
+                emit_offline_cron_synth(&conn, &format!("{prefix}{i}"), hit, hit == agree);
+            }
+        };
+        let pass = |prior: Option<JudgeCalibrationState>| {
+            let (state, max_id) = recompute_judge_calibration_state(&conn, prior, None).unwrap();
+            commit_offset(&conn, &[(JUDGE_CALIBRATION_CONSUMER, max_id.unwrap())]).unwrap();
+            state
+        };
+
+        // 100 agreeing pairs: κ = 1.0, no alert.
+        emit("a", 100, true);
+        let healthy = pass(None);
+        assert_eq!(healthy.judge_drift_alert, 0);
+        assert_eq!(healthy.judge_drift_alert_synthesis, 0);
+
+        // 18 disagreeing pairs: p_o = 100/118, κ ≈ 0.695, both alerts fire.
+        emit("b", 18, false);
+        let drifted = pass(Some(healthy));
+        assert_eq!(load_drift_alert_raised(&conn).global, Some(118));
+        assert_eq!(load_drift_alert_raised(&conn).synthesis, Some(118));
+        assert!(drifted.runtime_vs_offline_kappa < JUDGE_DRIFT_THRESHOLD);
+        assert_eq!(drifted.judge_drift_alert, 1);
+        assert_eq!(drifted.judge_drift_alert_synthesis, 1);
+        assert_eq!(drifted.judge_drift_alert_concept, 0);
+
+        // 4 agreeing pairs lift the rolling κ just over the threshold
+        // (p_o = 104/122, κ ≈ 0.705), but 4 pairs are not a full window of
+        // evidence gathered after the raise: the alert stands.
+        emit("c", 4, true);
+        let hovering = pass(Some(drifted));
+        assert!(hovering.runtime_vs_offline_kappa >= JUDGE_DRIFT_THRESHOLD);
+        assert_eq!(hovering.judge_drift_alert, 1, "no clear on a few pairs");
+        assert_eq!(hovering.judge_drift_alert_synthesis, 1);
+
+        // 26 more make 30 agreeing pairs since the raise: the alert clears.
+        emit("d", 26, true);
+        let recovered = pass(Some(hovering));
+        assert!(recovered.runtime_vs_offline_kappa >= JUDGE_DRIFT_THRESHOLD);
+        assert_eq!(
+            recovered.judge_drift_alert, 0,
+            "recovered κ clears the alert"
+        );
+        assert_eq!(recovered.judge_drift_alert_synthesis, 0);
+        // The raise points go with the alerts, so a later alert is never
+        // judged from an earlier alert's raise point.
+        let after_clear = load_drift_alert_raised(&conn);
+        assert_eq!(after_clear.global, None);
+        assert_eq!(after_clear.synthesis, None);
+
+        // A fresh drop (p_o = 130/154, κ ≈ 0.688) is an edge crossing again.
+        emit("e", 6, false);
+        let relapsed = pass(Some(recovered));
+        assert!(relapsed.runtime_vs_offline_kappa < JUDGE_DRIFT_THRESHOLD);
+        assert_eq!(relapsed.judge_drift_alert, 1);
+        assert_eq!(relapsed.judge_drift_alert_synthesis, 1);
     }
 
     #[test]

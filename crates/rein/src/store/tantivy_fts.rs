@@ -335,6 +335,11 @@ impl TantivyFts {
         topic: Option<&str>,
         limit: usize,
     ) -> Result<Vec<(String, f32)>, tantivy::TantivyError> {
+        // `TopDocs::with_limit(0)` panics, and release builds abort on panic:
+        // a caller asking for zero results must not take the process down.
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         self.reader.reload()?;
         let searcher = self.reader.searcher();
 
@@ -462,6 +467,9 @@ mod tests {
         let results = fts.search("ownership", None, 10).unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].0, "m1");
+
+        // A zero limit (`rein_recall` with `limit: 0`) is empty, not a panic.
+        assert!(fts.search("ownership", None, 0).unwrap().is_empty());
 
         // Topic filter
         let results = fts.search("ownership", Some("python"), 10).unwrap();
