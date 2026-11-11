@@ -9,6 +9,33 @@ The full release notes (with audit-round breakdowns and operator-visible
 schema changes) live on the [GitHub Releases page](https://github.com/lyr1cs/rein/releases).
 This file is a condensed index intended for quick scanning.
 
+## [1.5.3] — 2026-11-12
+
+Patch for the owner token. No schema or config change.
+
+### Fixed
+
+- **`rein doctor` reported an unresolved auth policy while the server ran
+  normally** — `REIN_HTTP_TOKEN` was read straight from the process
+  environment, so a server started with the token and a command line without
+  it disagreed. The owner token now resolves like provider keys: process
+  environment first, then `~/.rein/secrets.env`. Store it once with
+  `rein keys set REIN_HTTP_TOKEN` and the server, `rein doctor` and every
+  other command read the same value. Every read goes through one accessor:
+  auth policy resolution, HTTP server startup, the REST owner and
+  protected-read gates, session cookies, OAuth owner approval, proxy startup,
+  the dashboard and the doctor checks.
+- The token is trimmed everywhere; `/mcp` and REST no longer disagree about a
+  token stored with surrounding whitespace.
+- The provider reveal route refuses the owner and proxy tokens.
+
+### Notes
+
+- The environment still wins, so deployments that export `REIN_HTTP_TOKEN`
+  need no change.
+- `REIN_PROXY_TOKEN` and the legacy auth-bool migration read the environment
+  only.
+
 ## [1.5.2] — 2026-11-12
 
 Maintenance patch for two reported issues ([#5], [#6]) and the defects found
