@@ -703,6 +703,16 @@ rein providers set judge --provider openrouter --model anthropic/claude-sonnet-4
 rein keys set OPENROUTER_API_KEY
 ```
 
+Anthropic directly (v1.5.4+), for example a small model for the judge, summaries and extraction while embeddings stay where they are:
+
+```bash
+rein keys set ANTHROPIC_API_KEY --stdin < key.txt
+rein providers set llm --provider anthropic --model claude-haiku-5-5
+rein providers set extract --provider anthropic --model claude-haiku-5-5 --disable-thinking true
+```
+
+Anthropic has no embeddings endpoint. rein sends it no `temperature` (its current models reject a non-default value), so keep the LLM reranker on a vendor that accepts `temperature = 0` if you need repeatable ordering, and raise `max_input_chars` (default 16000 for OpenAI-compatible tables) in `[extract.openai]` / `[llm.openai]` for large-context models.
+
 The same wiring is shown by `rein status`, `rein config`, `GET /api/providers` and the GUI's **AI Keys** page, always with masked keys; the page can reveal a key behind an eye toggle for the owner session only.
 
 Equivalent TOML:
@@ -939,10 +949,11 @@ rein serve --sse
 
 By default, the server binds to `127.0.0.1:8680`.
 
-To bind to a non-localhost address, you **must** set the `REIN_HTTP_TOKEN` environment variable for bearer token authentication:
+To bind to a non-localhost address, you **must** configure `REIN_HTTP_TOKEN` for bearer token authentication. It is read from the process environment first, then from `~/.rein/secrets.env`:
 
 ```bash
-export REIN_HTTP_TOKEN="your-secret-token"
+export REIN_HTTP_TOKEN="your-secret-token"   # for this shell only
+rein keys set REIN_HTTP_TOKEN                # or store it once (hidden prompt, or --stdin); services and `rein doctor` then read the same value
 ```
 
 Configure bind address and port in `config.toml`:
@@ -1603,6 +1614,16 @@ rein providers set judge --provider openrouter --model anthropic/claude-sonnet-4
 rein keys set OPENROUTER_API_KEY
 ```
 
+直接用 Anthropic（v1.5.4 起），例如让一个小模型负责 judge、摘要和抽取，embedding 保持原样：
+
+```bash
+rein keys set ANTHROPIC_API_KEY --stdin < key.txt
+rein providers set llm --provider anthropic --model claude-haiku-5-5
+rein providers set extract --provider anthropic --model claude-haiku-5-5 --disable-thinking true
+```
+
+Anthropic 没有 embedding 接口。rein 不向它发送 `temperature`（它当前的模型会拒绝非默认值），所以如果需要可复现的排序，LLM 重排请留在接受 `temperature = 0` 的厂商上；大上下文模型请在 `[extract.openai]` / `[llm.openai]` 里调高 `max_input_chars`（OpenAI 兼容表默认 16000）。
+
 `rein status`、`rein config`、`GET /api/providers` 和 GUI 的 **AI Keys** 页面显示同一套接线，key 始终打码；页面上的小眼睛只对 owner 会话显示明文。
 
 等价 TOML：
@@ -1761,10 +1782,11 @@ rein serve --sse
 
 默认绑定地址为 `127.0.0.1:8680`。
 
-若要绑定到非 localhost 地址，**必须**设置 `REIN_HTTP_TOKEN` 环境变量以启用 bearer token 认证：
+若要绑定到非 localhost 地址，**必须**配置 `REIN_HTTP_TOKEN` 以启用 bearer token 认证。读取顺序是先进程环境变量，再 `~/.rein/secrets.env`：
 
 ```bash
-export REIN_HTTP_TOKEN="your-secret-token"
+export REIN_HTTP_TOKEN="your-secret-token"   # 只对当前 shell 生效
+rein keys set REIN_HTTP_TOKEN                # 或者存一次（隐藏输入，也可用 --stdin）；服务和 `rein doctor` 读到的是同一个值
 ```
 
 在 `config.toml` 中配置绑定地址和端口：

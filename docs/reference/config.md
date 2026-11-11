@@ -17,7 +17,7 @@ default TOML template is `crates/rein/config/default.toml`.
 | `[decay]` | Ebbinghaus-style decay constants, pruning threshold, and STM-to-LTM promotion count. |
 | `[server]` | HTTP/SSE bind, port, compact mode, GUI flag, loopback auth opt-in, and allowed hosts. |
 | `[hooks]`, `[hooks.codex]`, `[hooks.claude]` | Hook extraction thresholds, context window, buffer location, signal keywords, and per-runtime prompt-context policy. |
-| `[extract]`, `[extract.google]`, `[extract.omlx]` (alias `[extract.openai]`) | LLM extraction provider, model, endpoint, prompt cap, `api_key_env`, `auth_header`, and the optional `disable_thinking` toggle (unset → vendor default). |
+| `[extract]`, `[extract.google]`, `[extract.omlx]` (alias `[extract.openai]`) | LLM extraction provider, model, endpoint, prompt cap, `api_key_env`, `auth_header`, and the optional `disable_thinking` toggle (unset → vendor default; sent as a `/no_think` prompt line, or as a `thinking` request field for Anthropic). `max_input_chars` defaults to 16000 for OpenAI-compatible tables. |
 | `[query_expansion]`, provider subtables | Query expansion provider and maximum expansion count. |
 | `[proxy]` | Record-only proxy bind, upstreams, extraction thresholds, retry and buffer limits, and auth opt-in. |
 | `[async_memory]` | Async memory worker provider, retries, batching, cooldown, and working-set limits. |

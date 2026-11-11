@@ -194,9 +194,27 @@ rein warmup --reembed-all            # re-embed every live row under the current
 
 `warmup` streams the gap in pages: it reads the ids of live memories without a
 vector row, then for each page fetches the text, writes rows for cache hits and
-embeds the misses. Rows that cannot be embedded keep their retry flag and are
-counted as errors — they are never silently skipped. The HNSW index is rebuilt
-once at the end, over the same live scope.
+embeds the misses. The HNSW index is rebuilt once at the end, over the same live
+scope.
+
+A page is a read unit, not a request. Embedding requests are packed by size (a
+character budget and a per-request text cap), so a very large memory travels
+alone; a failed request is split down to single texts, so one text the provider
+cannot embed fails by itself; and a rate-limit response is waited out for the
+quota window before the retry. When the provider stops answering, or refuses
+every request, the run falls back to one attempt per request until something
+succeeds again.
+
+The final line reports three outcomes separately:
+
+- **embedded / restored from cache** — the memory has a vector row now.
+- **errors** — transient or unexplained failures (outage, rate limit, timeout,
+  storage). The memory is tried again on the next run.
+- **refused by the embedding provider** — the provider answered a request
+  holding only that text with 400, 413 or 422 while it embedded other texts in
+  the same run. The memory is recorded (per memory, model and text hash), stays
+  searchable through the lexical index, and is not sent again until its text or
+  the embedding model changes. Refusals are not counted as errors.
 
 ### The provenance stamp
 
@@ -227,9 +245,12 @@ together. Live memories whose vector was written while the migration was
 staging, or whose row was skipped at publish, are flagged for re-embedding by
 the next adaptive pass.
 
-If the migration cannot complete — no provider, or an embedding failure — the
-old vector table is left untouched and the HNSW index is left marked dirty
-rather than rebuilt from vectors in the old embedding space.
+If the migration cannot complete — no provider, an outage, a rate limit that
+does not clear, a storage error — the old vector table is left untouched and the
+HNSW index is left marked dirty rather than rebuilt from vectors in the old
+embedding space. Memories the provider refuses on their own (see above) do not
+stop it: they are recorded, the new index is published without them, and the
+report lists how many.
 
 **After upgrading a running deployment**: restart every rein process. A process
 still running the previous configuration is refused vector writes once the store
@@ -372,6 +393,12 @@ installed Claude Code hooks under `claude_hooks`.
 The GUI requires a binary installed with `--features gui` and an HTTP token
 unless unauthenticated loopback was explicitly configured.
 
+The token is read from the process environment first and then from
+`~/.rein/secrets.env`. Storing it once with `rein keys set REIN_HTTP_TOKEN`
+(hidden prompt, or `--stdin`) lets the service, `rein doctor` and every other
+command read the same value without exporting it into each shell; the examples
+below use the environment variable for brevity.
+
 Start and stop the background GUI service:
 
 ```bash
@@ -464,6 +491,24 @@ rein keys set OPENROUTER_API_KEY                                   # hidden prom
 rein providers status --probe
 launchctl kickstart -k gui/$(id -u)/com.rein.gui                   # services read config at boot
 ```
+
+Anthropic directly, for example a small model for the judge, summaries and
+extraction while embeddings stay on an embedding vendor:
+
+```bash
+rein keys set ANTHROPIC_API_KEY --stdin < key.txt
+rein providers set llm --provider anthropic --model claude-haiku-5-5
+rein providers set extract --provider anthropic --model claude-haiku-5-5 --disable-thinking true
+rein providers status --probe
+```
+
+Three things differ from other vendors there. rein sends no `temperature` to
+Anthropic (its current models reject a non-default value), so the LLM reranker
+is not guaranteed to produce the same ordering twice — keep the reranker on a
+vendor that accepts `temperature = 0` if that matters. `disable_thinking` is sent
+as a request field rather than a `/no_think` prompt line. And OpenAI-compatible
+LLM tables default to `max_input_chars = 16000`; raise it in `[extract.openai]`
+and `[llm.openai]` for a model with a large context window.
 
 `rein providers set` edits `config.toml` in place with comments preserved,
 validates the result (unknown vendors, vendors without the needed API, invalid

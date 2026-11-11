@@ -103,7 +103,9 @@ Build the image:
 docker build -t rein .
 ```
 
-Run the container with an HTTP bearer token:
+Run the container with an HTTP bearer token (outside a container the token can
+also be stored once with `rein keys set REIN_HTTP_TOKEN` instead of being
+exported):
 
 ```bash
 export REIN_HTTP_TOKEN="change-this-token"
