@@ -1,6 +1,6 @@
 [package]
 name = "rein"
-version = "1.5.4"
+version = "1.5.5"
 edition = "2021"
 rust-version = "1.89"
 description = "Multi-source cross-validated memory for AI agents"

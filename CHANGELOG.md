@@ -9,6 +9,29 @@ The full release notes (with audit-round breakdowns and operator-visible
 schema changes) live on the [GitHub Releases page](https://github.com/lyr1cs/rein/releases).
 This file is a condensed index intended for quick scanning.
 
+## [1.5.5] — 2026-11-12
+
+Dependency security refresh. No schema or config change. **The minimum
+supported Rust version rises from 1.86 to 1.89.**
+
+### Security
+
+- **Every open dependency advisory is closed or documented** — the lockfile
+  is refreshed to patched releases of `openssl`, `zstd` / `zstd-safe` /
+  `zstd-sys`, `rustls-webpki`, `webpki-roots` and `tokio`, and `rusqlite`
+  moves 0.34 -> 0.41 (`libsqlite3-sys` 0.39, a newer bundled SQLite).
+  `cargo audit` reports no vulnerabilities.
+- RUSTSEC-2026-0462 (rmcp Streamable HTTP clients) is ignored in
+  `.cargo/audit.toml` with a written rationale: rein compiles no rmcp
+  client transport, and the only patched line is rmcp 3.x.
+
+### Changed
+
+- **MSRV 1.86 -> 1.89** (`rust-version`, the CI `msrv` job, the manual).
+  Two dependencies in the 1.5.x lockfile already required 1.88, so a build
+  on 1.86 or 1.87 was failing before this release; `rusqlite` 0.41 sets
+  the floor at 1.89. Prebuilt binaries are unaffected.
+
 ## [1.5.4] — 2026-11-12
 
 Patch for Anthropic as an LLM vendor. No schema or config change.

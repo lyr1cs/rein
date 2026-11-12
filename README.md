@@ -12,7 +12,7 @@
 
 rein is a self-adaptive memory system for AI coding agents. It stores, recalls, and manages memories across sessions with embedding-based semantic dedup, data-driven decay (Kaplan-Meier survival curves), and a fully closed self-learning loop that replaces fixed parameters with learned values.
 
-**Current release: `v1.5.4`** (2026-11-12) — Anthropic works as an LLM vendor: chat requests are built per vendor, so an Anthropic model gets no `temperature`, no `json_object` mode and a real thinking switch, and `rein providers status --probe` no longer reports a valid Anthropic key as unauthorized. v1.5.3 (same day): the owner token (`REIN_HTTP_TOKEN`) resolves like provider keys: process environment first, then `~/.rein/secrets.env` (`rein keys set REIN_HTTP_TOKEN`), so `rein doctor` and every other command agree with the running server without the token being exported into a shell. v1.5.2 (same day) fixed [#5](https://github.com/lyr1cs/rein/issues/5) and [#6](https://github.com/lyr1cs/rein/issues/6): embedding requests packed by size with failing texts isolated, so a store with a few very large memories converges in one run; a legacy UNIQUE on the OAuth client name repaired on open; internal error text no longer returned by OAuth and REST endpoints; read-only database open; merges that never shorten a memory. **2155 lib tests / 0 fail; clippy + fmt clean.**
+**Current release: `v1.5.5`** (2026-11-12) — dependency security refresh: the lockfile moves to patched releases of openssl, zstd, rustls-webpki, webpki-roots, tokio and SQLite (`rusqlite` 0.41), and `cargo audit` is clean. Building from source now needs Rust 1.89 or newer; nothing else changes. v1.5.4 (same day): Anthropic works as an LLM vendor: chat requests are built per vendor, so an Anthropic model gets no `temperature`, no `json_object` mode and a real thinking switch, and `rein providers status --probe` no longer reports a valid Anthropic key as unauthorized. v1.5.3 (same day): the owner token (`REIN_HTTP_TOKEN`) resolves like provider keys: process environment first, then `~/.rein/secrets.env` (`rein keys set REIN_HTTP_TOKEN`), so `rein doctor` and every other command agree with the running server without the token being exported into a shell. v1.5.2 (same day) fixed [#5](https://github.com/lyr1cs/rein/issues/5) and [#6](https://github.com/lyr1cs/rein/issues/6): embedding requests packed by size with failing texts isolated, so a store with a few very large memories converges in one run; a legacy UNIQUE on the OAuth client name repaired on open; internal error text no longer returned by OAuth and REST endpoints; read-only database open; merges that never shorten a memory. **2155 lib tests / 0 fail; clippy + fmt clean.**
 
 **v1.4.1** (2026-10-10) — maintenance patch on the v1.4.0 runway automation line. Tantivy no longer leaves one segment per memory: the staged rebuild loads the corpus through a single writer with automatic merges disabled and compacts to one segment (a 10.6k-memory database rebuilds in 15 s instead of ~28 min; 10,651 segments → 1), and single inserts wait for their scheduled merges. Background warmup runs on a detached thread, so `rein serve` exits on SIGINT/SIGTERM during a rebuild instead of lingering until it finishes. The GUI's synthesis thumbs no longer show a vote as recorded when the server refused the write (`auth = "public"` with a `public_url` rejects every REST mutation) and show the refusal reason instead; the Connectors page explains the owner-only 401; the GUI's own doctor page no longer flags `gui_runtime` by probing itself; and `#[op]` validates literal REST paths at expansion time. **1900 lib tests / 0 fail; clippy + fmt clean; 2 codex review rounds (1 P2 closed, last round clean).**
 
@@ -93,12 +93,12 @@ Three install paths depending on your client:
 rein ships as a Claude Desktop Extension (`.mcpb`). One-click install,
 no Rust toolchain required.
 
-1. Download `rein-v1.5.4.mcpb` from
-   [the v1.5.4 release](https://github.com/lyr1cs/rein/releases/download/v1.5.4/rein-v1.5.4.mcpb).
+1. Download `rein-v1.5.5.mcpb` from
+   [the v1.5.5 release](https://github.com/lyr1cs/rein/releases/download/v1.5.5/rein-v1.5.5.mcpb).
 2. Clear macOS quarantine (one-time, the build is unsigned):
 
    ```bash
-   xattr -d com.apple.quarantine ~/Downloads/rein-v1.5.4.mcpb
+   xattr -d com.apple.quarantine ~/Downloads/rein-v1.5.5.mcpb
    ```
 
 3. Double-click the file. Claude Desktop opens its install dialog.
@@ -132,7 +132,7 @@ need the `rein` binary on your `PATH`:
 cargo install --git https://github.com/lyr1cs/rein --locked rein
 
 # Or pin to a specific release tag (recommended for reproducible installs)
-cargo install --git https://github.com/lyr1cs/rein --tag v1.5.4 --locked rein
+cargo install --git https://github.com/lyr1cs/rein --tag v1.5.5 --locked rein
 ```
 
 > **`--locked` is required.** Without it, `cargo install --git` ignores
@@ -551,6 +551,7 @@ The v0.21 → v0.38.0 arc rebuilt rein around six axes: a unified operation regi
 
 | Version | Theme | Highlights |
 |---|---|---|
+| **v1.5.5** (2026-11-12) | Patch | Dependency security refresh: patched openssl, zstd, rustls-webpki, webpki-roots, tokio and SQLite (`rusqlite` 0.41); `cargo audit` clean with one documented ignore; MSRV 1.86 → 1.89. No behaviour, schema or config change. |
 | **v1.5.4** (2026-11-12) | Patch | Chat requests built per vendor: Anthropic gets no `temperature`, no `json_object` attempt, and `thinking: disabled` instead of `/no_think`; key probe sends `anthropic-version`; extract backend note names the resolved vendor. |
 | **v1.5.3** (2026-11-12) | Patch | Owner token resolved from the environment, then `~/.rein/secrets.env`, through one accessor at every read site; `rein doctor` agrees with the running server; token trimmed everywhere; reveal route refuses the owner and proxy tokens. |
 | **v1.5.2** (2026-11-12) | Maintenance | **Embedding**: bulk requests packed by size, failed requests split to single texts, rate limits waited out; refused texts recorded and skipped; reindex publishes around them; vec-dedup sweeps shortest first. **OAuth**: legacy UNIQUE on client name removed on open; internal failures answered with a fixed message; registration rate limit keyed on the forwarded address with a global ceiling. **Store / ingest**: read-only open; zero-limit recall safe; merges never shorten content; size limit at admission and on `rein_update`; CJK-aware pattern fallback. **Maintenance passes**: consolidation skips a group on LLM failure; drift alerts clear; cold-archive backoff; doctor checks pipeline age and the merge-refinement queue. **Proxy**: connect/idle timeouts, streamed unrouted responses, 64 MiB default request body. |
@@ -1307,7 +1308,7 @@ If you need a non-AGPL license for commercial / proprietary use, the project's c
 
 rein 是一个自适应记忆系统，专为 AI 编程智能体设计。它跨会话存储、检索和管理记忆，通过反馈事件和慢通道学习逐步减少固定参数。
 
-**当前版本：`v1.5.4`**（2026-11-12）— Anthropic 可以作为 LLM 厂商使用：chat 请求按厂商构造，Anthropic 模型不再收到 `temperature`、不再先试 `json_object` 模式，并有真正生效的关闭思考开关；`rein providers status --probe` 不再把有效的 Anthropic key 报成 unauthorized。同一天的 v1.5.3：owner token（`REIN_HTTP_TOKEN`）和 provider key 走同一条解析路径：先进程环境变量，再 `~/.rein/secrets.env`（`rein keys set REIN_HTTP_TOKEN`），所以 `rein doctor` 和其他命令不必把 token 导出到 shell，也能和正在运行的服务保持一致。同一天的 v1.5.2 修复了 [#5](https://github.com/lyr1cs/rein/issues/5) 和 [#6](https://github.com/lyr1cs/rein/issues/6)：embedding 请求按大小打包并隔离失败文本，含少量超大记忆的库一次即可收敛；打开数据库时修复 OAuth client 名称上的旧 UNIQUE 约束；OAuth 与 REST 端点不再返回内部错误原文；打开数据库不再需要写锁；合并不会缩短已有记忆。**2155 lib 测试 / 0 失败；clippy + fmt clean。**
+**当前版本：`v1.5.5`**（2026-11-12）— 依赖安全更新：lockfile 升到 openssl、zstd、rustls-webpki、webpki-roots、tokio 和 SQLite（`rusqlite` 0.41）的已修复版本，`cargo audit` 干净。从源码构建现在需要 Rust 1.89 或更新；其余不变。同一天的 v1.5.4：Anthropic 可以作为 LLM 厂商使用：chat 请求按厂商构造，Anthropic 模型不再收到 `temperature`、不再先试 `json_object` 模式，并有真正生效的关闭思考开关；`rein providers status --probe` 不再把有效的 Anthropic key 报成 unauthorized。同一天的 v1.5.3：owner token（`REIN_HTTP_TOKEN`）和 provider key 走同一条解析路径：先进程环境变量，再 `~/.rein/secrets.env`（`rein keys set REIN_HTTP_TOKEN`），所以 `rein doctor` 和其他命令不必把 token 导出到 shell，也能和正在运行的服务保持一致。同一天的 v1.5.2 修复了 [#5](https://github.com/lyr1cs/rein/issues/5) 和 [#6](https://github.com/lyr1cs/rein/issues/6)：embedding 请求按大小打包并隔离失败文本，含少量超大记忆的库一次即可收敛；打开数据库时修复 OAuth client 名称上的旧 UNIQUE 约束；OAuth 与 REST 端点不再返回内部错误原文；打开数据库不再需要写锁；合并不会缩短已有记忆。**2155 lib 测试 / 0 失败；clippy + fmt clean。**
 
 **v1.4.1**（2026-10-10）— v1.4.0 runway 自动化线上的维护补丁。Tantivy 不再每条记忆一个 segment：staged 重建改为单 writer 批量写入、关闭自动合并、最后显式合并成一个 segment（10.6k 记忆库重建 28 分钟 → 15 秒；10,651 个 segment → 1），单条插入等待已调度的合并完成。后台 warmup 改在独立线程运行，`rein serve` 在重建期间收到 SIGINT/SIGTERM 会立即退出而不是等重建结束。GUI 的合成点赞在服务器拒绝写入时（`auth = "public"` 且配置了 `public_url` 时所有 REST 写操作都被拒绝）不再显示"已记录"，而是显示拒绝原因；Connectors 页把 owner-only 401 解释为配置提示；GUI 自己的 doctor 页不再因自探测而误报 `gui_runtime`；`#[op]` 在展开期校验字面量 REST 路径。**1900 lib 测试 / 0 失败；clippy + fmt clean；2 轮 codex 审查（修复 1 个 P2，最后一轮零发现）。**
 
@@ -1928,6 +1929,7 @@ v0.21 → v0.38.0 这一段重构围绕六条主线：统一 operation registry�
 
 | 版本 | 主题 | 重点 |
 |---|---|---|
+| **v1.5.5** (2026-11-12) | 补丁 | 依赖安全更新：openssl、zstd、rustls-webpki、webpki-roots、tokio、SQLite（`rusqlite` 0.41）升到已修复版本；`cargo audit` 干净，保留一条有说明的忽略；MSRV 1.86 → 1.89。行为、schema、配置均无变化。 |
 | **v1.5.4** (2026-11-12) | 补丁 | chat 请求按厂商构造：Anthropic 不发 `temperature`、不试 `json_object`，用 `thinking: disabled` 代替 `/no_think`；key 探测带 `anthropic-version`；抽取后端提示显示解析后的厂商。 |
 | **v1.5.3** (2026-11-12) | 补丁 | owner token 先读环境变量、再读 `~/.rein/secrets.env`，所有读取点走同一个入口；`rein doctor` 与运行中的服务一致；token 统一去除首尾空白；reveal 接口拒绝 owner / proxy token。 |
 | **v1.5.2** (2026-11-12) | 维护补丁 | **Embedding**：批量请求按大小打包，失败请求拆到单条，限流等待配额窗口；被拒绝的文本记录并跳过；reindex 绕过它们发布；向量去重从短到长扫描。**OAuth**：打开时移除 client 名称上的旧 UNIQUE 约束；内部失败返回固定文案；注册限流按转发地址计数并设全局上限。**存储 / 摄入**：只读打开；limit 为 0 的 recall 安全；合并不缩短内容；准入与 `rein_update` 套用大小上限；规则回退识别中文句读。**维护流程**：consolidation 在 LLM 失败时跳过该组；drift 告警可清除；cold-archive 退避；doctor 检查 pipeline 时效与 merge-refinement 队列。**Proxy**：连接 / 空闲超时，未路由响应流式转发，请求体默认 64 MiB。 |
