@@ -35,4 +35,17 @@ ignore = [
   # until tantivy upgrades its lru dependency (already happens in
   # tantivy 0.24+, so a future tantivy upgrade closes this).
   "RUSTSEC-2026-0002",
+
+  # rmcp 1.8.0 — unbounded response body buffering in the Streamable
+  # HTTP *clients* (denial of service against the client process).
+  # https://rustsec.org/advisories/RUSTSEC-2026-0462.html
+  # Only the `transport-streamable-http-client-reqwest` and
+  # `transport-streamable-http-client-unix-socket` transports are
+  # affected. rein enables `server`, `macros`, `transport-io`,
+  # `transport-streamable-http-server` and `tower` only, so the affected
+  # code is not compiled in (`cargo tree -e features -p rmcp`). The only
+  # patched line is rmcp >= 3.9.0, a major-version migration. Remove this
+  # entry when rein moves to rmcp 3.x, or immediately if a client
+  # transport feature is ever enabled.
+  "RUSTSEC-2026-0462",
 ]

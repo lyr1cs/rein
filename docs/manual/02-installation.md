@@ -7,7 +7,7 @@ intended to run from the repository root.
 ## Prerequisites
 
 - Rust and Cargo for building the `rein` binary. **Minimum supported Rust
-  version (MSRV): 1.86** (declared as `rust-version` in `Cargo.toml` and
+  version (MSRV): 1.89** (declared as `rust-version` in `Cargo.toml` and
   enforced by the CI `msrv` job); newer toolchains also work.
 - Node.js and npm when building the embedded GUI.
 - Optional: an API key for at least one model vendor. Gemini (`GEMINI_API_KEY`)

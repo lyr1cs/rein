@@ -1823,7 +1823,7 @@ pub fn load_cluster_centroids(conn: &Connection, expected_dims: usize) -> HashMa
                     continue;
                 }
                 let floats: Vec<f32> = blob
-                    .chunks_exact(4)
+                    .as_chunks::<4>().0.iter()
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect();
                 out.insert(cid, floats);
