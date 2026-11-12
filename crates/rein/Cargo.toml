@@ -2,7 +2,7 @@
 name = "rein"
 version = "1.5.4"
 edition = "2021"
-rust-version = "1.86"
+rust-version = "1.89"
 description = "Multi-source cross-validated memory for AI agents"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/lyr1cs/rein"
@@ -10,7 +10,7 @@ homepage = "https://github.com/lyr1cs/rein"
 readme = "../../README.md"
 
 [dependencies]
-rusqlite = { version = "0.34", features = ["bundled", "modern_sqlite"] }
+rusqlite = { version = "0.41", features = ["bundled", "modern_sqlite", "fallible_uint"] }
 sqlite-vec = "0.1"
 zerocopy = { version = "0.8", features = ["derive"] }
 rmcp = { version = "1.6", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "tower"] }

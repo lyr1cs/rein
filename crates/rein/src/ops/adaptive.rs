@@ -2680,7 +2680,9 @@ fn run_hdbscan_clustering(
                 let id: String = row.get(0)?;
                 let blob: Vec<u8> = row.get(1)?;
                 let floats: Vec<f32> = blob
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect();
                 Ok((id, floats))
@@ -2806,7 +2808,9 @@ fn run_hdbscan_clustering(
                                 let id: String = row.get(0)?;
                                 let blob: Vec<u8> = row.get(1)?;
                                 let floats: Vec<f32> = blob
-                                    .chunks_exact(4)
+                                    .as_chunks::<4>()
+                                    .0
+                                    .iter()
                                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                                     .collect();
                                 Ok((id, floats))

@@ -935,8 +935,8 @@ mod tests {
 
         let idx = crate::store::adaptive::LLM_JUDGE_J3_MIN_PAIRS - 1;
         calibration.recent_pairs_synthesis.push_back((
-            idx % 2 == 0,
-            idx % 2 == 0,
+            idx.is_multiple_of(2),
+            idx.is_multiple_of(2),
             live_pair_ts(idx),
         ));
         assert_eq!(

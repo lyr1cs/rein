@@ -727,7 +727,7 @@ pub fn recall_temporal_with_request_id(
 /// after that recording rather than inside the recall (codex round-14 P2).
 pub(crate) fn refresh_quality_weights_on_cadence(store: &SqliteStore) {
     let total_recalls: u64 = store.quality_metrics().map(|(_, r, _)| r).unwrap_or(0);
-    if total_recalls > 0 && total_recalls % 50 == 0 {
+    if total_recalls > 0 && total_recalls.is_multiple_of(50) {
         store.update_quality_weights();
     }
 }

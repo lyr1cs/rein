@@ -488,7 +488,7 @@ where
                 });
                 after_case(store, case_index)?;
                 case_index = case_index.saturating_add(1);
-                if case_index % 500 == 0 {
+                if case_index.is_multiple_of(500) {
                     tracing::info!(
                         cases = case_index,
                         total_cases,
@@ -789,8 +789,7 @@ fn hash_sqlite_table(
     let mut statement = connection.prepare(&sql)?;
     let column_names = statement
         .column_names()
-        .iter()
-        .map(|name| (*name).to_string())
+        .map(str::to_string)
         .collect::<Vec<_>>();
     for column_name in &column_names {
         hash_field(hasher, column_name.as_bytes());
@@ -1726,7 +1725,7 @@ fn build_a12_loo_corpus_inner(
         let mut cases = Vec::new();
         for view in views {
             processed_views += 1;
-            if processed_views % 500 == 0 {
+            if processed_views.is_multiple_of(500) {
                 tracing::info!(
                     views = processed_views,
                     families = observations.len(),
@@ -4010,7 +4009,7 @@ mod tests {
             family_evidence_ids.dedup();
             for view in views {
                 cursor += 1;
-                if cursor % stride != 0 {
+                if !cursor.is_multiple_of(stride) {
                     continue;
                 }
                 for bound in [0.70_f32, 0.35] {

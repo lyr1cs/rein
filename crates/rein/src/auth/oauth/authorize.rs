@@ -58,12 +58,14 @@ fn csrf_mac(
 }
 
 fn hex_to_bytes(secret_hex: &str) -> anyhow::Result<Vec<u8>> {
-    if secret_hex.len() % 2 != 0 {
+    if !secret_hex.len().is_multiple_of(2) {
         anyhow::bail!("invalid hex");
     }
     secret_hex
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| {
             let raw = std::str::from_utf8(chunk)?;
             Ok(u8::from_str_radix(raw, 16)?)
